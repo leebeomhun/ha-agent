@@ -1,0 +1,10 @@
+.env
+.env.*
+*.bak
+*.bak-*
+state/
+logs/
+brain/run/
+replay/
+.claude/
+node_modules/

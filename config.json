@@ -1,0 +1,44 @@
+{
+ "notify_targets": [
+  "mobile_app_ibeomhun"
+ ],
+ "weather_entity": "weather.seoul_weather",
+ "active_hours": {
+  "start": 7,
+  "end": 23
+ },
+ "hourly_checkin": true,
+ "reflection_hour": 23,
+ "noise_entities": [
+  "binary_sensor.*_kiosk_screensaver",
+  "sensor.*_wi_fi_connection",
+  "sensor.seoul_*"
+ ],
+ "limits": {
+  "brain_runs_per_day": 80,
+  "alerts_per_day": 25,
+  "summaries_per_day": 20,
+  "min_gap_minutes": 3,
+  "max_rules": 60
+ },
+ "codex": {
+  "model": "gpt-6.1-terra",
+  "effort": "high",
+  "effort_deep": "max"
+ },
+ "actions": {
+  "enabled": true,
+  "auto": [],
+  "confirm": [
+   "switch.geosil_seuwici",
+   "switch.anbang_seuwici",
+   "switch.jageunbang_seuwici",
+   "switch.setagsil_seuwici_seuwici_2",
+   "switch.setagsil_seuwici_seuwici",
+   "light.bul",
+   "light.hwanpunggi",
+   "switch.geosil_gonggiceongjeonggi_power",
+   "media_player.geosil_geosil_tv_un43ru7150fxkr"
+  ]
+ }
+}

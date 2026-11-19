@@ -1,0 +1,323 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "summary",
+    "notifications",
+    "rule_changes",
+    "next_wakes",
+    "memory",
+    "info_requests",
+    "actions",
+    "report"
+  ],
+  "properties": {
+    "summary": {
+      "type": "string",
+      "description": "이번 판단 요약(기록용, 한두 문장)"
+    },
+    "notifications": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "kind",
+          "level",
+          "title",
+          "message",
+          "related_rule_ids"
+        ],
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": [
+              "alert",
+              "info",
+              "hourly_summary"
+            ]
+          },
+          "level": {
+            "type": "string",
+            "enum": [
+              "urgent",
+              "normal",
+              "quiet"
+            ]
+          },
+          "title": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "related_rule_ids": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    },
+    "rule_changes": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "upsert",
+        "delete"
+      ],
+      "properties": {
+        "upsert": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "id",
+              "description",
+              "entity_id",
+              "attribute",
+              "op",
+              "value",
+              "for_minutes",
+              "cooldown_minutes",
+              "priority",
+              "also",
+              "hour_from",
+              "hour_to"
+            ],
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "description": {
+                "type": "string"
+              },
+              "entity_id": {
+                "type": "string"
+              },
+              "attribute": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "op": {
+                "type": "string",
+                "enum": [
+                  "eq",
+                  "ne",
+                  "in",
+                  "not_in",
+                  "gt",
+                  "lt",
+                  "unavailable",
+                  "stale",
+                  "changes_gt",
+                  "rise_gt",
+                  "drop_gt",
+                  "older_than"
+                ]
+              },
+              "value": {
+                "type": [
+                  "string",
+                  "number",
+                  "null"
+                ]
+              },
+              "for_minutes": {
+                "type": "number"
+              },
+              "cooldown_minutes": {
+                "type": "number"
+              },
+              "priority": {
+                "type": "string",
+                "enum": [
+                  "urgent",
+                  "normal"
+                ]
+              },
+              "also": {
+                "type": "array",
+                "description": "함께 참이어야 하는 다른 조건(3개까지). 없으면 빈 배열",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "entity_id",
+                    "attribute",
+                    "op",
+                    "value"
+                  ],
+                  "properties": {
+                    "entity_id": {
+                      "type": "string"
+                    },
+                    "attribute": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "op": {
+                      "type": "string",
+                      "enum": [
+                        "eq",
+                        "ne",
+                        "in",
+                        "not_in",
+                        "gt",
+                        "lt",
+                        "unavailable",
+                        "older_than"
+                      ]
+                    },
+                    "value": {
+                      "type": [
+                        "string",
+                        "number",
+                        "null"
+                      ]
+                    }
+                  }
+                }
+              },
+              "hour_from": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "description": "이 시각(KST 0~23)부터만 본다. 시간대 제한이 없으면 null"
+              },
+              "hour_to": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "description": "이 시각(KST 0~24) 전까지만 본다. 시간대 제한이 없으면 null"
+              }
+            }
+          }
+        },
+        "delete": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "next_wakes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "at",
+          "reason"
+        ],
+        "properties": {
+          "at": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "memory": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mode",
+        "text"
+      ],
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": [
+            "keep",
+            "append",
+            "replace"
+          ]
+        },
+        "text": {
+          "type": "string"
+        }
+      }
+    },
+    "info_requests": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "kind",
+          "entity_ids",
+          "hours"
+        ],
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": [
+              "history",
+              "statistics",
+              "logbook"
+            ]
+          },
+          "entity_ids": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "hours": {
+            "type": "number"
+          }
+        }
+      }
+    },
+    "actions": {
+      "type": "array",
+      "description": "기기 켜기/끄기. 행동 권한에 적힌 엔티티만. 없으면 빈 배열",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "entity_id",
+          "action",
+          "reason",
+          "requested"
+        ],
+        "properties": {
+          "entity_id": {
+            "type": "string"
+          },
+          "action": {
+            "type": "string",
+            "enum": [
+              "turn_on",
+              "turn_off"
+            ]
+          },
+          "reason": {
+            "type": "string",
+            "description": "사용자에게 보여줄 이유(한국어, 한 문장)"
+          },
+          "requested": {
+            "type": "boolean",
+            "description": "깨운 이유가 [사용자 말]이고 사용자가 그 말에서 직접 시킨 행동이면 true(승인을 다시 묻지 않고 바로 실행). 스스로 판단한 행동은 false"
+          }
+        }
+      }
+    },
+    "report": {
+      "type": "string",
+      "description": "주간 분석 보고서(마크다운). 주간 분석(weekly) 깨움에서만 쓰고 그 밖에는 빈 문자열"
+    }
+  }
+}

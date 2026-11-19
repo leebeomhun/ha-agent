@@ -1,0 +1,11 @@
+{
+  "name": "ha-agent",
+  "private": true,
+  "type": "module",
+  "description": "HA 집 비서: 규칙으로 실시간 감시하고 Codex가 판단해 알림",
+  "scripts": {
+    "start": "node src/main.mjs",
+    "test": "node --test test/*.test.mjs",
+    "status": "node src/cli.mjs status"
+  }
+}

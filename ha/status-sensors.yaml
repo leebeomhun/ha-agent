@@ -1,0 +1,81 @@
+# 집 비서 상태를 HA 대시보드(거실 iPad 등)에 보여 주는 센서 (HA에 직접 추가해야 합니다)
+#
+# 집 비서는 60초마다 haagent_heartbeat 이벤트에 자기 상태를 실어 보냅니다. 아래 센서들이 그 값을 받아 둡니다.
+# 집 비서는 HA 설정을 고칠 권한이 없으므로 이 파일은 사람이 넣어야 합니다.
+#
+# 추가 방법
+#   1. HA의 configuration.yaml에 아래 `template:` 블록을 붙여 넣습니다.
+#      (이미 `template:`이 있으면 그 아래에 `- triggers:`부터의 항목만 덧붙입니다.)
+#   2. 개발자 도구 → YAML → "템플릿 엔티티" 다시 읽기 (또는 HA 재시작)
+#   3. 1분쯤 뒤 sensor.jib_biseo_* 엔티티가 생깁니다(이름은 HA가 정하므로 조금 다를 수 있습니다).
+#
+# 생기는 엔티티
+#   - 집 비서 연결 (binary_sensor): 신호가 3분 넘게 없으면 꺼짐
+#   - 집 비서 상태: 정상 / 일시정지 / 시험 모드 / 판단 실패 / 대체 방식으로 판단 중
+#   - 집 비서 오늘 판단, 오늘 알림: 오늘 횟수
+#   - 집 비서 마지막 판단: 마지막 판단의 요약 한 줄(속성에 시각)
+template:
+  - triggers:
+      - trigger: event
+        event_type: haagent_heartbeat
+    binary_sensor:
+      - name: 집 비서 연결
+        unique_id: haagent_alive
+        device_class: connectivity
+        state: "true"
+        auto_off: "00:03:00"
+    sensor:
+      - name: 집 비서 상태
+        unique_id: haagent_status
+        icon: mdi:robot-happy-outline
+        state: >-
+          {% set d = trigger.event.data %}
+          {% if d.paused %}일시정지
+          {% elif d.failures | int(0) >= 3 %}판단 실패
+          {% elif d.failover %}대체 방식으로 판단 중
+          {% elif not d.send | default(true) %}시험 모드
+          {% else %}정상{% endif %}
+        attributes:
+          brain: "{{ trigger.event.data.brain }}"
+          failures: "{{ trigger.event.data.failures }}"
+          rules: "{{ trigger.event.data.rules }}"
+          rules_true: "{{ trigger.event.data.rules_true }}"
+          queue: "{{ trigger.event.data.queue }}"
+          held: "{{ trigger.event.data.held }}"
+          pending_actions: "{{ trigger.event.data.pending_actions }}"
+      - name: 집 비서 오늘 판단
+        unique_id: haagent_runs_today
+        icon: mdi:head-cog-outline
+        unit_of_measurement: 회
+        state: "{{ trigger.event.data.runs_today | int(0) }}"
+      - name: 집 비서 오늘 알림
+        unique_id: haagent_alerts_today
+        icon: mdi:bell-outline
+        unit_of_measurement: 개
+        state: "{{ trigger.event.data.alerts_today | int(0) + trigger.event.data.summaries_today | int(0) }}"
+        attributes:
+          alerts: "{{ trigger.event.data.alerts_today }}"
+          summaries: "{{ trigger.event.data.summaries_today }}"
+          actions: "{{ trigger.event.data.actions_today }}"
+      - name: 집 비서 마지막 판단
+        unique_id: haagent_last_run
+        icon: mdi:text-box-check-outline
+        state: "{{ (trigger.event.data.last_summary or '아직 없음')[:250] }}"
+        attributes:
+          at: "{{ trigger.event.data.last_run }}"
+          ok: "{{ trigger.event.data.last_ok }}"
+
+# 대시보드 카드 예 (대시보드 편집 → 카드 추가 → 수동 → 붙여넣기. 엔티티 id는 실제로 생긴 것으로 맞춥니다)
+#
+# type: entities
+# title: 집 비서
+# entities:
+#   - entity: binary_sensor.jib_biseo_yeongyeol
+#   - entity: sensor.jib_biseo_sangtae
+#   - entity: sensor.jib_biseo_oneul_pandan
+#   - entity: sensor.jib_biseo_oneul_alrim
+#   - type: attribute
+#     entity: sensor.jib_biseo_majimag_pandan
+#     attribute: at
+#     name: 마지막 판단 시각
+#   - entity: sensor.jib_biseo_majimag_pandan

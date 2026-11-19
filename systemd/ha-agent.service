@@ -1,0 +1,15 @@
+[Unit]
+Description=HA 집 비서 (규칙 감시 + Codex 판단)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/ubuntu/ha-agent
+ExecStart=/usr/bin/env node /home/ubuntu/ha-agent/src/main.mjs
+Environment=PATH=/home/ubuntu/.npm-global/bin:/usr/local/bin:/usr/bin:/bin
+Restart=always
+RestartSec=15
+
+[Install]
+WantedBy=default.target
