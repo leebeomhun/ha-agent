@@ -28,13 +28,21 @@ export function apiKey(cfg, { env = process.env, envFile = join(ROOT, '.env') } 
 	throw new Error(`API 키를 찾지 못함: 환경 변수 ${a.key_env}, 프로젝트의 .env, config.json의 api.key_file 가운데 하나에 넣어야 함`)
 }
 
-// ── 파일 도구: brainDir 안에서만, 읽기만 ──
+// ── 파일 도구: brainDir/run 안에서만, 읽기만 ──
+function runRootOf(brainDir) {
+	const brainRoot = realpathSync(brainDir)
+	let runRoot
+	try { runRoot = realpathSync(join(brainRoot, 'run')) } catch { return { brainRoot, runRoot: null } }
+	if (runRoot !== brainRoot && !runRoot.startsWith(brainRoot + sep)) throw new Error('run 폴더 경로가 올바르지 않음')
+	return { brainRoot, runRoot }
+}
 function inside(brainDir, p) {
 	if (typeof p !== 'string' || !p) throw new Error('path가 비어 있음')
-	const root = realpathSync(brainDir)
+	const { brainRoot, runRoot } = runRootOf(brainDir)
+	if (!runRoot) throw new Error(`파일 없음: ${p}`)
 	let real
-	try { real = realpathSync(resolve(root, p)) } catch { throw new Error(`파일 없음: ${p}`) }
-	if (real !== root && !real.startsWith(root + sep)) throw new Error('이 폴더 밖은 읽을 수 없음')
+	try { real = realpathSync(resolve(brainRoot, p)) } catch { throw new Error(`파일 없음: ${p}`) }
+	if (real !== runRoot && !real.startsWith(runRoot + sep)) throw new Error('이 폴더 밖은 읽을 수 없음')
 	return real
 }
 function walk(dir, root, out = []) {
@@ -50,8 +58,9 @@ const int = (v, dflt, min, max) => Math.min(Math.max(Number.isFinite(Number(v)) 
 
 const TOOL_FNS = {
 	list_files({ brainDir }) {
-		const root = realpathSync(brainDir)
-		return walk(root, root).map(f => `${f}  ${statSync(join(root, f)).size}바이트`).join('\n') || '(파일 없음)'
+		const { brainRoot, runRoot } = runRootOf(brainDir)
+		if (!runRoot) return '(파일 없음)'
+		return walk(runRoot, brainRoot).map(f => `${f}  ${statSync(join(brainRoot, f)).size}바이트`).join('\n') || '(파일 없음)'
 	},
 	read_file({ brainDir }, a) {
 		const lines = readFileSync(inside(brainDir, a.path), 'utf8').split('\n')
@@ -63,12 +72,12 @@ const TOOL_FNS = {
 	// 모델이 준 정규식을 Node에서 돌리면 나쁜 패턴 하나로 주 루프가 멈출 수 있어, 시간 제한을 걸고 grep에 맡긴다.
 	grep({ brainDir }, a) {
 		if (typeof a.pattern !== 'string' || !a.pattern) throw new Error('pattern이 비어 있음')
-		const root = realpathSync(brainDir)
-		const files = a.path ? [relative(root, inside(brainDir, a.path))] : walk(root, root)
+		const { brainRoot, runRoot } = runRootOf(brainDir)
+		const files = a.path ? [relative(brainRoot, inside(brainDir, a.path))] : (runRoot ? walk(runRoot, brainRoot) : [])
 		if (!files.length) return '(파일 없음)'
 		const args = ['-n', '-H', '-i', '-E', '-m', String(int(a.max_matches, 50, 1, 200)), '-C', String(int(a.context, 0, 0, 20)), '-e', a.pattern, '--', ...files]
 		return new Promise((done, fail) => {
-			execFile('grep', args, { cwd: root, timeout: 5000, maxBuffer: 4 << 20, env: { PATH: process.env.PATH, LC_ALL: 'C.UTF-8' } }, (err, stdout, stderr) => {
+			execFile('grep', args, { cwd: brainRoot, timeout: 5000, maxBuffer: 4 << 20, env: { PATH: process.env.PATH, LC_ALL: 'C.UTF-8' } }, (err, stdout, stderr) => {
 				if (!err) return done(clip(stdout))
 				if (err.code === 1) return done('(찾은 줄 없음)')
 				fail(new Error(err.killed ? '검색이 너무 오래 걸림. 패턴을 단순하게 한다' : `grep 오류: ${String(stderr || err.message).trim().slice(0, 200)}`))
@@ -135,6 +144,15 @@ const sleep = (ms, signal) => new Promise((done, fail) => {
 	const t = setTimeout(done, ms)
 	signal.addEventListener('abort', () => { clearTimeout(t); fail(signal.reason) }, { once: true })
 })
+function retryAfterMs(res) {
+	const raw = res?.headers?.get?.('retry-after')
+	if (!raw) return null
+	const sec = Number(raw)
+	if (Number.isFinite(sec) && sec >= 0) return Math.min(Math.round(sec * 1000), 30000)
+	const ts = Date.parse(raw)
+	if (Number.isFinite(ts)) return Math.min(Math.max(0, ts - Date.now()), 30000)
+	return null
+}
 
 // 잠깐의 오류(한도·서버 오류·연결 끊김)는 두 번까지 다시 보낸다. 그 밖은 판단 실패로 올려 본체가 다시 깨운다.
 async function post({ url, key, body, signal, fetchFn }) {
@@ -155,7 +173,7 @@ async function post({ url, key, body, signal, fetchFn }) {
 			if (!RETRY_STATUS.has(res.status)) throw err
 		}
 		if (attempt >= 2) throw err
-		await sleep(2000 * 3 ** attempt, signal)
+		await sleep(retryAfterMs(res) ?? (2000 * 3 ** attempt), signal)
 	}
 }
 
@@ -170,7 +188,7 @@ function finalAnswer(res) {
 }
 
 // runCodex와 같은 모양으로 받고 돌려준다. 대화는 OpenAI에 저장하지 않고(store: false) 매번 전체를 다시 보낸다.
-export async function runApi({ cfg, prompt, effort, timeoutSec, model, brainDir = P.brain, runDir = P.run, schema = P.schema, fetchFn = fetch }) {
+export async function runApi({ cfg, prompt, effort, timeoutSec, model, brainDir = P.brain, runDir = P.run, schema = P.schema, fetchFn = fetch, signal }) {
 	const key = apiKey(cfg)
 	const format = { type: 'json_schema', name: 'ha_agent_answer', strict: true, schema: JSON.parse(readFileSync(schema, 'utf8')) }
 	// Codex가 남긴 지난 답을 자료로 읽지 않게 지운다.
@@ -178,8 +196,15 @@ export async function runApi({ cfg, prompt, effort, timeoutSec, model, brainDir 
 	const url = `${cfg.api.base_url.replace(/\/+$/, '')}/responses`
 	const started = Date.now(), ctl = new AbortController()
 	const timer = setTimeout(() => ctl.abort(new Error(`API 응답 시간 초과 (${timeoutSec}초)`)), timeoutSec * 1000)
+	const onAbort = () => ctl.abort(signal.reason instanceof Error ? signal.reason : new Error('API 중단됨'))
+	if (signal) {
+		if (signal.aborted) onAbort()
+		else signal.addEventListener('abort', onAbort, { once: true })
+	}
+	const useReasoning = effort && !['none', 'off', 'disabled'].includes(String(effort).toLowerCase())
 	const input = [{ role: 'user', content: prompt }]
 	let tokens = 0, calls = 0, chars = 0
+	const usage = { input: 0, cached: 0, output: 0, reasoning: 0 }
 	try {
 		for (;;) {
 			// 도구 호출 한도에 닿으면 도구 없이 답만 받는다.
@@ -189,13 +214,23 @@ export async function runApi({ cfg, prompt, effort, timeoutSec, model, brainDir 
 				body: {
 					model: model ?? cfg.api.model ?? cfg.codex.model, instructions: INSTRUCTIONS, input,
 					tools: TOOLS, tool_choice: last ? 'none' : 'auto',
-					reasoning: { effort }, text: { format },
-					store: false, include: ['reasoning.encrypted_content'],
+					text: { format }, store: false,
+					...(useReasoning ? { reasoning: { effort }, include: ['reasoning.encrypted_content'] } : {}),
 				},
 			})
-			tokens += res.usage?.total_tokens ?? 0
+			const u = res.usage
+			if (u) {
+				tokens += u.total_tokens ?? ((u.input_tokens ?? 0) + (u.output_tokens ?? 0))
+				usage.input += u.input_tokens ?? 0
+				usage.cached += u.input_tokens_details?.cached_tokens ?? 0
+				usage.output += u.output_tokens ?? 0
+				usage.reasoning += u.output_tokens_details?.reasoning_tokens ?? 0
+			}
 			const asked = (res.output ?? []).filter(o => o.type === 'function_call')
-			if (!asked.length || last) return { result: finalAnswer(res), ms: Date.now() - started, tokens: tokens || null, tool_calls: calls }
+			if (!asked.length || last) {
+				const hasUsage = usage.input || usage.cached || usage.output || usage.reasoning
+				return { result: finalAnswer(res), ms: Date.now() - started, tokens: tokens || null, usage: hasUsage ? usage : null, tool_calls: calls }
+			}
 			// 추론 항목(암호화된 것)과 도구 호출을 그대로 되돌려 보내야 다음 차례가 이어진다.
 			input.push(...res.output)
 			for (const c of asked) {
@@ -209,5 +244,5 @@ export async function runApi({ cfg, prompt, effort, timeoutSec, model, brainDir 
 	} catch (e) {
 		if (ctl.signal.aborted) throw ctl.signal.reason
 		throw e
-	} finally { clearTimeout(timer) }
+	} finally { clearTimeout(timer); signal?.removeEventListener('abort', onAbort) }
 }

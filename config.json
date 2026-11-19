@@ -3,6 +3,8 @@
   "mobile_app_ibeomhun"
  ],
  "weather_entity": "weather.seoul_weather",
+ "weather_fallback_entity": "weather.jib",
+ "away_override_entity": "input_boolean.household_occupied_override",
  "active_hours": {
   "start": 7,
   "end": 23
@@ -11,7 +13,12 @@
  "reflection_hour": 23,
  "noise_entities": [
   "binary_sensor.*_kiosk_screensaver",
+  "binary_sensor.seoul_weatheri_*",
   "sensor.*_wi_fi_connection",
+  "sensor.*_battery_state",
+  "sensor.*_charger_type",
+  "device_tracker.*",
+  "input_select.gonggi_*",
   "sensor.seoul_*"
  ],
  "limits": {
@@ -23,8 +30,16 @@
  },
  "codex": {
   "model": "gpt-6.1-terra",
+  "fallback_model": "gpt-6.1-sol",
   "effort": "high",
+  "effort_hourly": "low",
   "effort_deep": "max"
+ },
+ "api": {
+  "model": "gpt-6.1-sol",
+  "effort": "low",
+  "effort_hourly": "low",
+  "effort_deep": "medium"
  },
  "actions": {
   "enabled": true,

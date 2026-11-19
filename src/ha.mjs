@@ -67,7 +67,10 @@ export class HA extends EventEmitter {
 		this.nextId = 1
 		this.pending = new Map()
 		this.subs = new Map()
-		ws.onmessage = e => { if (this.ws === ws) this.#onMessage(JSON.parse(e.data)) }
+		ws.onmessage = e => {
+			if (this.ws !== ws) return
+			try { this.#onMessage(JSON.parse(e.data)) } catch (err) { this.#lost(`메시지 파싱 실패: ${err.message}`) }
+		}
 		ws.onclose = () => { if (this.ws === ws) this.#lost('연결 끊김') }
 		// Node 22의 WebSocket은 접속 자체가 실패하면(연결 거부·네트워크 순간 끊김·101이 아닌 응답) error만 보내고 close는 보내지 않는다.
 		// 그래서 error도 끊김으로 다뤄야 다시 연결한다. 2026-11-14 23:00 Tailscale이 몇 초 끊긴 사이 재연결이 한 번 실패한 뒤 영영 멈췄다.
@@ -98,7 +101,14 @@ export class HA extends EventEmitter {
 
 	#onMessage(m) {
 		if (m.type === 'auth_required') {
-			this.ws.send(JSON.stringify({ type: 'auth', access_token: readFileSync(this.tokenFile, 'utf8').trim() }))
+			try {
+				const token = readFileSync(this.tokenFile, 'utf8').trim()
+				if (!token) throw new Error('토큰 파일이 비어 있음')
+				this.ws.send(JSON.stringify({ type: 'auth', access_token: token }))
+			} catch (err) {
+				log('HA 인증 준비 실패:', err.message)
+				this.#lost(`인증 준비 실패: ${err.message}`)
+			}
 		} else if (m.type === 'auth_ok') {
 			this.#ready().catch(e => this.#lost(`초기화 실패: ${e.message}`))
 		} else if (m.type === 'auth_invalid') {
@@ -143,7 +153,13 @@ export class HA extends EventEmitter {
 		return new Promise((res, rej) => {
 			const t = setTimeout(() => { pending.delete(id); rej(new Error(`시간 초과: ${msg.type}`)) }, timeoutMs)
 			pending.set(id, { res: v => { clearTimeout(t); res(v) }, rej: e => { clearTimeout(t); rej(e) } })
-			ws.send(JSON.stringify({ id, ...msg }))
+			try {
+				ws.send(JSON.stringify({ id, ...msg }))
+			} catch (e) {
+				clearTimeout(t)
+				pending.delete(id)
+				rej(e)
+			}
 		})
 	}
 

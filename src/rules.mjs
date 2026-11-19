@@ -13,8 +13,13 @@ const ATTR_RE = /^[A-Za-z0-9_]{1,64}$/
 const DEAD = new Set(['unavailable', 'unknown'])
 const MAX_ALSO = 3
 const readValue = (rule, st) => (rule.attribute ? st?.attributes?.[rule.attribute] : st?.state)
+export const recentFires = (rt, now = Date.now()) => (rt?.fire_log ?? []).filter(t => now - t < 7 * 86400000)
 // 시각을 값으로 갖는 엔티티(timestamp 센서, last_triggered 같은 속성)의 값을 ms로. 시각 모양이 아니면 NaN.
-const tsOf = v => (typeof v === 'string' && /^\d{4}-\d\d-\d\d[T ]\d\d:\d\d/.test(v) ? Date.parse(v) : NaN)
+const tsOf = v => {
+	if (typeof v !== 'string' || !/^\d{4}-\d\d-\d\d[T ]\d\d:\d\d/.test(v)) return NaN
+	const iso = v.replace(' ', 'T')
+	return Date.parse(/(?:[zZ]|[+-]\d\d:?\d\d)$/.test(iso) ? iso : `${iso}+09:00`)
+}
 
 function checkCond(c, states, ops, e, label = '') {
 	if (!states.has(c.entity_id)) e.push(`${label}없는 엔티티 ${c.entity_id}`)
@@ -25,7 +30,9 @@ function checkCond(c, states, ops, e, label = '') {
 	if (c.op === 'older_than') {
 		if (!(Number(c.value) > 0)) e.push(`${label}older_than의 value는 0보다 큰 분 수`)
 		const st = states.get(c.entity_id)
-		if (st && !DEAD.has(st.state) && !Number.isFinite(tsOf(readValue(c, st)))) e.push(`${label}older_than은 값이 시각(timestamp)인 엔티티·속성에만 쓴다 (지금 값 ${JSON.stringify(readValue(c, st) ?? null)})`)
+		const val = readValue(c, st)
+		const allowNull = c.attribute === 'last_triggered' && val == null
+		if (st && !DEAD.has(st.state) && !allowNull && !Number.isFinite(tsOf(val))) e.push(`${label}older_than은 값이 시각(timestamp)인 엔티티·속성에만 쓴다 (지금 값 ${JSON.stringify(val ?? null)})`)
 	}
 }
 

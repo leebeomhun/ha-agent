@@ -1,15 +1,17 @@
 // 관리 명령: node src/cli.mjs <명령>
-import { writeFileSync, mkdirSync, existsSync, readFileSync, rmSync, cpSync } from 'node:fs'
+import { writeFileSync, mkdirSync, existsSync, readFileSync, rmSync, cpSync, copyFileSync, statSync, readdirSync } from 'node:fs'
 import { join } from 'node:path'
-import { P, readJson, readJsonl, latestBy, fmt, kst } from './util.mjs'
-import { loadConfig, loadControl, saveControl } from './config.mjs'
+import { P, ROOT, readJson, writeJson, readJsonlAll, latestBy, fmt, kst, newId, expandHome } from './util.mjs'
+import { loadConfig, loadControl, saveControl, validateConfig } from './config.mjs'
 import { MODES, MODE_LABEL, brainMode, brainSettings, selfCheck } from './brain.mjs'
+import { recentFires } from './rules.mjs'
+import { rangeStats } from './records.mjs'
 
 const [cmd, ...rest] = process.argv.slice(2)
 const daemonPid = () => { const p = Number(existsSync(P.pid) ? readFileSync(P.pid, 'utf8') : 0); try { return p && process.kill(p, 0) ? p : 0 } catch { return 0 } }
 const toInbox = obj => {
 	mkdirSync(P.inbox, { recursive: true })
-	writeFileSync(join(P.inbox, `${Date.now()}.json`), JSON.stringify(obj))
+	writeJson(join(P.inbox, `${Date.now()}-${newId()}.json`), obj)
 }
 const VERB = { turn_on: '켜기', turn_off: '끄기' }
 const MODE_DESC = { codex: 'Codex CLI', api: 'OpenAI API 직접 호출' }
@@ -17,7 +19,7 @@ const MODE_DESC = { codex: 'Codex CLI', api: 'OpenAI API 직접 호출' }
 const brainLine = (cfg, c) => {
 	const mode = brainMode(cfg, c), s = brainSettings(cfg, mode)
 	const from = MODES.includes(c.brain) ? `cli brain으로 바꿈, config.json은 ${brainMode(cfg)}` : 'config.json'
-	return `판단 방식: ${mode} (${MODE_DESC[mode]}) | 모델 ${s.model}, 노력 ${s.effort}/${s.effort_deep} | ${from}`
+	return `판단 방식: ${mode} (${MODE_DESC[mode]}) | 모델 ${s.model}, 노력 ${s.effort_hourly}/${s.effort}/${s.effort_deep} | ${from}`
 }
 
 const cmds = {
@@ -25,8 +27,8 @@ const cmds = {
 		const c = loadControl(), cfg = loadConfig(), rules = readJson(P.rules, null), rt = readJson(P.runtime, { rules: {} }).rules ?? {}
 		const cnt = readJson(P.counters, {}), sched = readJson(P.schedule, []), held = readJson(P.held, [])
 		const q = readJson(P.queue, {}), outbox = readJson(P.outbox, [])
-		const pending = latestBy(readJsonl(P.actions), 'aid').filter(a => a.status === 'pending')
-		const last = readJsonl(P.decisions).slice(-1)[0]
+		const pending = latestBy(readJsonlAll(P.actions), 'aid').filter(a => a.status === 'pending')
+		const last = readJsonlAll(P.decisions).slice(-1)[0]
 		console.log(`데몬: ${daemonPid() ? `실행 중 (pid ${daemonPid()})` : '꺼짐'} | ${c.paused ? '일시정지' : '동작'} | 알림 발송 ${c.send ? '켜짐' : '꺼짐(시험 모드)'}`)
 		console.log(brainLine(cfg, c))
 		console.log(`오늘(${cnt.date ?? '-'}): 판단 ${cnt.runs ?? 0}회, 알림 ${cnt.alerts ?? 0}개, 요약 ${cnt.summaries ?? 0}개, 행동 ${cnt.actions ?? 0}회`)
@@ -42,18 +44,20 @@ const cmds = {
 	},
 	rules() {
 		const rules = readJson(P.rules, null)?.rules ?? [], rt = readJson(P.runtime, { rules: {} }).rules ?? {}
+		const now = Date.now()
 		const cond = c => `${c.entity_id}${c.attribute ? `[${c.attribute}]` : ''} ${c.op} ${c.value ?? ''}`.trim()
 		for (const r of rules) {
 			const x = rt[r.id] ?? {}
 			const extra = [...(r.also ?? []).map(c => `그리고 ${cond(c)}`), ...(r.hour_from != null ? [`${r.hour_from}~${r.hour_to}시만`] : [])]
-			console.log(`${r.id}  [${r.priority}] ${r.description}\n    ${cond(r)}${extra.length ? ` · ${extra.join(' · ')}` : ''} · ${r.for_minutes}분 · 쿨다운 ${r.cooldown_minutes}분 · 7일 발동 ${(x.fire_log ?? []).length}회${x.backtest ? ` · 백테스트 ${x.backtest.days}일 ${x.backtest.fires}회` : ''}${x.waiting ? ' · 쿨다운·쉼 뒤 발동 대기' : ''}${x.muted_until > Date.now() ? ` · ${fmt(x.muted_until)}까지 쉼` : ''}`)
+			console.log(`${r.id}  [${r.priority}] ${r.description}\n    ${cond(r)}${extra.length ? ` · ${extra.join(' · ')}` : ''} · ${r.for_minutes}분 · 쿨다운 ${r.cooldown_minutes}분 · 7일 발동 ${recentFires(x, now).length}회${x.backtest ? ` · 백테스트 ${x.backtest.days}일 ${x.backtest.fires}회` : ''}${x.waiting ? ' · 쿨다운·쉼 뒤 발동 대기' : ''}${x.muted_until > now ? ` · ${fmt(x.muted_until)}까지 쉼` : ''}`)
 		}
 		if (!rules.length) console.log('규칙 없음')
 	},
 	log() {
 		const n = Number(rest[0]) || 10
-		for (const d of readJsonl(P.decisions).slice(-n)) {
-			console.log(`${fmt(Date.parse(d.ts))} [${d.reasons.join(', ')}] ${Math.round(d.total_ms / 1000)}초 토큰 ${d.tokens ?? '?'}${d.rounds > 1 ? ` (${d.rounds}번 물음)` : ''}${d.skipped ? ' (건너뜀)' : ''}${d.deferred ? ' (미룸)' : ''}${d.brain === 'api' ? ' [api]' : ''}${d.failover ? ' (자동 전환)' : ''}`)
+		for (const d of readJsonlAll(P.decisions).slice(-n)) {
+			const u = d.usage ? ` (입력 ${d.usage.input}/캐시 ${d.usage.cached}/출력 ${d.usage.output}/추론 ${d.usage.reasoning})` : ''
+			console.log(`${fmt(Date.parse(d.ts))} [${d.reasons.join(', ')}] ${Math.round(d.total_ms / 1000)}초 토큰 ${d.tokens ?? '?'}${u}${d.rounds > 1 ? ` (${d.rounds}번 물음)` : ''}${d.skipped ? ' (건너뜀)' : ''}${d.deferred ? ' (미룸)' : ''}${d.brain === 'api' ? ' [api]' : ''}${d.failover ? ' (자동 전환)' : ''}`)
 			console.log(`  ${d.error ? `실패: ${d.error}` : d.summary}`)
 			const a = d.applied
 			if (a) {
@@ -74,11 +78,11 @@ const cmds = {
 	},
 	notes() {
 		const day = rest[0] ?? kst().date
-		for (const n of latestBy(readJsonl(P.notifications), 'nid').filter(n => kst(new Date(n.ts)).date === day)) console.log(`${kst(new Date(n.ts)).hm} [${n.kind}/${n.level}/${n.status}] ${n.title} — ${n.message}`)
+		for (const n of latestBy(readJsonlAll(P.notifications), 'nid').filter(n => kst(new Date(n.ts)).date === day)) console.log(`${kst(new Date(n.ts)).hm} [${n.kind}/${n.level}/${n.status}] ${n.title} — ${n.message}`)
 	},
 	actions() {
 		const n = Number(rest[0]) || 20
-		const list = latestBy(readJsonl(P.actions), 'aid').slice(-n)
+		const list = latestBy(readJsonlAll(P.actions), 'aid').slice(-n)
 		for (const a of list) console.log(`${fmt(Date.parse(a.ts))} [${a.tier}/${a.status}] ${a.name} ${VERB[a.action]} — ${a.reason}${a.error ? ` (${a.error})` : ''}`)
 		if (!list.length) console.log('행동 기록 없음')
 	},
@@ -181,13 +185,18 @@ const cmds = {
 		rmSync(P.replay, { recursive: true, force: true })
 		mkdirSync(join(P.replay, 'run'), { recursive: true })
 		if (existsSync(join(dir, 'files'))) cpSync(join(dir, 'files'), join(P.replay, 'run'), { recursive: true })
+		const replayAutoCfg = join(P.replay, 'run', 'automation-configs.json')
+		if (!existsSync(replayAutoCfg) && existsSync(join(P.run, 'automation-configs.json'))) {
+			copyFileSync(join(P.run, 'automation-configs.json'), replayAutoCfg)
+		}
 		let input = readJson(join(dir, 'input.json'), null)
 		if (typeof input === 'string') input = JSON.parse(input) // 예전 보관분은 문자열로 한 번 더 감싸여 있다
 		const weekly = input.reasons.some(r => r.type === 'weekly')
 		const deep = weekly || input.reasons.some(r => r.type === 'bootstrap' || r.type === 'reflection')
+		const pureHourly = !deep && input.reasons.length === 1 && input.reasons[0].type === 'hourly'
 		const prompt = buildPrompt({ ...input, guide: readFileSync(P.guide, 'utf8'), infoFiles: [], lastRound: true })
 		console.log(`다시 묻는 중: ${name} (${MODE_LABEL[mode]} ${bs.model}, 지금의 GUIDE.md, 추가 자료 요청 없이 한 번)`)
-		const r = await runBrain({ cfg, mode, prompt, model: bs.model, effort: deep ? bs.effort_deep : bs.effort, timeoutSec: weekly ? cfg.weekly.timeout_seconds : deep ? bs.timeout_deep_seconds : bs.timeout_seconds, brainDir: P.replay, runDir: join(P.replay, 'run') })
+		const r = await runBrain({ cfg, mode, prompt, model: bs.model, effort: deep ? bs.effort_deep : pureHourly ? bs.effort_hourly : bs.effort, timeoutSec: weekly ? cfg.weekly.timeout_seconds : deep ? bs.timeout_deep_seconds : bs.timeout_seconds, brainDir: P.replay, runDir: join(P.replay, 'run') })
 		let last = 1
 		while (existsSync(join(dir, `answer-${last + 1}.json`))) last++
 		const old = readJson(join(dir, `answer-${last}.json`), null)
@@ -195,6 +204,101 @@ const cmds = {
 		console.log(JSON.stringify(old && validateResponse(old), null, 1))
 		console.log(`── 지금의 답 (${MODE_LABEL[mode]}, ${Math.round(r.ms / 1000)}초, 토큰 ${r.tokens ?? '?'}${r.tool_calls != null ? `, 파일 도구 ${r.tool_calls}번` : ''}) ──`)
 		console.log(JSON.stringify(validateResponse(r.result), null, 1))
+	},
+	doctor() {
+		const cfg = loadConfig(), c = loadControl(), rt = readJson(P.runtime, {})
+		let errors = 0, warnings = 0
+		const ok = msg => console.log(`[OK]   ${msg}`)
+		const warn = msg => { warnings++; console.log(`[WARN] ${msg}`) }
+		const fail = msg => { errors++; console.log(`[FAIL] ${msg}`) }
+
+		const pid = daemonPid()
+		if (pid) ok(`데몬 실행 중 (pid ${pid}, ${c.paused ? '일시정지' : '동작'}, 알림 ${c.send ? '켜짐' : '꺼짐'})`)
+		else warn('데몬이 꺼져 있음')
+
+		const cfgRes = validateConfig(cfg)
+		if (!cfgRes.errors.length && !cfgRes.warnings.length) ok('config.json 설정 유효')
+		for (const e of cfgRes.errors) fail(`설정: ${e}`)
+		for (const w of cfgRes.warnings) warn(`설정: ${w}`)
+
+		const mode = brainMode(cfg, c)
+		const mainChk = selfCheck(cfg, mode)
+		if (mainChk) fail(`주 판단 방식(${mode}): ${mainChk}`)
+		else ok(`주 판단 방식(${mode}): 사용 가능 (모델 ${brainSettings(cfg, mode).model})`)
+		const other = MODES.find(m => m !== mode)
+		const altChk = selfCheck(cfg, other)
+		if (altChk) warn(`대체 판단 방식(${other}): ${altChk}`)
+		else ok(`대체 판단 방식(${other}): 사용 가능 (모델 ${brainSettings(cfg, other).model})`)
+
+		const checkPerm = (label, filePath, required = false) => {
+			if (!filePath) return
+			const p = expandHome(filePath)
+			if (!existsSync(p)) return required ? fail(`${label} 파일 없음: ${filePath}`) : null
+			const modeBits = statSync(p).mode & 0o777
+			if (modeBits & 0o077) warn(`${label} 권한 과다 (${modeBits.toString(8)}): chmod 600 ${filePath} 권장`)
+			else ok(`${label} 권한 안전 (${modeBits.toString(8)})`)
+		}
+		checkPerm('HA 토큰', cfg.token_file, true)
+		checkPerm('.env', join(ROOT, '.env'), false)
+		checkPerm('API 키 파일', cfg.api.key_file, false)
+		checkPerm('OOB 토큰 파일', cfg.oob.token_file, false)
+
+		const baks = []
+		for (const dir of [ROOT, join(ROOT, 'src'), join(ROOT, 'test'), P.brain]) {
+			try {
+				for (const f of readdirSync(dir)) if (/\.bak($|-)/.test(f)) baks.push(join(dir, f).replace(ROOT + '/', ''))
+			} catch {}
+		}
+		if (baks.length) warn(`잔여 백업 파일 ${baks.length}개: ${baks.join(', ')}`)
+		else ok('잔여 백업 파일 없음')
+
+		if (cfg.oob?.type) ok(`비상 알림 길(oob): ${cfg.oob.type} 설정됨`)
+		else warn('비상 알림 길(oob) 꺼짐 (HA 단절 시 외부 알림 없음)')
+
+		if (cfg.heartbeat?.enabled) {
+			const beatAgeMin = rt.last_beat_ok ? Math.round((Date.now() - rt.last_beat_ok) / 60000) : null
+			if (beatAgeMin == null) warn('heartbeat 전달 기록 없음')
+			else if (beatAgeMin > cfg.heartbeat.alert_minutes) warn(`마지막 heartbeat ${beatAgeMin}분 전 (임계 ${cfg.heartbeat.alert_minutes}분 초과)`)
+			else ok(`heartbeat 정상 (${beatAgeMin}분 전)`)
+		}
+
+		const autos = readJson(join(P.run, 'automations.json'), null)
+		if (Array.isArray(autos)) {
+			const hb = autos.find(a => (a.watches ?? []).includes('haagent_heartbeat') || a.id === 'automation.jib_biseo_eungdab_eobseum_gyeonggo')
+			if (!hb) warn('HA에 heartbeat 응답 없음 경고 자동화 미설치 (ha/heartbeat-automation.yaml 참고)')
+			else if (hb.state !== 'on') warn(`HA heartbeat 자동화 꺼짐 (${hb.id})`)
+			else ok(`HA heartbeat 자동화 활성 (${hb.id})`)
+		}
+		const states = readJson(join(P.run, 'states.json'), null)
+		if (Array.isArray(states)) {
+			const hasSensors = states.some(s => /jib_biseo_yeongyeol|jib_biseo_sangtae|haagent_alive|haagent_status/i.test(s.id))
+			if (hasSensors) ok('HA 상태 센서(status-sensors.yaml) 적용됨')
+			else warn('HA 상태 센서(ha/status-sensors.yaml) 미적용 — 대시보드 표시·경량 heartbeat 전환 권장')
+		}
+		console.log(`점검 요약: 오류 ${errors}건, 주의 ${warnings}건`)
+		if (errors) process.exitCode = 1
+	},
+	stats() {
+		const days = Math.max(1, Number(rest[0]) || 7)
+		const s = rangeStats(days)
+		console.log(`=== 최근 ${s.days}일 통계 ===`)
+		console.log(`판단: 전체 ${s.total}회 (실행 ${s.real}, 건너뜀 ${s.skipped}, 미룸 ${s.deferred}, 실패 ${s.errors})`)
+		console.log(`빈 호출(알림·행동·규칙변경 없음): ${s.noop}회 (${s.noop_pct}%)`)
+		console.log(`토큰: 합계 ${s.tokens.toLocaleString()} (성공 회당 평균 ${s.avg_tokens.toLocaleString()})`)
+		if (s.usage) console.log(`세부 토큰(API): 입력 ${s.usage.input.toLocaleString()}, 캐시 ${s.usage.cached.toLocaleString()}, 출력 ${s.usage.output.toLocaleString()}, 추론 ${s.usage.reasoning.toLocaleString()}`)
+		const brains = Object.entries(s.by_brain).map(([k, v]) => `${k} ${v.runs}회(${v.tokens.toLocaleString()}tok${v.errors ? `, 실패 ${v.errors}` : ''})`)
+		if (brains.length) console.log(`방식별: ${brains.join(' | ')}`)
+		const reasons = Object.entries(s.by_reason).sort((a, b) => b[1].runs - a[1].runs)
+		if (reasons.length) {
+			console.log('이유별:')
+			for (const [k, v] of reasons) console.log(`  - ${k}: ${v.runs}회 (빈 호출 ${v.noop}회, 토큰 ${v.tokens.toLocaleString()})`)
+		}
+		console.log(`알림: 경고 ${s.notifications.sent_alerts}, 정보 ${s.notifications.sent_infos}, 요약 ${s.notifications.sent_summaries}, 미발송·기타 ${s.notifications.other}`)
+		console.log(`피드백: 도움됐어요 ${s.feedback.up}, 그만 ${s.feedback.mute}, 줄여 줘 ${s.feedback.less}, 답장 ${s.feedback.reply}`)
+		console.log(`행동: 실행 ${s.actions.done}, 거절 ${s.actions.declined}, 되돌림 ${s.actions.undone}, 실패 ${s.actions.error}`)
+		const rules = readJson(P.rules, null)?.rules ?? [], rt = readJson(P.runtime, { rules: {} }).rules ?? {}, now = Date.now()
+		const fired = rules.map(r => [r.id, recentFires(rt[r.id], now).length]).filter(([, n]) => n > 0).sort((a, b) => b[1] - a[1])
+		if (fired.length) console.log(`규칙 7일 발동: ${fired.map(([id, n]) => `${id}(${n}회)`).join(', ')}`)
 	},
 	async once() {
 		// 데몬과 따로 한 번 판단해 보고 결과만 보여준다(상태 파일·알림은 건드리지 않음).
@@ -212,7 +316,7 @@ const cmds = {
 }
 
 if (!cmds[cmd]) {
-	console.log('명령: status | rules | log [n] | notes [YYYY-MM-DD] | actions [n] | memory | weekly [list|run|publish|YYYY-MM-DD] | wake [이유] | say <말> | brain [codex|api|default] | pause | resume | send-on | send-off | history | restore <파일> | runs [n] | replay [이름|latest] [codex|api] | oob-test | once [bootstrap|hourly|weekly|manual] [이유]')
+	console.log('명령: status | rules | log [n] | notes [YYYY-MM-DD] | actions [n] | memory | stats [일수] | doctor | weekly [list|run|publish|YYYY-MM-DD] | wake [이유] | say <말> | brain [codex|api|default] | pause | resume | send-on | send-off | history | restore <파일> | runs [n] | replay [이름|latest] [codex|api] | oob-test | once [bootstrap|hourly|weekly|manual] [이유]')
 	process.exit(cmd ? 1 : 0)
 }
 await cmds[cmd]()

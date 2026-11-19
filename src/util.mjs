@@ -48,7 +48,7 @@ export function readJson(path, fallback) {
 }
 export function writeJson(path, data) {
 	mkdirSync(dirname(path), { recursive: true })
-	const tmp = `${path}.tmp`
+	const tmp = `${path}.${process.pid}.${newId()}.tmp`
 	writeFileSync(tmp, JSON.stringify(data, null, 1))
 	renameSync(tmp, path)
 }
@@ -61,6 +61,8 @@ export function readJsonl(path) {
 	try { text = readFileSync(path, 'utf8') } catch { return [] }
 	return text.split('\n').filter(Boolean).map(l => { try { return JSON.parse(l) } catch { return null } }).filter(Boolean)
 }
+// 로그 로테이션 직후에도 직전 세대(.1) 기록까지 이어서 읽는다.
+export const readJsonlAll = path => [...readJsonl(`${path}.1`), ...readJsonl(path)]
 // 같은 key의 줄이 여러 번 있으면(상태가 바뀔 때마다 덧붙임) 마지막 것만 남긴다. 순서는 처음 나온 자리.
 export function latestBy(list, key) {
 	const m = new Map()

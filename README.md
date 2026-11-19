@@ -15,13 +15,14 @@ HA를 실시간으로 지켜보다가 필요할 때 AI(Codex 또는 OpenAI API)�
 |---|---|---|
 | 묻는 길 | Codex CLI를 격리해 실행 (`src/brain.mjs`) | OpenAI Responses API 직접 호출 (`src/api.mjs`) |
 | 인증·요금 | Codex 로그인(ChatGPT 요금제 한도) | API 키, 쓴 토큰만큼 과금 |
-| 자료 읽기 | 격리된 셸에서 `jq`·`grep` | 읽기 전용 도구 4개(`list_files`·`grep`·`json_get`·`read_file`), `brain/` 안에서만 |
+| 자료 읽기 | 격리된 셸에서 `jq`·`grep` | 읽기 전용 도구 4개(`list_files`·`grep`·`json_get`·`read_file`), `brain/run/` 안에서만 |
 | 필요한 것 | `codex` 실행 파일 | 키: 환경 변수 `OPENAI_API_KEY`, 프로젝트 `.env`, 또는 `api.key_file` |
 
 - **고르기**: `config.json`의 `"brain": "codex"` 또는 `"api"`(재시작 필요). 실행 중에는 `node src/cli.mjs brain api`처럼 바꾸면 재시작 없이 다음 판단부터 따른다(`state/control.json`에 남고 `config.json`보다 먼저다. `brain default`로 되돌린다).
 - **확인**: `node src/cli.mjs brain`은 지금 방식과 두 방식을 쓸 수 있는지 보여준다. `status`에도 나오고, `log`에는 API로 한 판단에 `[api]`가 붙는다.
 - **견주기**: `node src/cli.mjs replay latest api`(또는 `codex`)로 같은 상황을 다른 방식에 물어 답·시간·토큰을 비교한다.
-- **모델·노력**: `api.model`·`api.effort` 등을 적지 않으면 `codex`의 값을 그대로 쓴다. API는 토큰만큼 요금이 나가니 `api.effort`·`api.effort_deep`을 따로 낮게 잡을 수 있다.
+- **모델·노력**: `api.model`·`api.effort` 등을 적지 않으면 `codex`의 값을 그대로 쓴다. API는 토큰만큼 요금이 나가니 `api.effort`·`api.effort_hourly`·`api.effort_deep`을 따로 낮게 잡을 수 있다. `codex.effort_hourly`(또는 `api.effort_hourly`)로 정각 점검 추론 노력만 따로 낮출 수도 있다.
+- **시스템 오류 자동 추적**: `system-log.json`과 `repairs.json`의 이전 횟수·시각을 `state/runtime.json`에 기억해 새로 생기거나 늘어난 항목만 프롬프트에 알리고, 신규 `ERROR` 발생 시에는 정각 점검을 건너뛰지 않는다.
 - **자동 전환**: 고른 방식이 2번 연속 실패하면(예: Codex 로그인 만료) 다른 방식으로 넘어가 2시간 동안 그쪽에 묻고, 그 뒤 원래 방식을 다시 써 본다(`failover`). 넘어갈 쪽을 쓸 수 있을 때만(API 키 또는 Codex 실행 파일) 동작하고, 넘어가면 하루 한 번 알린다. `log`에 `(자동 전환)`으로 남는다. 둘 다 실패하면 번갈아 시도한다.
 - API 방식은 대화를 OpenAI에 저장하지 않는다(`store: false`). 잠깐의 오류(429·5xx·연결 끊김)는 두 번까지 다시 보내고, 그래도 안 되면 Codex 때와 같이 깨움을 다시 넣는다.
 
@@ -44,7 +45,7 @@ HA를 실시간으로 지켜보다가 필요할 때 AI(Codex 또는 OpenAI API)�
 - 오래 걸리는 판단이라 다른 깨움과 섞지 않고 혼자 돈다. 그 시각에 꺼져 있었으면 그날 다시 켜질 때 돈다. 보고서 없이 끝나면 한 번 다시 시도한다.
 
 ## 사람 없이 굴러가기
-- **heartbeat**: 60초마다 HA로 `haagent_heartbeat` 이벤트를 보낸다. `ha/heartbeat-automation.yaml`을 HA에 추가하면 10분 넘게 끊길 때 HA가 휴대폰으로 알린다. 신호가 `heartbeat.alert_minutes`(기본 10분) 넘게 끊겼다 돌아오면(재시작 포함) 집 비서가 같은 tag로 '다시 연결됐어요'를 소리 없이 보내 그 경고를 바꿔 놓는다. 이벤트에는 상태(오늘 판단·알림 수, 실패 횟수, 판단 방식, 마지막 판단 요약)가 실려 있어 `ha/status-sensors.yaml`을 추가하면 대시보드에서 볼 수 있다.
+- **heartbeat**: 60초마다 HA로 `haagent_heartbeat` 이벤트를 보낸다. `ha/status-sensors.yaml`과 `ha/heartbeat-automation.yaml`을 HA에 추가하면 `binary_sensor.jib_biseo_yeongyeol`이 꺼진 뒤 7분(총 10분) 지날 때만 HA가 휴대폰으로 알린다(매분 자동화가 재실행되지 않는 경량 방식). 신호가 `heartbeat.alert_minutes`(기본 10분) 넘게 끊겼다 돌아오면(재시작 포함) 집 비서가 같은 tag로 '다시 연결됐어요'를 소리 없이 보내 그 경고를 바꿔 놓는다. 이벤트에는 상태(오늘 판단·알림 수, 실패 횟수, 판단 방식, 마지막 판단 요약)가 실려 있어 대시보드에서 볼 수 있다.
 - **비상 알림 길**: HA에 15분 넘게 연결하지 못하거나 urgent 알림을 못 보내면 HA 밖의 길로 알린다. `config.json`의 `oob`를 채워야 동작한다(아래 설정). `node src/cli.mjs oob-test`로 확인.
 - **멈춤 감시**: 주 루프가 5분 넘게 멈추면 프로세스를 끝내고 systemd가 다시 띄운다(`src/watchdog.mjs`).
 - **시작 점검**: 시작할 때 고른 판단 방식에 필요한 것(Codex 실행 파일 또는 API 키)과 지침·스키마를 확인하고 문제가 있으면 알린다. `codex.fallback_model`(API는 `api.fallback_model`)을 정하면 두 번 연속 실패한 뒤 그 모델로 시도한다.
@@ -80,6 +81,8 @@ node src/cli.mjs rules         # 감시 규칙
 node src/cli.mjs log [n]       # 최근 판단 기록
 node src/cli.mjs notes [날짜]   # 그날 알림
 node src/cli.mjs memory        # AI 메모
+node src/cli.mjs stats [일수]  # 최근 N일 운영·토큰·빈 호출 통계
+node src/cli.mjs doctor        # 설정·권한·연동·모델 상태 일괄 점검
 node src/cli.mjs weekly [list|run|publish|날짜]  # 주간 분석 보고서(최근 것 / 목록 / 지금 분석 / HA 알림에 다시 올리기 / 그날 것)
 node src/cli.mjs actions [n]   # 행동 기록
 node src/cli.mjs wake [이유]    # 지금 판단시키기
@@ -99,8 +102,10 @@ npm test                       # 단위 시험 + 통합 시험(가짜 HA·가짜
 
 ## 설정 (`config.json`, 바꾼 뒤 `systemctl --user restart ha-agent`)
 - `brain` 판단 방식: `"codex"`(기본) 또는 `"api"` (위 "판단 방식")
-- `api` API 방식 설정: `key_env`(기본 `OPENAI_API_KEY`), `key_file`(키를 둔 파일 경로), `base_url`, `max_tool_calls`(기본 30), 그리고 `model`·`fallback_model`·`effort`·`effort_deep`·`timeout_seconds`·`timeout_deep_seconds`(적지 않으면 `codex` 값)
-- `codex.model` 모델(기본 `gpt-6.1-sol`), `codex.effort` 평소 추론 노력(기본 `low`), `codex.effort_deep` 처음 시작·하루 돌아보기·주간 분석용(기본 `medium`)
+- `api` API 방식 설정: `key_env`(기본 `OPENAI_API_KEY`), `key_file`(키를 둔 파일 경로), `base_url`, `max_tool_calls`(기본 30), 그리고 `model`·`fallback_model`·`effort`·`effort_hourly`·`effort_deep`·`timeout_seconds`·`timeout_deep_seconds`(적지 않으면 `codex` 값)
+- `codex.model` 모델(기본 `gpt-6.1-sol`), `codex.effort` 평소 추론 노력(기본 `low`), `codex.effort_hourly` 정각 점검용(적지 않으면 `effort`), `codex.effort_deep` 처음 시작·하루 돌아보기·주간 분석용(기본 `medium`)
+- `weather_entity` 주 날씨 엔티티, `weather_fallback_entity` 주 날씨 조회 실패 시 대신 볼 보조 엔티티
+- `away_override_entity` 가족·손님 재실 도우미(`input_boolean` 등) — 켜짐 상태를 AI에게 함께 알린다
 - `notify_targets` 알림 받을 기기(`mobile_app_ibeomhun` 휴대폰, iPad는 `mobile_app_bh_s_ipad`)
 - `active_hours` 활동 시간(`start`~`end`시. 이 안의 매시 정각에 점검하고, 밖은 조용한 시간), `reflection_hour` 하루 돌아보기 시각(0~23, 활동 시간 밖이어도 된다. `null`이면 끔)
 - `limits` 한도, `hourly_skip_unchanged` 달라진 것이 없으면 정각 점검에서 Codex를 부르지 않음(기본 켜짐), `reply_button` 알림의 [답장] 버튼(기본 켜짐)

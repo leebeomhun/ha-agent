@@ -47,9 +47,10 @@ export function buildPayload(n, nid, { reply = true } = {}) {
 
 // 버튼을 누르면 같은 tag로 다시 보내 결과 문구로 바꾼다(삼성 휴대폰은 눌러도 알림이 남기 때문).
 export function feedbackPayload(rec, kind, mutedDescriptions = [], muteDays = 7) {
-	const mark = { UP: '👍', MUTE: '🔕', LESS: '🔽', REPLY: '💬' }[kind] ?? '🤖'
+	const mark = { UP: '👍', MUTE: '🔕', LESS: '🔽', REPLY: '💬', PAUSED: '⏸️' }[kind] ?? '🤖'
 	const message = kind === 'UP' ? '고마워요. 이런 알림은 계속 보낼게요.'
 		: kind === 'REPLY' ? '답장을 받았어요. 확인하고 다시 알려 드릴게요.'
+		: kind === 'PAUSED' ? '지금은 집 비서가 일시정지 중이라 답장을 처리하지 않았어요. 재개한 뒤 다시 말씀해 주세요.'
 		: kind === 'LESS' ? '알겠어요. 이런 요약은 줄일게요.'
 			: mutedDescriptions.length
 				? `알겠어요. "${mutedDescriptions.join('", "')}" 알림은 ${muteDays}일 동안 쉬고, 밤에 규칙을 다시 손볼게요.`

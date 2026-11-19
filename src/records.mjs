@@ -1,7 +1,7 @@
 // 기록 관리: 판단 원문 보관(다시 돌려보기용), 규칙·메모 이전 판, 하루 요약, 주간 분석 보고서, 주간 지표, 기록 파일 정리
 import { mkdirSync, writeFileSync, readdirSync, rmSync, cpSync, existsSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { P, DAY, kst, readJson, writeJson, readJsonl, rotateIfBig, latestBy } from './util.mjs'
+import { P, DAY, kst, readJson, writeJson, readJsonlAll, rotateIfBig, latestBy } from './util.mjs'
 
 const stamp = ms => kst(new Date(ms)).iso.slice(0, 19).replace(/[-:]/g, '').replace('T', '-')
 const list = dir => { try { return readdirSync(dir).sort() } catch { return [] } }
@@ -45,7 +45,11 @@ export function readSnapshot(name) {
 }
 
 // ── 하루 요약: 엔티티별 변화 횟수·처음/마지막 시각·켜져 있던 시간 ──
-const ACTIVE = new Set(['on', 'open', 'unlocked', 'home', 'playing', 'heat', 'cool', 'heating', 'cooling', 'cleaning', 'detected'])
+const ACTIVE = new Set([
+	'on', 'open', 'unlocked', 'home', 'playing', 'heat', 'cool', 'heating', 'cooling', 'cleaning', 'detected',
+	'running', 'washing', 'rinsing', 'spinning', 'drying', 'prewash', 'steam_softening', 'refreshing',
+	'auto', 'dry', 'fan_only', 'heat_cool',
+])
 
 export function dailyDigest(date, events, until = Infinity) {
 	const start = Date.parse(`${date}T00:00:00+09:00`), end = Math.min(start + DAY, until)
@@ -74,10 +78,10 @@ const inDay = (ts, date) => kst(new Date(ts)).date === date
 
 // 날짜가 바뀔 때 전날 것을 state/daily/에 남긴다.
 export function writeDaily(date, keepDays = 60) {
-	const notes = latestBy(readJsonl(P.notifications), 'nid').filter(n => inDay(n.ts, date))
-	const fb = readJsonl(P.feedback).filter(f => inDay(f.ts, date))
-	const dec = readJsonl(P.decisions).filter(d => inDay(d.ts, date))
-	const acts = latestBy(readJsonl(P.actions), 'aid').filter(a => inDay(a.ts, date))
+	const notes = latestBy(readJsonlAll(P.notifications), 'nid').filter(n => inDay(n.ts, date))
+	const fb = readJsonlAll(P.feedback).filter(f => inDay(f.ts, date))
+	const dec = readJsonlAll(P.decisions).filter(d => inDay(d.ts, date))
+	const acts = latestBy(readJsonlAll(P.actions), 'aid').filter(a => inDay(a.ts, date))
 	const count = (arr, f) => arr.reduce((m, x) => { const k = f(x); m[k] = (m[k] ?? 0) + 1; return m }, {})
 	const doc = {
 		date, weekday: kst(new Date(`${date}T12:00:00+09:00`)).wd,
@@ -85,7 +89,7 @@ export function writeDaily(date, keepDays = 60) {
 		notifications: count(notes, n => `${n.kind}/${n.status}`),
 		feedback: count(fb, f => f.kind),
 		actions: count(acts, a => a.status),
-		entities: dailyDigest(date, readJsonl(P.events)),
+		entities: dailyDigest(date, readJsonlAll(P.events)),
 	}
 	writeJson(join(P.daily, `${date}.json`), doc)
 	prune(P.daily, keepDays)
@@ -112,10 +116,10 @@ export function readWeekly(name = listWeekly().at(-1)) {
 export function weekMetrics(now) {
 	const since = now - 7 * DAY
 	const recent = arr => arr.filter(x => Date.parse(x.ts) >= since)
-	const dec = recent(readJsonl(P.decisions))
-	const notes = recent(latestBy(readJsonl(P.notifications), 'nid')).filter(n => n.status === 'sent')
-	const fb = recent(readJsonl(P.feedback))
-	const acts = recent(latestBy(readJsonl(P.actions), 'aid'))
+	const dec = recent(readJsonlAll(P.decisions))
+	const notes = recent(latestBy(readJsonlAll(P.notifications), 'nid')).filter(n => n.status === 'sent')
+	const fb = recent(readJsonlAll(P.feedback))
+	const acts = recent(latestBy(readJsonlAll(P.actions), 'aid'))
 	const n = (arr, f) => arr.filter(f).length
 	return {
 		runs: n(dec, d => !d.skipped && !d.deferred), failed: n(dec, d => d.error), skipped_hourly: n(dec, d => d.skipped), deferred_disconnected: n(dec, d => d.deferred),
@@ -125,6 +129,69 @@ export function weekMetrics(now) {
 		feedback_up: n(fb, f => f.kind === 'up'), feedback_mute: n(fb, f => f.kind === 'mute'), summary_less: n(fb, f => f.kind === 'less'), replies: n(fb, f => f.kind === 'reply'),
 		rule_wakes: dec.reduce((s, d) => s + (d.reasons ?? []).filter(r => r.startsWith('rule:')).length, 0),
 		actions_done: n(acts, a => a.status === 'done'), actions_declined: n(acts, a => a.status === 'declined'), actions_undone: n(acts, a => a.status === 'undone'),
+	}
+}
+
+// ── 기간별 운영 통계 (cli.mjs stats) ──
+export function rangeStats(days = 7, now = Date.now()) {
+	const since = now - days * DAY
+	const recent = arr => arr.filter(x => Date.parse(x.ts) >= since)
+	const dec = recent(readJsonlAll(P.decisions))
+	const notes = recent(latestBy(readJsonlAll(P.notifications), 'nid'))
+	const fb = recent(readJsonlAll(P.feedback))
+	const acts = recent(latestBy(readJsonlAll(P.actions), 'aid'))
+	const real = dec.filter(d => !d.skipped && !d.deferred)
+	const okRuns = real.filter(d => !d.error)
+	const noop = okRuns.filter(d => {
+		const a = d.applied
+		return !(a?.notifications?.length || a?.actions?.length || a?.added?.length || a?.changed?.length || a?.deleted?.length || a?.report)
+	})
+	const tokens = dec.reduce((s, d) => s + (d.tokens ?? 0), 0)
+	const byBrain = {}, byReason = {}
+	const usage = { input: 0, cached: 0, output: 0, reasoning: 0 }
+	for (const d of real) {
+		const bm = d.brain ?? 'codex'
+		const b = (byBrain[bm] ??= { runs: 0, errors: 0, tokens: 0 })
+		b.runs++
+		if (d.error) b.errors++
+		b.tokens += d.tokens ?? 0
+		const rk = (d.reasons ?? []).map(r => r.split(':')[0]).join('+') || 'unknown'
+		const r = (byReason[rk] ??= { runs: 0, tokens: 0, noop: 0 })
+		r.runs++
+		r.tokens += d.tokens ?? 0
+		if (noop.includes(d)) r.noop++
+		if (d.usage) {
+			usage.input += d.usage.input ?? 0
+			usage.cached += d.usage.cached ?? 0
+			usage.output += d.usage.output ?? 0
+			usage.reasoning += d.usage.reasoning ?? 0
+		}
+	}
+	const hasUsage = usage.input || usage.cached || usage.output || usage.reasoning
+	const sent = notes.filter(n => n.status === 'sent')
+	const n = (arr, f) => arr.filter(f).length
+	return {
+		days,
+		total: dec.length,
+		real: real.length,
+		skipped: n(dec, d => d.skipped),
+		deferred: n(dec, d => d.deferred),
+		errors: n(real, d => d.error),
+		noop: noop.length,
+		noop_pct: okRuns.length ? Math.round((noop.length / okRuns.length) * 1000) / 10 : 0,
+		tokens,
+		avg_tokens: okRuns.length ? Math.round(tokens / okRuns.length) : 0,
+		usage: hasUsage ? usage : null,
+		by_brain: byBrain,
+		by_reason: byReason,
+		notifications: {
+			sent_alerts: n(sent, x => x.kind === 'alert'),
+			sent_infos: n(sent, x => x.kind === 'info'),
+			sent_summaries: n(sent, x => x.kind === 'hourly_summary'),
+			other: n(notes, x => x.status !== 'sent'),
+		},
+		feedback: { up: n(fb, f => f.kind === 'up'), mute: n(fb, f => f.kind === 'mute'), less: n(fb, f => f.kind === 'less'), reply: n(fb, f => f.kind === 'reply') },
+		actions: { done: n(acts, a => a.status === 'done'), declined: n(acts, a => a.status === 'declined'), undone: n(acts, a => a.status === 'undone'), error: n(acts, a => a.status === 'error') },
 	}
 }
 

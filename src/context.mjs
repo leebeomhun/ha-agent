@@ -1,5 +1,6 @@
 // Codex에게 넘길 자료: 상태 요약본, 최근 변화, 날씨·일정 문장, 프롬프트
 import { fmt, kst, globs } from './util.mjs'
+import { recentFires } from './rules.mjs'
 
 const SKIP_DOMAINS = new Set(['button', 'scene', 'tts', 'stt', 'conversation', 'ai_task', 'wake_word', 'assist_satellite',
 	'image', 'event', 'todo', 'zone', 'sun', 'number', 'text', 'time', 'date', 'siren', 'notify', 'tag', 'camera', 'automation'])
@@ -135,9 +136,19 @@ export function calendarText(c) {
 	if (!c.length) return '(없음)'
 	return c.map(ev => {
 		const allDay = /^\d{4}-\d\d-\d\d$/.test(ev.start)
-		const s = new Date(allDay ? `${ev.start}T00:00:00+09:00` : ev.start)
-		const k = kst(s)
-		const when = allDay ? `${k.date.slice(5)}(${k.wd}) 종일` : `${k.date.slice(5)}(${k.wd}) ${k.hm}~${kst(new Date(ev.end)).hm}`
+		let when
+		if (allDay) {
+			const s = new Date(`${ev.start}T00:00:00+09:00`), k = kst(s)
+			const endMs = /^\d{4}-\d\d-\d\d$/.test(ev.end ?? '') ? Date.parse(`${ev.end}T00:00:00+09:00`) : NaN
+			const lastMs = Number.isFinite(endMs) ? endMs - 86400000 : NaN
+			const endK = Number.isFinite(lastMs) && lastMs > s.getTime() ? kst(new Date(lastMs)) : null
+			when = endK ? `${k.date.slice(5)}(${k.wd})~${endK.date.slice(5)}(${endK.wd}) 종일` : `${k.date.slice(5)}(${k.wd}) 종일`
+		} else {
+			const s = new Date(ev.start), e = new Date(ev.end), k = kst(s), ek = kst(e)
+			when = ek.date === k.date
+				? `${k.date.slice(5)}(${k.wd}) ${k.hm}~${ek.hm}`
+				: `${k.date.slice(5)}(${k.wd}) ${k.hm}~${ek.date.slice(5)}(${ek.wd}) ${ek.hm}`
+		}
 		return `- ${when} ${ev.summary}${ev.location ? ` @${ev.location}` : ''} [${ev.calendar}]`
 	}).join('\n')
 }
@@ -171,7 +182,7 @@ function ruleLine(r, rt, now) {
 	let target = cond(r)
 	for (const c of r.also ?? []) target += ` 그리고 ${cond(c)}`
 	if (r.hour_from != null) target += ` (${r.hour_from}~${r.hour_to}시만)`
-	const extra = [`7일 발동 ${(rt.fire_log ?? []).length}회`]
+	const extra = [`7일 발동 ${recentFires(rt, now).length}회`]
 	if (rt.backtest) extra.push(`백테스트: 만들 때 지난 ${rt.backtest.days}일 기록으로는 ${rt.backtest.fires}회 발동했을 것`)
 	if (rt.last_fired) extra.push(`마지막 ${fmt(rt.last_fired)}`)
 	const cl = (rt.clear_log ?? []).slice(-3).map(([a, b]) => `${Math.round((b - a) / 60000)}분`)
@@ -194,6 +205,7 @@ export function buildPrompt(x) {
 	lines.push(`- 지금: ${now.date}(${now.wd}) ${now.hm} KST, ${x.quiet ? '조용한 시간(urgent만 실제로 나감)' : '활동 시간'}`)
 	const hrs = x.hours
 	if (hrs) lines.push(`- 하루 시간표: 활동 시간 ${hrs.start}~${hrs.end}시(그 밖은 조용한 시간)${hrs.checkins?.length ? `, 정각 점검 ${hrs.checkins[0]}~${hrs.checkins.at(-1)}시` : ', 정각 점검 없음'}${hrs.reflection != null ? `, 하루 돌아보기 ${hrs.reflection}시` : ''}`)
+	if (x.awayOverride) lines.push(`- 재실·방해금지 도우미: ${x.awayOverride.name ?? x.awayOverride.id} (${x.awayOverride.id}) = ${x.awayOverride.state}`)
 	lines.push('- 깨운 이유:')
 	x.reasons.forEach((r, i) => lines.push(`  ${i + 1}. ${describeReason(r)}`))
 
@@ -230,6 +242,18 @@ export function buildPrompt(x) {
 
 	const recent = changeLines(x.ring.filter(c => x.now - c.t < 2 * 3600000), globs(x.noise))
 	sec('최근 2시간 주요 상태 변화', recent.length ? recent.join('\n') : '(없음)')
+	const sd = x.sysDelta
+	if (sd && (sd.newErrors?.length || sd.increasedErrors?.length || sd.newOther?.length || sd.increasedOther?.length || sd.newRepairs?.length)) {
+		const sLines = [
+			...(sd.newErrors ?? []).map(e => `- [신규 ${e.level}] ${e.name}: ${e.message} (${e.count}회, ${e.last})`),
+			...(sd.increasedErrors ?? []).map(e => `- [증가 ${e.level}] ${e.name}: ${e.message} (${e.prev_count} → ${e.count}회, +${e.count - e.prev_count}, ${e.last})`),
+			...(sd.newOther ?? []).map(e => `- [신규 ${e.level}] ${e.name}: ${e.message} (${e.count}회, ${e.last})`),
+			...(sd.increasedOther ?? []).map(e => `- [증가 ${e.level}] ${e.name}: ${e.message} (${e.prev_count} → ${e.count}회, +${e.count - e.prev_count}, ${e.last})`),
+			...(sd.newRepairs ?? []).map(r => `- [신규 수리] ${r.domain}:${r.id} (${r.severity})`),
+			'- 참고: 횟수·시각이 그대로인 기존 항목은 프로그램이 자동 추적하므로 메모에 따로 적어 비교하지 않아도 됩니다.',
+		]
+		sec('HA 시스템 오류·수리 변화', sLines.join('\n'))
+	}
 	sec(`날씨 (${x.weather?.entity ?? ''})`, weatherText(x.weather))
 	sec('일정 (지금부터 내일까지)', calendarText(x.calendar))
 	sec('참고 파일 (읽기 전용)', [

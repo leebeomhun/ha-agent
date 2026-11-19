@@ -6,6 +6,8 @@ export const DEFAULTS = {
 	token_file: '~/.config/home-assistant/token',
 	notify_targets: ['mobile_app_ibeomhun'],
 	weather_entity: 'weather.jib',
+	weather_fallback_entity: null,
+	away_override_entity: null,
 	active_hours: { start: 8, end: 24 },
 	hourly_checkin: true,
 	// 직전 정각 점검 뒤로 집 상태·날씨·일정이 그대로면 Codex를 부르지 않는다(첫 점검과 24시는 항상 실행).
@@ -44,6 +46,7 @@ export const DEFAULTS = {
 		model: 'gpt-6.1-sol',
 		fallback_model: null, // 두 번 연속 실패하면 이 모델로 시도
 		effort: 'low',
+		effort_hourly: null, // 정각 점검만 따로 낮출 때(null이면 effort 사용)
 		effort_deep: 'medium',
 		timeout_seconds: 240,
 		timeout_deep_seconds: 600,
@@ -58,6 +61,7 @@ export const DEFAULTS = {
 		model: null,
 		fallback_model: null,
 		effort: null,
+		effort_hourly: null,
 		effort_deep: null,
 		timeout_seconds: null,
 		timeout_deep_seconds: null,
@@ -92,6 +96,46 @@ export function mergeConfig(c = {}) {
 	return out
 }
 export const loadConfig = () => mergeConfig(readJson(P.config, {}))
+
+export function validateConfig(cfg) {
+	const errors = [], warnings = []
+	const ah = cfg?.active_hours ?? {}
+	if (!Number.isInteger(ah.start) || !Number.isInteger(ah.end) || ah.start < 0 || ah.end > 24 || ah.start >= ah.end) {
+		errors.push(`active_hours 범위 오류 (${ah.start}~${ah.end}, 0 <= start < end <= 24 정수 필요)`)
+	}
+	const rh = cfg?.reflection_hour
+	if (rh != null && (!Number.isInteger(rh) || rh < 0 || rh > 23)) errors.push(`reflection_hour 오류 (${rh}, null 또는 0~23 정수 필요)`)
+	if (!['codex', 'api'].includes(cfg?.brain)) errors.push(`brain 설정 오류 (${cfg?.brain}, codex 또는 api만 가능)`)
+	if (!Array.isArray(cfg?.notify_targets) || !cfg.notify_targets.some(t => typeof t === 'string' && t.trim())) {
+		errors.push('notify_targets가 비어 있음')
+	}
+	const posKeys = ['brain_runs_per_day', 'alerts_per_day', 'summaries_per_day', 'min_gap_minutes', 'max_rules', 'max_pending_wakes', 'memory_chars', 'rule_batch_seconds', 'mute_days', 'max_attempts', 'max_rounds', 'keep_runs', 'keep_snapshots', 'keep_weekly']
+	for (const k of posKeys) {
+		const v = cfg?.limits?.[k]
+		if (!Number.isFinite(v) || v <= 0) errors.push(`limits.${k}는 0보다 큰 수여야 함 (${v})`)
+	}
+	if (!Number.isFinite(cfg?.limits?.user_reserve_runs) || cfg.limits.user_reserve_runs < 0) {
+		errors.push(`limits.user_reserve_runs는 0 이상이어야 함 (${cfg?.limits?.user_reserve_runs})`)
+	}
+	const o = cfg?.oob ?? {}
+	if (o.type) {
+		if (o.type === 'ntfy') {
+			if (!o.topic) errors.push('oob.type이 ntfy인데 oob.topic이 비어 있음')
+		} else if (o.type === 'telegram') {
+			if (!o.token_file || !o.chat_id) errors.push('oob.type이 telegram인데 oob.token_file 또는 oob.chat_id가 비어 있음')
+		} else if (o.type === 'webhook') {
+			if (!o.url) errors.push('oob.type이 webhook인데 oob.url이 비어 있음')
+		} else {
+			errors.push(`알 수 없는 oob.type: ${o.type}`)
+		}
+	}
+	if ((cfg?.api?.effort == null && cfg?.codex?.effort === 'max')
+		|| (cfg?.api?.effort_deep == null && cfg?.codex?.effort_deep === 'max')
+		|| (cfg?.api?.effort_hourly == null && cfg?.api?.effort == null && cfg?.codex?.effort_hourly === 'max')) {
+		warnings.push('api.effort/effort_deep이 비어 있어 codex의 "max"를 상속합니다 (API 비용 증가·호환성 주의)')
+	}
+	return { errors, warnings }
+}
 
 export const loadControl = () => ({ paused: false, send: false, ...readJson(P.control, {}) })
 export const saveControl = c => writeJson(P.control, c)

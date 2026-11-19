@@ -17,17 +17,22 @@ export function brainMode(cfg, control) {
 	return MODES.includes(m) ? m : 'codex'
 }
 // 고른 방식의 모델·추론 노력·제한 시간. api 쪽에 적지 않은(null) 값은 codex 값을 그대로 쓴다.
-const SHARED = ['model', 'fallback_model', 'effort', 'effort_deep', 'timeout_seconds', 'timeout_deep_seconds']
+const SHARED = ['model', 'fallback_model', 'effort', 'effort_hourly', 'effort_deep', 'timeout_seconds', 'timeout_deep_seconds']
 export function brainSettings(cfg, mode) {
-	return Object.fromEntries(SHARED.map(k => [k, mode === 'api' ? cfg.api[k] ?? cfg.codex[k] : cfg.codex[k]]))
+	const out = Object.fromEntries(SHARED.map(k => [k, mode === 'api' ? cfg.api[k] ?? cfg.codex[k] : cfg.codex[k]]))
+	out.effort_hourly = mode === 'api'
+		? (cfg.api.effort_hourly ?? cfg.api.effort ?? cfg.codex.effort_hourly ?? cfg.codex.effort)
+		: (cfg.codex.effort_hourly ?? cfg.codex.effort)
+	return out
 }
 export const runBrain = ({ mode, ...args }) => (mode === 'api' ? runApi(args) : runCodex(args))
 
 function which(bin) {
 	if (bin.includes('/')) return existsSync(bin) ? bin : null
-	for (const d of (process.env.PATH ?? '').split(delimiter)) {
+	const dirs = [...(process.env.PATH ?? '').split(delimiter), join(homedir(), '.npm-global', 'bin'), join(homedir(), '.local', 'bin')].filter(Boolean)
+	for (const d of dirs) {
 		const p = join(d, bin)
-		if (d && existsSync(p)) return p
+		if (existsSync(p)) return p
 	}
 	return null
 }
@@ -83,30 +88,59 @@ export function codexArgs({ cfg, effort, outFile, vendorDir, model = cfg.codex.m
 }
 
 // brainDir를 바꾸면(다시 돌려보기) 그 폴더에서만 읽는다. 답 파일은 <brainDir>/run/answer.json.
-export function runCodex({ cfg, prompt, effort, timeoutSec, model, brainDir = P.brain, runDir = P.run }) {
+export function runCodex({ cfg, prompt, effort, timeoutSec, model, brainDir = P.brain, runDir = P.run, signal }) {
 	const outFile = join(runDir, 'answer.json')
 	rmSync(outFile, { force: true })
+	const bin = which(cfg.codex.bin) ?? cfg.codex.bin
 	const args = codexArgs({ cfg, effort, outFile, vendorDir: codexVendorDir(cfg), model: model ?? cfg.codex.model, brainDir })
 	const started = Date.now()
 	return new Promise((resolve, reject) => {
 		// API 키가 환경 변수에 있어도 Codex(와 그 안의 셸)로는 넘기지 않는다.
 		const { [cfg.api.key_env]: _key, ...env } = process.env
-		const child = spawn(cfg.codex.bin, args, { cwd: brainDir, env, stdio: ['pipe', 'pipe', 'pipe'] })
-		let out = ''
+		const child = spawn(bin, args, { cwd: brainDir, env, stdio: ['pipe', 'pipe', 'pipe'], detached: process.platform !== 'win32' })
+		let out = '', timedOut = false, aborted = false, killTimer = null
 		const keep = d => { out += d; if (out.length > 40000) out = out.slice(-40000) }
 		child.stdout.on('data', keep)
 		child.stderr.on('data', keep)
+		const killTree = sig => {
+			if (!child.pid) return
+			try {
+				if (process.platform !== 'win32') process.kill(-child.pid, sig)
+				else child.kill(sig)
+			} catch { try { child.kill(sig) } catch {} }
+		}
+		const onAbort = () => {
+			aborted = true
+			killTree('SIGTERM')
+			if (!killTimer) {
+				killTimer = setTimeout(() => killTree('SIGKILL'), 5000)
+				killTimer.unref()
+			}
+		}
+		if (signal) {
+			if (signal.aborted) onAbort()
+			else signal.addEventListener('abort', onAbort, { once: true })
+		}
 		const timer = setTimeout(() => {
-			child.kill('SIGTERM')
-			setTimeout(() => child.kill('SIGKILL'), 5000).unref()
+			timedOut = true
+			killTree('SIGTERM')
+			killTimer = setTimeout(() => killTree('SIGKILL'), 5000)
+			killTimer.unref()
 		}, timeoutSec * 1000)
-		child.on('error', e => { clearTimeout(timer); reject(e) })
-		child.on('close', code => {
+		const cleanup = () => {
 			clearTimeout(timer)
+			clearTimeout(killTimer)
+			signal?.removeEventListener('abort', onAbort)
+		}
+		child.on('error', e => { cleanup(); reject(e) })
+		child.on('close', (code, sig) => {
+			cleanup()
 			const ms = Date.now() - started
 			const tokens = Number((/tokens used\s*([\d,]+)/i.exec(out)?.[1] ?? '').replace(/,/g, '')) || null
 			const tail = out.slice(-400).replace(/\s+/g, ' ')
-			if (code !== 0) return reject(new Error(`codex 종료 코드 ${code} (${Math.round(ms / 1000)}초): ${tail}`))
+			if (timedOut) return reject(new Error(`codex 시간 초과 (${timeoutSec}초)`))
+			if (aborted) return reject(signal?.reason instanceof Error ? signal.reason : new Error('codex 중단됨'))
+			if (code !== 0) return reject(new Error(`codex 종료 코드 ${code}${sig ? ` (${sig})` : ''} (${Math.round(ms / 1000)}초): ${tail}`))
 			try {
 				resolve({ result: JSON.parse(readFileSync(outFile, 'utf8')), ms, tokens })
 			} catch (e) {

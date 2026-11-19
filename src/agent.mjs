@@ -1,7 +1,7 @@
 // 집 비서 본체: HA를 실시간으로 보고(규칙), 필요할 때 AI(Codex 또는 API)를 깨워 판단을 받고, 검사한 뒤 적용한다.
 import { readdirSync, readFileSync, unlinkSync, writeFileSync, mkdirSync, existsSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
-import { HA } from './ha.mjs'
+import { HA, ACTION_SERVICES } from './ha.mjs'
 import { RuleEngine, validateRule } from './rules.mjs'
 import { compactStates, automationList, notableChange, significantChange, buildPrompt } from './context.mjs'
 import { runBrain, brainMode, brainSettings, validateResponse, selfCheck, MODES, MODE_LABEL } from './brain.mjs'
@@ -11,7 +11,7 @@ import { sendOob } from './oob.mjs'
 import { archiveRun, snapshot, readSnapshot, writeDaily, recentDaily, weekMetrics, rotateLogs, saveWeekly, readWeekly } from './records.mjs'
 import { automationRuns, deviceActivity, DEVICE_DOMAINS, WEEKLY_HOURS } from './weekly.mjs'
 import { backtestRule, backtestable } from './backtest.mjs'
-import { P, DAY, readJson, writeJson, appendJsonl, readJsonl, latestBy, kst, fmt, newId, log, expandHome, globs } from './util.mjs'
+import { P, DAY, readJson, writeJson, appendJsonl, readJsonlAll, latestBy, kst, fmt, newId, log, expandHome, globs } from './util.mjs'
 import { loadConfig, loadControl } from './config.mjs'
 
 const MIN = 60000
@@ -23,6 +23,12 @@ const MAX_DEFERS = 3
 // 보내지 못한 정각 요약은 이 시간까지만 다시 보낸다. 그 뒤에는 낡은 내용이라 버린다.
 const SUMMARY_RETRY_MS = 60 * MIN
 const round2 = v => (typeof v === 'number' ? Math.round(v * 100) / 100 : v)
+const canUndo = rec => {
+	const d = rec?.entity_id?.split?.('.')[0]
+	return Boolean(d && (ACTION_SERVICES[d] ?? []).includes(opposite(rec.action)))
+}
+const sysKey = x => `${x.level ?? ''}|${x.name ?? ''}|${x.message ?? ''}`
+const repairKey = r => `${r.domain ?? ''}:${r.id ?? ''}`
 // 주간 보고서 전문을 HA 알림 목록(🔔)에 올릴 때 쓰는 서비스. 이것 말고 HA에 글을 쓰는 서비스는 허용하지 않는다.
 export const PUBLISH_SERVICE = 'persistent_notification.create'
 
@@ -45,7 +51,9 @@ export class Agent {
 			services: this.cfg.weekly.publish ? [PUBLISH_SERVICE] : [],
 		})
 		this.states = new Map()
-		this.ring = dry ? [] : readJsonl(P.events).slice(-300)
+		const initEvents = dry ? [] : readJsonlAll(P.events)
+		this.ring = initEvents.filter(c => !this.isNoise(c.id)).slice(-300)
+		this.noiseRing = initEvents.filter(c => this.isNoise(c.id)).slice(-300)
 		this.rulesDoc = readJson(P.rules, null)
 		this.runtime = readJson(P.runtime, { rules: {}, last_checkin: null })
 		this.runtime.rules ??= {}
@@ -54,18 +62,20 @@ export class Agent {
 		this.held = readJson(P.held, [])
 		this.counters = readJson(P.counters, null)
 		this.outbox = dry ? [] : readJson(P.outbox, [])
-		this.pendingActs = dry ? [] : latestBy(readJsonl(P.actions), 'aid').filter(a => a.status === 'pending')
+		this.pendingActs = dry ? [] : latestBy(readJsonlAll(P.actions), 'aid').filter(a => a.status === 'pending')
 		// 대기열은 파일에 남는다. 꺼질 때 돌던 판단(inflight)은 시도 횟수를 하나 올려 다시 넣는다.
 		const saved = dry ? {} : readJson(P.queue, {})
 		this.queue = [...(saved.inflight ?? []).map(r => ({ ...r, attempts: (r.attempts ?? 0) + 1 })), ...(saved.queue ?? [])]
 			.filter(r => (r.attempts ?? 0) < this.#maxAttempts(r))
 		this.inflight = []
 		this.running = false
+		this.runAbort = null
+		this.actingAids = new Set()
 		this.lastRunEnd = 0
 		this.failures = 0
 		this.failover = null // 다른 판단 방식으로 넘어가 있는 동안 { primary, until }
 		this.lastFailedMode = null
-		this.lastRun = dry ? null : readJsonl(P.decisions).at(-1) ?? null
+		this.lastRun = dry ? null : readJsonlAll(P.decisions).at(-1) ?? null
 		this.preAt = new Map()
 		this.meta = { at: 0, areaOf: null, autoCfg: null }
 		this.lastBeat = 0
@@ -85,7 +95,11 @@ export class Agent {
 		this.ha.start()
 		if (!this.dry) this.timer = setInterval(() => this.tick().catch(e => log('tick 오류:', e.stack)), 15000)
 	}
-	stop() { clearInterval(this.timer); this.ha.stop() }
+	stop() {
+		clearInterval(this.timer)
+		this.runAbort?.abort(new Error('데몬 종료'))
+		this.ha.stop()
+	}
 	waitReady() { return new Promise(res => this.ha.once('ready', () => setImmediate(res))) }
 
 	// ── HA 이벤트 ──
@@ -113,15 +127,16 @@ export class Agent {
 		if (this.dry) return
 		const c = notableChange(d)
 		if (c) {
-			this.ring.push(c)
-			if (this.ring.length > 300) this.ring.shift()
+			const bucket = this.isNoise(c.id) ? this.noiseRing : this.ring
+			bucket.push(c)
+			if (bucket.length > 300) bucket.shift()
 			appendJsonl(P.events, c)
 		}
 		const fired = this.engine.onState(id, n, this.clock(), this.states)
 		if (fired.length) { this.#saveRuntime(); this.#handleFired(fired) }
 	}
 
-	#notes() { return latestBy(readJsonl(P.notifications), 'nid') }
+	#notes() { return latestBy(readJsonlAll(P.notifications), 'nid') }
 
 	async #onAction(d) {
 		if (this.dry) return
@@ -139,7 +154,7 @@ export class Agent {
 			for (const id of rec.related_rule_ids ?? []) if (this.engine.mute(id, now + this.cfg.limits.mute_days * DAY)) muted.push(id)
 			this.#saveRuntime()
 		}
-		const dup = readJsonl(P.feedback).some(f => f.nid === nid && f.kind === kind.toLowerCase())
+		const dup = readJsonlAll(P.feedback).some(f => f.nid === nid && f.kind === kind.toLowerCase())
 		// [줄여 줘]는 요약에 단다. 무엇이 과했는지 돌아보기가 따질 수 있게 그 요약의 내용도 남긴다.
 		if (!dup) appendJsonl(P.feedback, { ts: iso(now), nid, kind: kind.toLowerCase(), title: rec.title, ...(kind === 'LESS' ? { message: String(rec.message ?? '').slice(0, 300) } : {}), rules: rec.related_rule_ids ?? [], muted })
 		log(`버튼 ${kind}: ${rec.title}${muted.length ? ` (규칙 쉼: ${muted.join(', ')})` : ''}`)
@@ -153,6 +168,12 @@ export class Agent {
 		const nid = d.action_data?.nid, tag = typeof d.tag === 'string' ? d.tag : null
 		const rec = this.#notes().reverse().find(r => (nid && r.nid === nid) || (tag && r.tag === tag))
 		if (!text || !(rec || tag?.startsWith(TAG_PREFIX))) return
+		if (!this.dry) this.control = loadControl()
+		if (this.control.paused) {
+			log(`일시정지 중이라 답장을 처리하지 않음: "${text}"`)
+			if (rec) await this.#send(feedbackPayload(rec, 'PAUSED')).catch(() => {})
+			return
+		}
 		const now = this.clock()
 		appendJsonl(P.feedback, { ts: iso(now), nid: rec?.nid ?? null, kind: 'reply', title: rec?.title ?? '', text, rules: rec?.related_rule_ids ?? [] })
 		log(`답장: "${text}"${rec ? ` ← ${rec.title}` : ''}`)
@@ -218,6 +239,7 @@ export class Agent {
 		this.beat()
 		this.control = loadControl()
 		this.#todayCounters()
+		await this.#refreshStates(now)
 		if (this.ha.connected) {
 			const fired = this.engine.tick(this.states, now)
 			if (fired.length) { this.#saveRuntime(); this.#handleFired(fired) }
@@ -233,13 +255,18 @@ export class Agent {
 			this.schedule = this.schedule.filter(w => Date.parse(w.at) > now)
 			writeJson(P.schedule, this.schedule)
 		}
-		// 정각 점검은 활동 시간 안의 매시, 하루 돌아보기는 reflection_hour에(활동 시간 밖이어도) 돈다.
+		// 정각 점검은 활동 시간 안의 매시, 하루 돌아보기는 reflection_hour에(활동 시간 밖이어도, 지연돼도 당일 1회) 돈다.
 		const key = `${k.date}T${String(k.h).padStart(2, '0')}`
 		const reflect = k.h === this.cfg.reflection_hour
-		if ((reflect || (this.cfg.hourly_checkin && this.#checkinHours().includes(k.h))) && k.mi < 10 && this.runtime.last_checkin !== key) {
+		if (reflect && this.runtime.last_reflection !== k.date && this.runtime.last_checkin !== key) {
+			this.runtime.last_reflection = k.date
 			this.runtime.last_checkin = key
 			this.#saveRuntime()
-			this.#enqueue({ type: reflect ? 'reflection' : 'hourly', hour: k.h === 0 ? 24 : k.h })
+			this.#enqueue({ type: 'reflection', hour: k.h === 0 ? 24 : k.h })
+		} else if (this.cfg.hourly_checkin && this.#checkinHours().includes(k.h) && k.mi < 10 && this.runtime.last_checkin !== key) {
+			this.runtime.last_checkin = key
+			this.#saveRuntime()
+			this.#enqueue({ type: 'hourly', hour: k.h === 0 ? 24 : k.h })
 		}
 		// 주간 분석: 정한 요일의 정한 시각부터 그날 안에 한 번. 그 시각에 꺼져 있었어도 그날 다시 켜지면 돈다.
 		const w = this.cfg.weekly
@@ -251,7 +278,6 @@ export class Agent {
 		this.#readInbox()
 		await this.#expireActions(now)
 		await this.#flushOutbox(now)
-		await this.#refreshStates(now)
 		await this.#maybeRun()
 	}
 
@@ -363,11 +389,13 @@ export class Agent {
 		const started = this.clock()
 		const weekly = reasons.some(r => r.type === 'weekly')
 		const deep = weekly || reasons.some(r => r.type === 'bootstrap' || r.type === 'reflection')
+		const forceMeta = weekly || reasons.some(r => r.type === 'manual' || r.type === 'user')
 		const entry = { ts: iso(started), reasons: reasons.map(r => r.type + (r.rule_id ? `:${r.rule_id}` : '')), dry: this.dry }
 		const rounds = []
 		let input = null, mode = null, primary = null
 		try {
-			const ctx = await this.#gather(started)
+			const ctx = await this.#gather(started, { forceMeta })
+			const sysDelta = this.#computeSysDelta(ctx)
 			const lost = this.#connectionLost(ctx)
 			if (!this.dry && lost && reasons.every(r => (r.defers ?? 0) < MAX_DEFERS)) {
 				// 판단 실패가 아니다: 시도 횟수를 올리지 않고 그대로 다시 넣는다. #maybeRun은 연결된 뒤에만 돈다.
@@ -375,22 +403,28 @@ export class Agent {
 				entry.summary = `HA 연결이 끊겨 자료를 다 받지 못해(${lost}) 다시 연결된 뒤 판단`
 				this.queue.push(...reasons.map(r => ({ ...r, defers: (r.defers ?? 0) + 1 })))
 				this.#saveQueue()
-			} else if (!this.dry && this.#unchangedHourly(reasons, ctx, started)) {
+			} else if (!this.dry && this.#unchangedHourly(reasons, ctx, started, sysDelta)) {
 				entry.skipped = true
 				entry.summary = '직전 정각 점검 뒤로 달라진 것이 없어 판단을 건너뜀'
 			} else {
 				if (!this.dry) this.#bump('runs')
-				const lastReport = this.#writeRunFiles(ctx)
+				const lastReport = this.#writeRunFiles(ctx, sysDelta)
 				if (weekly) await this.#writeWeeklyFiles(ctx, started)
+				const aoId = this.cfg.away_override_entity
+				const aoSt = aoId ? this.states.get(aoId) : null
+				const awayOverride = aoSt ? { id: aoId, name: aoSt.attributes?.friendly_name, state: aoSt.state } : null
 				const base = {
 					now: started, quiet: this.#quiet(started), reasons,
 					rules: this.engine.rules, runtime: this.runtime.rules, schedule: this.schedule,
 					memory: existsSync(P.memory) ? readFileSync(P.memory, 'utf8') : '',
 					// "오늘"이 아니라 최근 24시간: 00시 돌아보기와 아침 첫 점검이 전날 알림을 볼 수 있어야 한다.
 					recentNotes: this.#notes().filter(n => started - Date.parse(n.ts) < DAY),
-					feedback: readJsonl(P.feedback).filter(f => started - Date.parse(f.ts) < 7 * DAY),
-					held: heldItems, rejected: readJson(P.rejected, []), ring: this.ring, weather: ctx.weather, calendar: ctx.calendar,
+					feedback: readJsonlAll(P.feedback).filter(f => started - Date.parse(f.ts) < 7 * DAY),
+					held: heldItems, rejected: readJson(P.rejected, []),
+					ring: [...this.ring, ...this.noiseRing].sort((a, b) => a.t - b.t),
+					weather: ctx.weather, calendar: ctx.calendar,
 					actions: this.#actionContext(), metrics: deep ? weekMetrics(started) : null, lastReport,
+					awayOverride, sysDelta,
 					hours: { ...this.cfg.active_hours, checkins: this.cfg.hourly_checkin ? this.#checkinHours().map(h => (h === 0 ? 24 : h)) : [], reflection: this.cfg.reflection_hour },
 					noise: this.cfg.noise_entities,
 				}
@@ -403,26 +437,37 @@ export class Agent {
 				const bs = brainSettings(this.cfg, mode)
 				entry.brain = mode
 				if (mode !== primary) entry.failover = true
-				const effort = deep ? bs.effort_deep : bs.effort
+				const pureHourly = !deep && reasons.length === 1 && reasons[0].type === 'hourly'
+				const effort = deep ? bs.effort_deep : pureHourly ? bs.effort_hourly : bs.effort
 				const timeoutSec = weekly ? this.cfg.weekly.timeout_seconds : deep ? bs.timeout_deep_seconds : bs.timeout_seconds
-				const model = mode === primary && this.failures >= 2 && bs.fallback_model ? bs.fallback_model : bs.model
+				const model = mode === primary && this.failures >= this.cfg.failover.after_failures && bs.fallback_model ? bs.fallback_model : bs.model
 				if (model !== bs.model) entry.model = model
 				let infoFiles = [], res
 				entry.codex_ms = 0
-				for (let round = 1; ; round++) {
-					const lastRound = round >= this.cfg.limits.max_rounds
-					const prompt = buildPrompt({ ...base, guide, infoFiles, lastRound })
-					const r = await this.brain({ cfg: this.cfg, mode, prompt, effort, timeoutSec, model })
-					rounds.push({ prompt, answer: r.result })
-					res = validateResponse(r.result)
-					entry.rounds = round
-					entry.codex_ms += r.ms ?? 0
-					if (r.tokens) entry.tokens = (entry.tokens ?? 0) + r.tokens
-					if (!res.info_requests.length || lastRound) break
-					const more = await this.#fetchInfo(res.info_requests, infoFiles.length)
-					if (!more.length) break
-					infoFiles = [...infoFiles, ...more]
-				}
+				this.runAbort = new AbortController()
+				try {
+					for (let round = 1; ; round++) {
+						const lastRound = round >= this.cfg.limits.max_rounds
+						const prompt = buildPrompt({ ...base, guide, infoFiles, lastRound })
+						const r = await this.brain({ cfg: this.cfg, mode, prompt, effort, timeoutSec, model, signal: this.runAbort.signal })
+						rounds.push({ prompt, answer: r.result })
+						res = validateResponse(r.result)
+						entry.rounds = round
+						entry.codex_ms += r.ms ?? 0
+						if (r.tokens) entry.tokens = (entry.tokens ?? 0) + r.tokens
+						if (r.usage) {
+							entry.usage ??= { input: 0, cached: 0, output: 0, reasoning: 0 }
+							entry.usage.input += r.usage.input ?? 0
+							entry.usage.cached += r.usage.cached ?? 0
+							entry.usage.output += r.usage.output ?? 0
+							entry.usage.reasoning += r.usage.reasoning ?? 0
+						}
+						if (!res.info_requests.length || lastRound) break
+						const more = await this.#fetchInfo(res.info_requests, infoFiles.length)
+						if (!more.length) break
+						infoFiles = [...infoFiles, ...more]
+					}
+				} finally { this.runAbort = null }
 				if (infoFiles.length) entry.info = infoFiles.map(h => `${h.kind}:${h.entity_ids.join(',')}`)
 				// 보고서 없이 끝난 주간 분석은 실패로 보고 다시 시도한다.
 				if (weekly && !res.report) throw new Error('주간 분석인데 report가 비어 있음')
@@ -432,6 +477,7 @@ export class Agent {
 				this.lastFailedMode = null
 				if (mode !== primary && !this.failover) await this.#startFailover(primary, mode, started, failedBefore)
 				entry.applied = await this.#apply(res, reasons)
+				this.#commitSysDelta(ctx)
 			}
 		} catch (e) {
 			entry.error = e.message
@@ -452,19 +498,20 @@ export class Agent {
 		return entry
 	}
 
-	// 고른 방식이 after_failures번 연속 실패하면 다른 방식(codex↔api)으로 넘어가 hold_minutes 동안 그쪽에 묻는다.
+	// 고른 방식이 after_failures번 연속 실패하면(대체 모델이 있으면 1번 더 써 본 뒤) 다른 방식(codex↔api)으로 넘어가 hold_minutes 동안 그쪽에 묻는다.
 	// 그 시간이 지나면 원래 방식을 다시 써 보고, 한 번이라도 실패하면 곧바로 다시 넘어간다.
 	// 둘 다 실패하는 동안에는 번갈아 시도한다(한쪽이 돌아오면 잡을 수 있게).
 	#pickMode(primary, now) {
 		const f = this.cfg.failover
 		if (this.dry || !f.enabled) return primary
 		const other = MODES.find(m => m !== primary)
+		const threshold = brainSettings(this.cfg, primary).fallback_model ? f.after_failures + 1 : f.after_failures
 		if (this.failover && (this.failover.primary !== primary || now >= this.failover.until)) {
-			if (this.failover.primary === primary) this.failures = Math.max(this.failures, f.after_failures - 1)
+			if (this.failover.primary === primary) this.failures = Math.max(this.failures, threshold - 1)
 			this.failover = null
 		}
 		if (this.failover) return other
-		return this.failures >= f.after_failures && this.lastFailedMode !== other && this.canUse(this.cfg, other) ? other : primary
+		return this.failures >= threshold && this.lastFailedMode !== other && this.canUse(this.cfg, other) ? other : primary
 	}
 
 	// 다른 방식으로 넘어가 판단에 성공했다. 한동안 그쪽에 묻고, 요금이 달라질 수 있으니 하루에 한 번 알린다.
@@ -481,8 +528,8 @@ export class Agent {
 		await this.#deliver({ kind: 'info', level: 'normal', title: '🤖 판단 방식을 잠시 바꿨어요', message: `${MODE_LABEL[primary]} 판단이 ${failed}번 연속 실패해 ${MODE_LABEL[mode]}로 묻고 있어요.${cost} ${MODE_LABEL[primary]}가 돌아오면 스스로 되돌아가요. 마지막 오류: ${why}`.slice(0, 500), related_rule_ids: [] })
 	}
 
-	// 정각 점검만 깨웠고, 직전 점검 뒤로 집 상태·날씨·일정·피드백이 그대로면 건너뛴다.
-	#unchangedHourly(reasons, ctx, now) {
+	// 정각 점검만 깨웠고, 직전 점검 뒤로 집 상태·날씨·일정·피드백·신규 시스템 오류가 그대로면 건너뛴다.
+	#unchangedHourly(reasons, ctx, now, sysDelta = null) {
 		if (!this.cfg.hourly_skip_unchanged || reasons.length !== 1 || reasons[0].type !== 'hourly') return false
 		const hour = reasons[0].hour
 		const rain = f => Number(f.precipitation) > 0 || /rain|pour|snow|hail|lightning/.test(f.condition ?? '')
@@ -496,11 +543,48 @@ export class Agent {
 		const last = this.runtime.hourly
 		const since = last?.at ?? 0
 		// 소음 엔티티(noise_entities)와 TV·셋톱의 재생↔일시정지 같은 출렁임은 달라진 것으로 치지 않는다.
-		const quietHouse = !this.ring.some(c => c.t > since && significantChange(c, this.isNoise)) && !readJsonl(P.feedback).some(f => Date.parse(f.ts) > since)
+		const quietHouse = !this.ring.some(c => c.t > since && significantChange(c, this.isNoise)) && !readJsonlAll(P.feedback).some(f => Date.parse(f.ts) > since)
+		const hasSysAlert = Boolean(this.runtime.syslog_seen && (sysDelta?.newErrors?.length || sysDelta?.increasedErrors?.length || sysDelta?.newRepairs?.length))
 		const first = hour === this.cfg.active_hours.start || hour === 24
-		const skip = !first && last?.fp === fp && quietHouse && now - since < 6 * 3600000
+		const skip = !first && !hasSysAlert && last?.fp === fp && quietHouse && now - since < 6 * 3600000
 		if (!skip) { this.runtime.hourly = { fp, at: now }; this.#saveRuntime() }
 		return skip
+	}
+
+	#computeSysDelta(ctx) {
+		const prevSys = this.runtime.syslog_seen
+		const prevRep = this.runtime.repairs_seen
+		const newErrors = [], increasedErrors = [], newOther = [], increasedOther = []
+		const annotatedSyslog = ctx.syslog.map(x => {
+			const k = sysKey(x), prev = prevSys?.[k]
+			const isErr = x.level === 'ERROR' || x.level === 'CRITICAL'
+			if (!prev) {
+				(isErr ? newErrors : newOther).push(x)
+				return { ...x, status: 'new' }
+			}
+			if ((x.count ?? 1) > (prev.count ?? 0) || (x.last && x.last !== prev.last)) {
+				const item = { ...x, prev_count: prev.count ?? 0 }
+				;(isErr ? increasedErrors : increasedOther).push(item)
+				return { ...item, status: 'increased' }
+			}
+			return { ...x, status: 'unchanged' }
+		})
+		const newRepairs = ctx.repairs.filter(r => !prevRep || !prevRep.includes(repairKey(r)))
+		return { annotatedSyslog, newErrors, increasedErrors, newOther, increasedOther, newRepairs }
+	}
+
+	#commitSysDelta(ctx) {
+		if (this.dry) return
+		let changed = false
+		if (!ctx.syslogError) {
+			this.runtime.syslog_seen = Object.fromEntries(ctx.syslog.map(x => [sysKey(x), { count: x.count ?? 1, last: x.last ?? null }]))
+			changed = true
+		}
+		if (!ctx.repairsError) {
+			this.runtime.repairs_seen = ctx.repairs.map(repairKey)
+			changed = true
+		}
+		if (changed) this.#saveRuntime()
 	}
 
 	// 자료를 받는 사이 HA 연결이 끊겼는지. 끊겼으면 그 이유, 아니면 null.
@@ -511,15 +595,17 @@ export class Agent {
 		return e ?? null
 	}
 
-	async #gather(now) {
+	async #gather(now, { forceMeta = false } = {}) {
 		const safe = p => p.catch(e => ({ error: e.message }))
 		const [weather, calendar, repairs, syslog] = await Promise.all([
 			safe(this.#weather()), safe(this.#calendar()),
 			safe(this.ha.call({ type: 'repairs/list_issues' })), safe(this.ha.call({ type: 'system_log/list' })),
 		])
-		await this.#refreshMeta(now)
+		await this.#refreshMeta(now, forceMeta)
 		return {
 			weather, calendar,
+			repairsError: !!repairs?.error,
+			syslogError: !!syslog?.error,
 			repairs: (repairs?.issues ?? []).filter(i => !i.ignored).map(i => ({ domain: i.issue_domain ?? i.domain, id: i.issue_id, severity: i.severity, created: fmt(Date.parse(i.created)), detail: i.translation_placeholders ?? undefined })),
 			syslog: (Array.isArray(syslog) ? syslog : []).slice(0, 50).map(x => ({ level: x.level, name: x.name, message: [].concat(x.message ?? []).join(' ').slice(0, 300), count: x.count, last: fmt(x.timestamp * 1000) })),
 			states: compactStates(this.states, this.meta.areaOf),
@@ -527,9 +613,9 @@ export class Agent {
 		}
 	}
 
-	// 방(영역) 정보와 자동화 설정은 잘 안 바뀌므로 6시간에 한 번만 가져온다.
-	async #refreshMeta(now) {
-		if (this.meta.at && now - this.meta.at < 6 * 3600000) return
+	// 방(영역) 정보와 자동화 설정은 잘 안 바뀌므로 6시간에 한 번만 가져온다(주간·수동·사용자 말 때는 최신으로 다시 읽음).
+	async #refreshMeta(now, force = false) {
+		if (!force && this.meta.at && now - this.meta.at < 6 * 3600000) return
 		try {
 			const [areas, devices, entities] = await Promise.all(['area', 'device', 'entity'].map(k => this.ha.call({ type: `config/${k}_registry/list` })))
 			const areaName = new Map(areas.map(a => [a.area_id, a.name]))
@@ -540,24 +626,38 @@ export class Agent {
 				if (name) areaOf.set(e.entity_id, name)
 			}
 			const autoCfg = {}
-			for (const id of this.states.keys()) {
-				if (!id.startsWith('automation.')) continue
-				try { autoCfg[id] = (await this.ha.call({ type: 'automation/config', entity_id: id }))?.config } catch {}
+			const autoIds = [...this.states.keys()].filter(id => id.startsWith('automation.'))
+			for (let i = 0; i < autoIds.length; i += 8) {
+				await Promise.all(autoIds.slice(i, i + 8).map(async id => {
+					try { autoCfg[id] = (await this.ha.call({ type: 'automation/config', entity_id: id }))?.config } catch {}
+				}))
 			}
 			this.meta = { at: now, areaOf, autoCfg }
 		} catch (e) { log('영역·자동화 정보를 가져오지 못함:', e.message) }
 	}
 
 	async #weather() {
-		const e = this.cfg.weather_entity
-		const [h, d] = await Promise.all(['hourly', 'daily'].map(type =>
-			this.ha.callService('weather', 'get_forecasts', { data: { type }, target: { entity_id: e }, response: true })))
-		const cur = this.states.get(e)
-		return {
-			entity: e,
-			current: cur ? { state: cur.state, temperature: cur.attributes.temperature, humidity: cur.attributes.humidity, wind_speed: cur.attributes.wind_speed, wind_unit: cur.attributes.wind_speed_unit } : null,
-			hourly: (h?.response?.[e]?.forecast ?? []).slice(0, 12),
-			daily: (d?.response?.[e]?.forecast ?? []).slice(0, 3),
+		const read = async e => {
+			const [h, d] = await Promise.all(['hourly', 'daily'].map(type =>
+				this.ha.callService('weather', 'get_forecasts', { data: { type }, target: { entity_id: e }, response: true })))
+			const cur = this.states.get(e)
+			return {
+				entity: e,
+				current: cur ? { state: cur.state, temperature: cur.attributes.temperature, humidity: cur.attributes.humidity, wind_speed: cur.attributes.wind_speed, wind_unit: cur.attributes.wind_speed_unit } : null,
+				hourly: (h?.response?.[e]?.forecast ?? []).slice(0, 12),
+				daily: (d?.response?.[e]?.forecast ?? []).slice(0, 3),
+			}
+		}
+		const primary = this.cfg.weather_entity, fb = this.cfg.weather_fallback_entity
+		try {
+			const w = await read(primary)
+			if (fb && fb !== primary && !w.hourly.length && !w.daily.length) {
+				try { return await read(fb) } catch {}
+			}
+			return w
+		} catch (err) {
+			if (!fb || fb === primary || CONN_ERR.test(err.message)) throw err
+			return await read(fb)
 		}
 	}
 
@@ -577,7 +677,7 @@ export class Agent {
 		return out.sort((a, b) => t(a) - t(b)).slice(0, 30)
 	}
 
-	#writeRunFiles(ctx) {
+	#writeRunFiles(ctx, sysDelta = null) {
 		rmSync(P.run, { recursive: true, force: true })
 		mkdirSync(P.run, { recursive: true })
 		const w = (name, data, pretty = true) => writeFileSync(join(P.run, name), pretty ? JSON.stringify(data, null, 1) : JSON.stringify(data))
@@ -586,7 +686,7 @@ export class Agent {
 		w('automation-configs.json', this.meta.autoCfg ?? {})
 		w('daily.json', recentDaily(14))
 		w('repairs.json', ctx.repairs)
-		w('system-log.json', ctx.syslog)
+		w('system-log.json', sysDelta ? sysDelta.annotatedSyslog : ctx.syslog)
 		// 지난 주간 분석 보고서: 제안을 되풀이하지 않고, 사용자가 보고서에 대해 물을 때 답할 수 있게 한다.
 		const last = readWeekly()
 		if (last) writeFileSync(join(P.run, 'weekly-last-report.md'), last.text)
@@ -746,8 +846,8 @@ export class Agent {
 		const c = this.#todayCounters()
 		const k = kst(new Date(now))
 		const summary = n.kind === 'hourly_summary'
-		// 하루 돌아보기의 요약만은 그 시각 30분 안에는 조용한 시간이어도 보낸다(소리 없는 요약). 다른 알림은 아침까지 보류.
-		const midnightGrace = summary && k.h === this.cfg.reflection_hour && k.mi < 30 && reasons.some(r => r.type === 'reflection')
+		// 하루 돌아보기의 요약은 늦게 끝나도 조용한 시간 보류 없이 소리 없이 보낸다. 다른 알림은 아침까지 보류.
+		const midnightGrace = summary && reasons.some(r => r.type === 'reflection')
 		const rec = { nid, ts: iso(now), ...n, tag: tagFor(n, nid) }
 		if (this.#quiet(now) && !midnightGrace && n.level !== 'urgent') {
 			rec.status = 'held'
@@ -869,6 +969,7 @@ export class Agent {
 	// heartbeat가 HA에 닿은 시각을 남긴다(재시작해도 이어지게 runtime에). 직전 신호와의 사이가 HA 경고 시간보다 길면
 	// HA가 '응답하지 않아요'를 보냈을 것이니, 같은 tag로 '다시 연결됐어요'를 보내 그 경고를 바꿔 놓는다.
 	async #beatDelivered(now) {
+		this.beatWarned = false
 		const prev = this.runtime.last_beat_ok
 		this.runtime.last_beat_ok = now
 		this.#saveRuntime()
@@ -894,7 +995,7 @@ export class Agent {
 			const m = rt.remind
 			if (m.done || m.n >= e.max_reminders || now - m.at < e.remind_minutes * MIN) continue
 			touched = true
-			fb ??= readJsonl(P.feedback)
+			fb ??= readJsonlAll(P.feedback)
 			if ((rt.muted_until && now < rt.muted_until) || fb.some(f => (f.rules ?? []).includes(r.id) && Date.parse(f.ts) >= rt.open)) { m.done = true; continue }
 			m.n++
 			m.at = now
@@ -902,8 +1003,8 @@ export class Agent {
 			const alert = this.#ruleAlert({ rule_id: r.id, description: r.description, entity_id: r.entity_id, value: r.attribute ? st?.attributes?.[r.attribute] : st?.state }, 'urgent',
 				`${Math.round((now - rt.open) / MIN)}분째 그대로예요(다시 알림 ${m.n}/${e.max_reminders}). 확인하셨으면 [도움됐어요]를 눌러 주세요.`)
 			log(`urgent 다시 알림 ${m.n}/${e.max_reminders}: ${r.id}`)
-			await this.#deliver(alert).catch(err => log('다시 알림 실패:', err.message))
-			if (m.n >= e.oob_from) this.#oobSend(alert.title, alert.message)
+			const res = await this.#deliver(alert).catch(err => { log('다시 알림 실패:', err.message); return '' })
+			if (m.n >= e.oob_from && !String(res).startsWith('queued:')) this.#oobSend(alert.title, alert.message)
 		}
 		if (touched) this.#saveRuntime()
 	}
@@ -913,10 +1014,14 @@ export class Agent {
 		if (this.dry || !this.ha.connected || now - this.lastRefresh < 5 * MIN) return
 		this.lastRefresh = now
 		try {
-			for (const s of await this.ha.call({ type: 'get_states' })) {
+			const list = await this.ha.call({ type: 'get_states' })
+			const seen = new Set()
+			for (const s of list) {
+				seen.add(s.entity_id)
 				const cur = this.states.get(s.entity_id)
 				if (!cur || Date.parse(s.last_updated) >= Date.parse(cur.last_updated)) this.states.set(s.entity_id, s)
 			}
+			for (const id of [...this.states.keys()]) if (!seen.has(id)) this.states.delete(id)
 		} catch (e) { log('상태 다시 읽기 실패:', e.message) }
 	}
 
@@ -955,7 +1060,7 @@ export class Agent {
 		return {
 			today: c.actions, perDay: this.cfg.actions.per_day, onRequest: !!this.cfg.actions.on_request,
 			tiers: [...this.tiers].map(([id, tier]) => ({ id, tier, name: this.states.get(id)?.attributes?.friendly_name, state: this.states.get(id)?.state ?? '없음' })),
-			recent: latestBy(readJsonl(P.actions), 'aid').filter(a => Date.parse(a.ts) >= since).slice(-10),
+			recent: latestBy(readJsonlAll(P.actions), 'aid').filter(a => Date.parse(a.ts) >= since).slice(-10),
 		}
 	}
 
@@ -992,7 +1097,7 @@ export class Agent {
 		appendJsonl(P.actions, rec)
 		log(`행동 ${rec.status}: ${rec.name} ${rec.action} — ${rec.reason}`)
 		const shown = undo && rec.status === 'done' ? { ...rec, status: 'undone' } : rec
-		await this.#send(actionResultPayload(shown, { undo: !undo && rec.status !== 'error' })).catch(() => {})
+		await this.#send(actionResultPayload(shown, { undo: !undo && rec.status !== 'error' && canUndo(rec) })).catch(() => {})
 		return rec
 	}
 
@@ -1022,31 +1127,43 @@ export class Agent {
 	}
 
 	async #onActionButton(kind, aid) {
-		const now = this.clock()
-		const rec = latestBy(readJsonl(P.actions), 'aid').find(a => a.aid === aid)
-		if (!rec) return log('버튼: 행동 기록을 찾지 못함', aid)
-		const close = async (status, extra = {}) => {
-			const r = { ...rec, ...extra, status, decided_at: iso(now) }
-			appendJsonl(P.actions, r)
-			log(`행동 ${status}: ${rec.name} ${rec.action}`)
-			await this.#send(actionResultPayload(r)).catch(() => {})
-		}
-		if (kind === 'UNDO') {
-			if (!['done', 'unverified'].includes(rec.status) || rec.undo_of) return
-			if (!this.tiers.has(rec.entity_id)) return log('되돌리기: 허용 목록에서 빠진 엔티티', rec.entity_id)
-			appendJsonl(P.actions, { ...rec, status: 'undone', decided_at: iso(now) })
-			await this.#execute({ aid: newId(), ts: iso(now), entity_id: rec.entity_id, name: rec.name, action: opposite(rec.action), reason: `되돌리기: ${rec.reason}`.slice(0, 200), tier: rec.tier, undo_of: aid }, { undo: true })
+		if (!this.dry) this.control = loadControl()
+		if (this.control.paused && (kind === 'DO' || kind === 'UNDO')) {
+			log(`일시정지 중이라 행동 버튼(${kind})을 실행하지 않음:`, aid)
 			return
 		}
-		if (rec.status !== 'pending') return
-		this.pendingActs = this.pendingActs.filter(p => p.aid !== aid)
-		if (kind === 'NO') return close('declined')
-		if (now > rec.expires) return close('expired')
-		// 승인을 기다리는 사이 설정이나 기기 상태가 바뀌었을 수 있으니 다시 검사한다.
-		const v = checkAction(rec, { tiers: this.tiers, states: this.states, quiet: false, usedToday: this.#todayCounters().actions, perDay: this.cfg.actions.per_day })
-		if (!v.ok) return close('error', { error: v.error })
-		if (v.noop) return close('done')
-		await this.#execute({ ...rec })
+		if (this.actingAids.has(aid)) return log('버튼: 이미 처리 중인 행동', aid)
+		this.actingAids.add(aid)
+		try {
+			const now = this.clock()
+			const rec = latestBy(readJsonlAll(P.actions), 'aid').find(a => a.aid === aid)
+			if (!rec) return log('버튼: 행동 기록을 찾지 못함', aid)
+			const close = async (status, extra = {}) => {
+				const r = { ...rec, ...extra, status, decided_at: iso(now) }
+				appendJsonl(P.actions, r)
+				log(`행동 ${status}: ${rec.name} ${rec.action}`)
+				await this.#send(actionResultPayload(r)).catch(() => {})
+			}
+			if (kind === 'UNDO') {
+				if (!['done', 'unverified'].includes(rec.status) || rec.undo_of) return
+				if (!canUndo(rec)) return log('되돌리기: 지원하지 않는 반대 행동', `${rec.entity_id} ${opposite(rec.action)}`)
+				if (!this.tiers.has(rec.entity_id)) return log('되돌리기: 허용 목록에서 빠진 엔티티', rec.entity_id)
+				const res = await this.#execute({ aid: newId(), ts: iso(now), entity_id: rec.entity_id, name: rec.name, action: opposite(rec.action), reason: `되돌리기: ${rec.reason}`.slice(0, 200), tier: rec.tier, undo_of: aid }, { undo: true })
+				if (res.status !== 'error') appendJsonl(P.actions, { ...rec, status: 'undone', decided_at: iso(now) })
+				return
+			}
+			if (rec.status !== 'pending' || !this.pendingActs.some(p => p.aid === aid)) return
+			this.pendingActs = this.pendingActs.filter(p => p.aid !== aid)
+			if (kind === 'NO') return close('declined')
+			if (now > rec.expires) return close('expired')
+			// 승인을 기다리는 사이 설정이나 기기 상태가 바뀌었을 수 있으니 다시 검사한다.
+			const v = checkAction(rec, { tiers: this.tiers, states: this.states, quiet: false, usedToday: this.#todayCounters().actions, perDay: this.cfg.actions.per_day })
+			if (!v.ok) return close('error', { error: v.error })
+			if (v.noop) return close('done')
+			await this.#execute({ ...rec })
+		} finally {
+			this.actingAids.delete(aid)
+		}
 	}
 
 	async #expireActions(now) {

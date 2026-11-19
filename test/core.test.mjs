@@ -4,7 +4,7 @@ import assert from 'node:assert/strict'
 import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync, rmSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { RuleEngine, validateRule, condition, ruleKey } from '../src/rules.mjs'
+import { RuleEngine, validateRule, condition, ruleKey, recentFires } from '../src/rules.mjs'
 import { validateResponse, codexArgs, brainMode, brainSettings, selfCheck } from '../src/brain.mjs'
 import { runApi, runTool, apiKey, TOOLS } from '../src/api.mjs'
 import { buildPayload, feedbackPayload, approvalPayload, actionResultPayload, isReservedMessage, ACTION_RE, CHANNELS } from '../src/notify.mjs'
@@ -12,10 +12,10 @@ import { checkMessage, HEARTBEAT_EVENT, HA } from '../src/ha.mjs'
 import { createServer } from 'node:net'
 import { checkAction, actionTiers } from '../src/actions.mjs'
 import { dailyDigest } from '../src/records.mjs'
-import { notableChange, compactStates, buildPrompt, changeLines, significantChange, guideFor } from '../src/context.mjs'
+import { notableChange, compactStates, buildPrompt, changeLines, significantChange, guideFor, calendarText } from '../src/context.mjs'
 import { backtestRule, backtestable } from '../src/backtest.mjs'
-import { globs } from '../src/util.mjs'
-import { DEFAULTS, mergeConfig } from '../src/config.mjs'
+import { globs, readJsonlAll } from '../src/util.mjs'
+import { DEFAULTS, mergeConfig, validateConfig } from '../src/config.mjs'
 import { automationRuns, deviceActivity } from '../src/weekly.mjs'
 
 const T0 = Date.parse('2026-11-11T06:00:00Z')
@@ -623,4 +623,75 @@ test('프롬프트: 백테스트 결과, 미뤄 둔 발동, 직접 시킨 행동
 	const p = buildPrompt({ ...base, reasons: [{ type: 'user', text: '작은방 불 꺼줘' }] })
 	for (const s of ['백테스트: 만들 때 지난 7일 기록으로는 21회 발동했을 것', '지금 조건 참(쿨다운·쉼이 끝나면 발동)', 'requested=true로 낸다']) assert.ok(p.includes(s), s)
 	assert.ok(!buildPrompt({ ...base, reasons: [{ type: 'hourly', hour: 9 }] }).includes('requested=true로 낸다'), '사용자 말로 깨어났을 때만')
+})
+
+test('설정 검증: 잘못된 범위·oob 누락은 오류, api의 max 상속은 경고', () => {
+	assert.deepEqual(validateConfig(mergeConfig({})), { errors: [], warnings: [] })
+	const bad = validateConfig(mergeConfig({ active_hours: { start: 23, end: 7 }, reflection_hour: 25, oob: { type: 'ntfy' } }))
+	assert.ok(bad.errors.some(e => /active_hours/.test(e)))
+	assert.ok(bad.errors.some(e => /reflection_hour/.test(e)))
+	assert.ok(bad.errors.some(e => /oob\.topic/.test(e)))
+	const warn = validateConfig(mergeConfig({ codex: { effort_deep: 'max' } }))
+	assert.equal(warn.errors.length, 0)
+	assert.ok(warn.warnings.some(w => /max/.test(w)))
+})
+
+test('규칙 7일 발동 필터, 타임존 없는 시각 파싱, null last_triggered 허용', () => {
+	const old = T0 - 10 * 24 * 60 * MIN, recent = T0 - 2 * 24 * 60 * MIN
+	assert.equal(recentFires({ fire_log: [old, recent] }, T0).length, 1)
+	const p = buildPrompt({ guide: 'g', now: T0, quiet: false, reasons: [{ type: 'hourly', hour: 9 }], rules: [rule()], runtime: { door_open_long: { fire_log: [old, recent] } }, schedule: [], memory: '', ring: [], weather: null, calendar: [] })
+	assert.ok(p.includes('7일 발동 1회'))
+	const autoNull = st('automation.never', 'on', T0, { last_triggered: null })
+	const sm = new Map([...states, ['automation.never', autoNull], ['sensor.no_tz', st('sensor.no_tz', '2026-11-11 10:00:00')]])
+	assert.equal(validateRule(rule({ entity_id: 'automation.never', attribute: 'last_triggered', op: 'older_than', value: 60, for_minutes: 0 }), sm).ok, true)
+	assert.equal(condition(rule({ entity_id: 'sensor.no_tz', op: 'older_than', value: 60, for_minutes: 0 }), sm.get('sensor.no_tz'), Date.parse('2026-11-11T12:00:00+09:00')), true)
+})
+
+test('다일 일정, 가전 가동 상태, readJsonlAll, effort_hourly 설정', () => {
+	const cal = calendarText([
+		{ calendar: '개인', start: '2026-11-19', end: '2026-11-22', summary: '제주 여행' },
+		{ calendar: '개인', start: '2026-11-19', end: '2026-11-20', summary: '당일' },
+		{ calendar: '개인', start: '2026-11-19T22:00:00+09:00', end: '2026-11-20T01:00:00+09:00', summary: '야간' },
+	])
+	assert.match(cal, /11-19\(목\)~11-21\(토\) 종일 제주 여행/)
+	assert.match(cal, /11-19\(목\) 종일 당일/)
+	assert.match(cal, /11-19\(목\) 22:00~11-20\(금\) 01:00 야간/)
+	const d0 = Date.parse('2026-11-10T00:00:00+09:00')
+	const d = dailyDigest('2026-11-10', [{ t: d0 + 60 * MIN, id: 'sensor.washer', name: '세탁기', from: 'power_off', to: 'washing' }, { t: d0 + 95 * MIN, id: 'sensor.washer', name: '세탁기', from: 'washing', to: 'power_off' }])
+	assert.equal(d['sensor.washer'].active_min, 35)
+	const cfg = mergeConfig({ codex: { effort: 'high', effort_hourly: 'low' }, api: { effort: 'medium' } })
+	assert.equal(brainSettings(cfg, 'codex').effort_hourly, 'low')
+	assert.equal(brainSettings(cfg, 'api').effort_hourly, 'medium')
+	const tmp = mkdtempSync(join(tmpdir(), 'haagent-jsonl-'))
+	try {
+		const f = join(tmp, 'log.jsonl')
+		writeFileSync(`${f}.1`, '{"a":1}\n')
+		writeFileSync(f, '{"a":2}\n')
+		assert.deepEqual(readJsonlAll(f), [{ a: 1 }, { a: 2 }])
+	} finally { rmSync(tmp, { recursive: true, force: true }) }
+})
+
+test('API 파일 도구 run/ 제한 및 세부 토큰·비추론 effort 생략', async () => {
+	const f = apiFixture()
+	try {
+		writeFileSync(join(f.dir, 'GUIDE.md'), 'SECRET_OUTSIDE_RUN')
+		const ctx = { brainDir: f.dir }
+		assert.ok(!(await runTool('list_files', '{}', ctx)).includes('GUIDE.md'))
+		assert.match(await runTool('read_file', JSON.stringify({ path: 'GUIDE.md', start_line: null, max_lines: null }), ctx), /^오류: 이 폴더 밖은/)
+		assert.equal(await runTool('grep', JSON.stringify({ pattern: 'SECRET_OUTSIDE_RUN', path: null, context: null, max_matches: null }), ctx), '(찾은 줄 없음)')
+		let seenBody = null
+		const r = await runApi({
+			cfg: f.cfg, prompt: 'p', effort: 'none', timeoutSec: 5, model: 'gpt-4o-mini', brainDir: f.dir, runDir: join(f.dir, 'run'),
+			fetchFn: async (_u, init) => {
+				seenBody = JSON.parse(init.body)
+				return {
+					ok: true, status: 200,
+					json: async () => ({ status: 'completed', usage: { input_tokens: 100, input_tokens_details: { cached_tokens: 40 }, output_tokens: 20, output_tokens_details: { reasoning_tokens: 5 }, total_tokens: 120 }, output: [{ type: 'message', content: [{ type: 'output_text', text: '{"summary":"ok"}' }] }] }),
+				}
+			},
+		})
+		assert.equal(seenBody.reasoning, undefined)
+		assert.equal(seenBody.include, undefined)
+		assert.deepEqual(r.usage, { input: 100, cached: 40, output: 20, reasoning: 5 })
+	} finally { f.done() }
 })

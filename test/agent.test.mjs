@@ -756,3 +756,121 @@ test('규칙 백테스트: 새 규칙을 받으면 지난 기록에 돌려 보�
 	const e2 = await y.agent.cycle([{ type: 'manual', reason: '시험' }])
 	assert.deepEqual([e2.applied.added, e2.applied.backtest, e2.error], [['light_on'], undefined, undefined])
 })
+
+test('행동 안전: TV 되돌리기 미부착, UNDO 실패 시 상태 유지, 중복 탭·일시정지 가드', async () => {
+	const states = [st('media_player.tv', 'playing', T0 - 60 * MIN), st('light.a', 'on', T0 - 60 * MIN), st('switch.b', 'on', T0 - 60 * MIN)]
+	const x = setup({
+		states,
+		cfg: { actions: { enabled: true, auto: ['media_player.tv', 'light.a'], confirm: ['switch.b'] } },
+		brain: async () => ({ result: answer({ actions: [{ entity_id: 'media_player.tv', action: 'turn_off', reason: '절전' }, { entity_id: 'light.a', action: 'turn_off', reason: '빈 방' }] }), ms: 1, tokens: 1 }),
+	})
+	await x.agent.cycle([{ type: 'manual', reason: '시험' }])
+	const [tvNote, lightNote] = x.ha.sent
+	assert.equal(tvNote.data.actions, undefined, 'media_player는 turn_on 불가라 되돌리기 버튼을 달지 않는다')
+	assert.match(lightNote.data.actions[0].action, /^HAAGENT_UNDO_/)
+	// UNDO 실행이 실패하면 원 행동이 undone으로 바뀌지 않는다
+	const origCall = x.ha.callService.bind(x.ha)
+	x.ha.callService = async (d, s, o) => { if (d === 'light' && s === 'turn_on') throw new Error('기기 오류'); return origCall(d, s, o) }
+	x.ha.emit('action', { action: lightNote.data.actions[0].action })
+	await flush(); await flush()
+	const lightRec = latestBy(readJsonl(P.actions), 'aid').find(a => a.entity_id === 'light.a' && a.action === 'turn_off')
+	assert.equal(lightRec.status, 'done', '되돌리기 실패 시 원 기록은 done 유지')
+
+	// [실행] 중복 탭 방지: 처리 중 두 번 눌러도 1번만 실행
+	let release
+	const slowGate = new Promise(r => { release = r })
+	x.ha.callService = async (d, s, o) => { if (d === 'switch') await slowGate; return origCall(d, s, o) }
+	x.t.brain = async () => ({ result: answer({ actions: [{ entity_id: 'switch.b', action: 'turn_off', reason: '끄기' }] }), ms: 1, tokens: 1 })
+	await x.agent.cycle([{ type: 'manual', reason: '시험' }])
+	const doBtn = x.ha.sent.at(-1).data.actions[0].action
+	x.ha.emit('action', { action: doBtn })
+	x.ha.emit('action', { action: doBtn })
+	await flush()
+	release()
+	await flush(); await flush()
+	assert.equal(x.ha.calls.filter(c => c === 'switch.b turn_off').length, 1, '중복 탭해도 1회만 실행')
+
+	// paused 상태에서는 DO와 REPLY가 차단된다
+	saveControl({ paused: true, send: true })
+	x.t.brain = async () => ({ result: answer({ actions: [{ entity_id: 'switch.b', action: 'turn_on', reason: '켜기' }] }), ms: 1, tokens: 1 })
+	x.agent.control.paused = false
+	await x.agent.cycle([{ type: 'manual', reason: '시험' }])
+	const doPaused = x.ha.sent.at(-1).data.actions[0].action
+	x.ha.emit('action', { action: doPaused })
+	await flush(); await flush()
+	assert.equal(x.ha.calls.filter(c => c === 'switch.b turn_on').length, 0, '일시정지 중에는 행동 버튼 미실행')
+	x.ha.emit('action', { action: 'REPLY', reply_text: '지금 실행해', tag: 'haagent-summary' })
+	await flush()
+	assert.equal(x.agent.queue.some(q => q.type === 'user'), false, '일시정지 중에는 답장을 큐에 넣지 않음')
+})
+
+test('reflection 지연 복구·보류 예외, fallback_model 우선순위, 날씨 폴백, effort_hourly', async () => {
+	const efforts = []
+	const x = setup({
+		cfg: { active_hours: { start: 7, end: 23 }, reflection_hour: 23, weather_entity: 'weather.bad', weather_fallback_entity: 'weather.good', codex: { effort: 'high', effort_hourly: 'low', effort_deep: 'max' }, away_override_entity: 'input_boolean.override' },
+		states: [st('binary_sensor.door', 'off', T0 - 60 * MIN), st('weather.bad', 'sunny', T0), st('weather.good', 'cloudy', T0, { temperature: 12, humidity: 40, wind_speed: 2 }), st('input_boolean.override', 'on', T0)],
+		brain: async a => { efforts.push(a.effort); return { result: answer({ notifications: [note({ kind: 'hourly_summary', level: 'quiet', title: '마감', related_rule_ids: [] })] }), ms: 1, tokens: 1 } },
+	})
+	const realSvc = x.ha.callService.bind(x.ha)
+	x.ha.callService = async (d, s, o) => {
+		if (d === 'weather' && o?.target?.entity_id === 'weather.bad') throw new Error('기상청 일시 오류')
+		if (d === 'weather' && o?.target?.entity_id === 'weather.good') return { response: { 'weather.good': { forecast: [{ datetime: new Date(T0 + 3600000).toISOString(), condition: 'cloudy', temperature: 11, precipitation: 0 }] } } }
+		return realSvc(d, s, o)
+	}
+	await x.agent.cycle([{ type: 'hourly', hour: 15 }])
+	await x.agent.cycle([{ type: 'manual', reason: '확인' }])
+	assert.match(x.t.prompts[0], /날씨 \(weather\.good\)/, '보조 날씨로 폴백')
+	assert.match(x.t.prompts[0], /재실·방해금지 도우미:.*= on/)
+	// 23:40에 깨어나도(k.mi >= 10, k.mi >= 30) reflection 실행 및 요약 즉시 발송
+	x.t.now = Date.parse('2026-11-11T23:40:00+09:00')
+	await x.agent.tick()
+	assert.deepEqual(efforts, ['low', 'high', 'max'])
+	assert.equal(x.ha.sent.at(-1).title, '마감', '23:30 이후에도 reflection 요약은 보류되지 않음')
+
+	// fallback_model이 설정되면 after_failures(2)째 실패에 대체 모델을 먼저 쓰고, 그다음 failover
+	const calls = []
+	const y = setup({
+		cfg: { codex: { model: 'm-main', fallback_model: 'm-fb' }, api: { model: 'm-api' }, failover: { after_failures: 2 } },
+		canUse: () => true,
+		brain: async a => { calls.push([a.mode, a.model]); throw new Error('실패') },
+	})
+	for (let i = 0; i < 4; i++) await y.agent.cycle([{ type: 'manual', reason: '시험' }])
+	assert.deepEqual(calls, [['codex', 'm-main'], ['codex', 'm-main'], ['codex', 'm-fb'], ['api', 'm-api']])
+})
+
+test('system-log 델타 추적과 정각 건너뛰기, noiseRing 분리, stale 갱신 순서', async () => {
+	const x = setup({ cfg: { noise_entities: ['sensor.noise_*'] }, states: [st('binary_sensor.door', 'off', T0 - 60 * MIN), st('sensor.noise_1', '0', T0 - 60 * MIN), st('sensor.temp', '20', T0 - 10 * MIN)] })
+	let logs = [{ level: 'WARNING', name: 'comp.a', message: 'warn1', count: 1, timestamp: T0 / 1000 }]
+	const realCall = x.ha.call.bind(x.ha)
+	x.ha.call = async msg => (msg.type === 'system_log/list' ? logs : realCall(msg))
+
+	await x.agent.cycle([{ type: 'hourly', hour: 16 }])
+	assert.equal(x.t.prompts.length, 1)
+	assert.match(x.t.prompts[0], /HA 시스템 오류·수리 변화/)
+	// 같은 경고 그대로면 17시는 건너뜀
+	x.t.now += 60 * MIN
+	assert.equal((await x.agent.cycle([{ type: 'hourly', hour: 17 }])).skipped, true)
+	// 새 ERROR가 생기면 건너뛰지 않고 프롬프트에 표시
+	logs = [...logs, { level: 'ERROR', name: 'comp.b', message: 'boom', count: 1, timestamp: x.t.now / 1000 }]
+	x.t.now += 60 * MIN
+	const res18 = await x.agent.cycle([{ type: 'hourly', hour: 18 }])
+	assert.equal(res18.skipped, undefined)
+	assert.match(x.t.prompts.at(-1), /\[신규 ERROR\] comp\.b: boom/)
+	assert.equal(readJson(join(P.run, 'system-log.json'), []).find(e => e.name === 'comp.b')?.status, 'new')
+
+	// 소음 350건이 와도 실제 변화(binary_sensor.door)가 ring에서 밀려나지 않음
+	x.ha.set('binary_sensor.door', 'on', x.t.now + MIN)
+	for (let i = 1; i <= 350; i++) x.ha.set('sensor.noise_1', String(i), x.t.now + MIN + i)
+	x.t.now += 60 * MIN
+	assert.equal((await x.agent.cycle([{ type: 'hourly', hour: 19 }])).skipped, undefined, '소음이 많아도 실제 변화 감지 유지')
+
+	// tick()이 engine.tick() 전에 stale 센서의 최신 last_reported를 읽어 오탐을 막는다
+	const y = setup({
+		rules: [rule({ id: 'temp_stale', entity_id: 'sensor.temp', op: 'stale', value: null, for_minutes: 10 })],
+		states: [st('sensor.temp', '20', T0)],
+	})
+	y.t.now += 15 * MIN
+	y.ha.map.set('sensor.temp', { ...st('sensor.temp', '20', T0), last_reported: new Date(y.t.now - MIN).toISOString(), last_updated: new Date(y.t.now - MIN).toISOString() })
+	await y.agent.tick()
+	assert.equal(y.agent.queue.some(q => q.rule_id === 'temp_stale'), false, '갱신 후 판정하므로 stale 오탐 없음')
+})
