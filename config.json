@@ -19,7 +19,8 @@
   "sensor.*_charger_type",
   "device_tracker.*",
   "input_select.gonggi_*",
-  "sensor.seoul_*"
+  "sensor.seoul_*",
+  "sensor.jib_biseo_*"
  ],
  "limits": {
   "brain_runs_per_day": 80,
