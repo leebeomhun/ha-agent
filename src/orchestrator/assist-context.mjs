@@ -1,9 +1,12 @@
 // Assist 대화용 프롬프트 조립·기기 목록·로컬 빠른 경로(LLM 없이 켜기/끄기)·모델 단계 선택
 // 프롬프트는 캐시가 잘 맞도록 "고정 부분(시스템 지시)"과 "매번 바뀌는 부분(마지막 사용자 메시지 앞)"으로 나눈다.
 import { ACTION_SERVICES } from '../ha.mjs'
+import { scriptFieldsText } from '../core/policy.mjs'
 import { fmt, kst } from '../util.mjs'
 
 const DEAD = new Set(['unavailable', 'unknown'])
+// 빠른 경로에 넣지 않는 도메인: 스크립트·씬은 "켜기"가 상태가 아니라 실행이고, 스크립트는 받는 값(fields)이 있을 수 있다.
+const NO_FAST_DOMAINS = new Set(['script', 'scene'])
 // 켜기/끄기 빠른 경로를 쓸 수 있는 도메인 (ACTION_SERVICES에 turn_on/turn_off가 둘 다 있는 것)
 const ON_OFF_DOMAINS = new Set(Object.entries(ACTION_SERVICES)
 	.filter(([, s]) => s.includes('turn_on') && s.includes('turn_off'))
@@ -34,10 +37,15 @@ const valueText = st => {
 	return unit ? `${st.state}${unit}` : st.state
 }
 
-function serviceText(id, st) {
+function serviceText(id, st, scriptFields = null) {
 	const domain = id.split('.')[0]
 	const a = st?.attributes ?? {}
 	const services = ACTION_SERVICES[domain] ?? []
+	if (domain === 'script') {
+		const info = scriptFields?.get?.(id)
+		const fields = info ? scriptFieldsText(info) : ''
+		return info ? `turn_on${fields ? `(${fields})` : ''}` : 'turn_on(설정을 아직 받지 못해 실행 불가)'
+	}
 	if ((domain === 'select' || domain === 'input_select') && Array.isArray(a.options)) {
 		return `select_option(${a.options.slice(0, 12).join('/')})`
 	}
@@ -58,7 +66,7 @@ function serviceText(id, st) {
  * index: 빠른 경로용 이름 → 엔티티 매핑 (중복 이름은 모호하므로 뺀다)
  * labels: entity_id → 음성 응답에 쓸 이름 (별칭이 있으면 첫 별칭)
  */
-export function buildDirectory({ policy, states, areaOf = null, catOf = null, aliases = {}, isNoise = () => false, sensorClasses = DEFAULT_SENSOR_CLASSES, maxSensors = 20, maxBlocked = 20 }) {
+export function buildDirectory({ policy, states, areaOf = null, catOf = null, aliases = {}, isNoise = () => false, sensorClasses = DEFAULT_SENSOR_CLASSES, maxSensors = 20, maxBlocked = 20, scriptFields = null }) {
 	const areaFor = id => areaOf?.get?.(id) ?? null
 	const tiers = policy.tiersMap()
 	const devices = [], stateParts = []
@@ -79,11 +87,11 @@ export function buildDirectory({ policy, states, areaOf = null, catOf = null, al
 		const al = (Array.isArray(aliases?.[id]) ? aliases[id] : []).map(s => String(s).trim()).filter(Boolean)
 		labels.set(id, al[0] ?? name)
 		const tierText = tier === 'auto' ? '자율' : '승인(직접 요청하면 즉시 실행)'
-		devices.push(`- ${id} | ${name} | ${area ?? '-'} | ${tierText} | ${serviceText(id, st)}${al.length ? ` | 별칭: ${al.join(', ')}` : ''}`)
+		devices.push(`- ${id} | ${name} | ${area ?? '-'} | ${tierText} | ${serviceText(id, st, scriptFields)}${al.length ? ` | 별칭: ${al.join(', ')}` : ''}`)
 		stateParts.push(`${id}=${valueText(st)}`)
 		const domain = id.split('.')[0]
 		const onOffSvcs = (ACTION_SERVICES[domain] ?? []).filter(s => s === 'turn_on' || s === 'turn_off')
-		if (ON_OFF_DOMAINS.has(domain) || onOffSvcs.length) {
+		if (!NO_FAST_DOMAINS.has(domain) && (ON_OFF_DOMAINS.has(domain) || onOffSvcs.length)) {
 			const entry = { entity_id: id, label: al[0] ?? name, services: new Set(onOffSvcs) }
 			for (const n of [...al, name]) addName(n, entry)
 		}

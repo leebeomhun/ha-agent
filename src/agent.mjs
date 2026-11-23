@@ -8,6 +8,7 @@ import { runBrain, brainMode, brainSettings, validateResponse, selfCheck, normal
 import { feedbackPayload, proposalApprovalPayload, proposalResultPayload, ACTION_RE, REPLY_ACTION, TAG_PREFIX } from './notify.mjs'
 import { PolicyEngine } from './core/policy.mjs'
 import { Store } from './core/store.mjs'
+import { Journal } from './core/journal.mjs'
 import { MemoryManager } from './core/memory.mjs'
 import { AnomalyEngine } from './engine/anomaly.mjs'
 import { HaAdmin } from './admin/ha-admin.mjs'
@@ -24,7 +25,7 @@ import { backtestRule, backtestable } from './backtest.mjs'
 import { Notifier } from './agent/notifier.mjs'
 import { ActionExecutor } from './agent/action-executor.mjs'
 import { AssistHandler } from './agent/assist-handler.mjs'
-import { P, DAY, readJson, writeJson, appendJsonl, readJsonlAll, readJsonlCached, latestBy, kst, fmt, newId, log, expandHome, globs } from './util.mjs'
+import { P, DAY, readJson, writeJson, appendJsonl, readJsonlAll, kst, fmt, log, expandHome, globs } from './util.mjs'
 import { loadConfig, loadControl } from './config.mjs'
 
 const MIN = 60000
@@ -60,6 +61,8 @@ export class Agent {
 		if (this.store) {
 			try { this.store.migrateFromLegacyFiles() } catch (e) { log('DB 초기 이관 경고:', e.message) }
 		}
+		// 알림·피드백·행동·상태 변화 기록의 원본은 SQLite. JSONL은 내보내기.
+		this.journal = new Journal({ store: this.store })
 		this.ha = ha ?? new HA({
 			url: this.cfg.ha_ws_url, tokenFile: expandHome(this.cfg.token_file), notifyTargets: this.cfg.notify_targets,
 			actionEntities: [...this.tiers.keys()],
@@ -67,7 +70,7 @@ export class Agent {
 			policy: this.policy,
 		})
 		this.states = new Map()
-		const initEvents = dry ? [] : readJsonlAll(P.events)
+		const initEvents = dry ? [] : this.journal.recentEvents({ limit: 5000 })
 		this.ring = initEvents.filter(c => !this.isNoise(c.id)).slice(-300)
 		this.noiseRing = initEvents.filter(c => this.isNoise(c.id)).slice(-300)
 		this.rulesDoc = readJson(P.rules, null)
@@ -78,7 +81,7 @@ export class Agent {
 		this.held = readJson(P.held, [])
 		this.counters = readJson(P.counters, null)
 		this.outbox = dry ? [] : readJson(P.outbox, [])
-		this.pendingActs = dry ? [] : latestBy(readJsonlAll(P.actions), 'aid').filter(a => a.status === 'pending')
+		this.pendingActs = dry ? [] : this.journal.pendingActions()
 		const saved = dry ? {} : readJson(P.queue, {})
 		this.queue = [...(saved.inflight ?? []).map(r => ({ ...r, attempts: (r.attempts ?? 0) + 1 })), ...(saved.queue ?? [])]
 			.filter(r => (r.attempts ?? 0) < this.#maxAttempts(r))
@@ -106,7 +109,7 @@ export class Agent {
 		this.sessions = new SessionManager({ store: this.store })
 		this.llmRouter = new LlmRouter({ cfg: this.cfg, brainFn: this.brain, canUse: this.canUse })
 		this.haAdmin = new HaAdmin({
-			cfg: this.cfg, ha: this.ha, store: this.store, states: this.states, meta: this.meta, memory: this.memoryMgr,
+			cfg: this.cfg, ha: this.ha, store: this.store, states: this.states, meta: this.meta, memory: this.memoryMgr, policy: this.policy,
 			onRulePromoted: async ruleId => this.#removePromotedRule(ruleId),
 		})
 		this.notifier = new Notifier(this)
@@ -209,15 +212,21 @@ export class Agent {
 			const bucket = isNoise ? this.noiseRing : this.ring
 			bucket.push(c)
 			if (bucket.length > 300) bucket.shift()
-			appendJsonl(P.events, c)
-			this.store?.recordEvent({ ...c, isNoise })
+			// 기록이 실패해도(디스크·DB) 규칙 판정은 이어 간다.
+			try { this.journal.event(c, isNoise) } catch (e) { this.#warnOnce('event', '상태 변화 기록 실패:', e) }
 		}
-		if (n) this.anomaly.onNumericState(id, n, now)
 		const fired = this.engine.onState(id, n, now, this.states)
 		if (fired.length) { this.saveRuntime(); this.#handleFired(fired) }
 	}
 
-	#notes() { return latestBy(readJsonlCached(P.notifications), 'nid') }
+	// 같은 종류의 오류는 1분에 한 번만 남긴다(상태 변화마다 나는 오류가 로그를 덮지 않게).
+	#warnOnce(key, msg, e) {
+		const now = Date.now()
+		this.warnAt ??= new Map()
+		if (now - (this.warnAt.get(key) ?? 0) < 60000) return
+		this.warnAt.set(key, now)
+		log(msg, e?.message ?? e)
+	}
 
 	async #onAction(d) {
 		if (this.dry) return
@@ -232,7 +241,7 @@ export class Agent {
 			await this.handleProposalAction(nid, dec)
 			return
 		}
-		const rec = this.#notes().reverse().find(r => r.nid === nid)
+		const rec = this.journal.findNotification({ nid })
 		if (!rec) return log('버튼: 알림 기록을 찾지 못함', nid)
 		const now = this.clock()
 		const muted = []
@@ -240,11 +249,9 @@ export class Agent {
 			for (const id of rec.related_rule_ids ?? []) if (this.engine.mute(id, now + this.cfg.limits.mute_days * DAY)) muted.push(id)
 			this.saveRuntime()
 		}
-		const dup = readJsonlCached(P.feedback).some(f => f.nid === nid && f.kind === kind.toLowerCase())
-		if (!dup) {
+		if (!this.journal.hasFeedback(nid, kind.toLowerCase())) {
 			const fbRec = { ts: iso(now), nid, kind: kind.toLowerCase(), title: rec.title, ...(kind === 'LESS' ? { message: String(rec.message ?? '').slice(0, 300) } : {}), rules: rec.related_rule_ids ?? [], muted }
-			appendJsonl(P.feedback, fbRec)
-			this.store?.recordFeedback(fbRec)
+			this.journal.feedback(fbRec)
 		}
 		log(`버튼 ${kind}: ${rec.title}${muted.length ? ` (규칙 쉼: ${muted.join(', ')})` : ''}`)
 		const descs = muted.map(id => this.engine.rules.find(r => r.id === id)?.description).filter(Boolean)
@@ -254,7 +261,7 @@ export class Agent {
 	async #onReply(d) {
 		const text = String(d.reply_text ?? '').trim().slice(0, 500)
 		const nid = d.action_data?.nid, tag = typeof d.tag === 'string' ? d.tag : null
-		const rec = this.#notes().reverse().find(r => (nid && r.nid === nid) || (tag && r.tag === tag))
+		const rec = this.journal.findNotification({ nid, tag })
 		if (!text || !(rec || tag?.startsWith(TAG_PREFIX))) return
 		if (!this.dry) this.control = loadControl()
 		if (this.control.paused) {
@@ -264,8 +271,7 @@ export class Agent {
 		}
 		const now = this.clock()
 		const fbRec = { ts: iso(now), nid: rec?.nid ?? null, kind: 'reply', title: rec?.title ?? '', text, rules: rec?.related_rule_ids ?? [] }
-		appendJsonl(P.feedback, fbRec)
-		this.store?.recordFeedback(fbRec)
+		this.journal.feedback(fbRec)
 		log(`답장: "${text}"${rec ? ` ← ${rec.title}` : ''}`)
 		this.#enqueue({ type: 'user', text, about: rec?.title ?? null, urgent: true, at: now })
 		if (rec) await this.notifier.send(feedbackPayload(rec, 'REPLY'))
@@ -328,6 +334,7 @@ export class Agent {
 		if (this.ha.connected) {
 			const fired = this.engine.tick(this.states, now)
 			if (fired.length) { this.saveRuntime(); this.#handleFired(fired) }
+			try { this.anomaly.sampleAll(this.states, now) } catch (e) { this.#warnOnce('samples', '센서 표본 기록 실패:', e) }
 			let heldAnomaly = false
 			for (const a of this.anomaly.checkAnomalies(this.states, now)) {
 				if (this.isQuiet(now)) {
@@ -505,6 +512,8 @@ export class Agent {
 		const entry = { ts: iso(started), reasons: reasons.map(r => r.type + (r.rule_id ? `:${r.rule_id}` : '')), dry: this.dry }
 		const rounds = []
 		let input = null, mode = null, primary = null
+		// 판단 중 도구(ha_control_device·ha_propose_admin)로 한 일. JSON 답의 actions와 같은 한도(per_cycle)를 쓰고 판단 기록에 남긴다.
+		const toolLog = { calls: 0, actions: [], proposals: [], rejected: [] }
 		try {
 			const ctx = await this.#gather(started, { forceMeta })
 			const sysDelta = this.#computeSysDelta(ctx)
@@ -530,8 +539,8 @@ export class Agent {
 					rules: this.engine.rules, runtime: this.runtime.rules, schedule: this.schedule,
 					memory: this.memoryMgr.renderForPrompt(this.cfg.limits.memory_chars),
 					homeProfile: this.memoryMgr.loadHomeProfile(),
-					recentNotes: this.#notes().filter(n => started - Date.parse(n.ts) < DAY),
-					feedback: readJsonlCached(P.feedback).filter(f => started - Date.parse(f.ts) < 7 * DAY),
+					recentNotes: this.journal.notifications({ sinceMs: started - DAY + 1 }),
+					feedback: this.journal.feedbackRows({ sinceMs: started - 7 * DAY + 1 }),
 					held: heldItems, rejected: readJson(P.rejected, []),
 					pendingProposals: this.haAdmin.listProposals({ status: 'pending', limit: 10 }),
 					ring: [...this.ring, ...this.noiseRing].sort((a, b) => a.t - b.t),
@@ -562,10 +571,30 @@ export class Agent {
 				let infoFiles = [], res
 				entry.codex_ms = 0
 				this.runAbort = new AbortController()
+				const perCycle = this.cfg.actions.per_cycle
 				const toolContext = {
 					allowDirectRequest: reasons.some(r => r.type === 'user'),
 					adminEnabled: Boolean(this.cfg.policy?.admin_enabled),
 					source: reasons.map(r => r.type).join('+'),
+					executeControl: async (req, opts) => {
+						const label = `${req.entity_id} ${req.action}`
+						if (toolLog.calls >= perCycle) {
+							const error = `행동은 한 번의 판단에 ${perCycle}개까지`
+							toolLog.rejected.push({ action: label, error, via: 'tool' })
+							return { ok: false, status: 'rejected', error }
+						}
+						toolLog.calls++
+						const r = await this.actionExecutor.executeControlItem(req, opts)
+						if (r.ok) toolLog.actions.push(`${r.status}: ${label} (도구)`)
+						else toolLog.rejected.push({ action: label, error: r.error, via: 'tool' })
+						return r
+					},
+					proposeAdmin: async req => {
+						const r = await this.createAndNotifyProposal(req)
+						if (r.ok) toolLog.proposals.push(`${r.proposal.pid}:${r.proposal.title}`)
+						else toolLog.rejected.push({ proposal: req.title, error: r.error, via: 'tool' })
+						return r
+					},
 				}
 				try {
 					for (let round = 1; ; round++) {
@@ -600,11 +629,13 @@ export class Agent {
 				this.failures = 0
 				this.lastFailedMode = null
 				if (mode !== primary && !this.failover) await this.#startFailover(primary, mode, started, failedBefore)
-				entry.applied = await this.#apply(res, reasons)
+				entry.applied = await this.#apply(res, reasons, toolLog)
 				this.#commitSysDelta(ctx)
 			}
 		} catch (e) {
 			entry.error = e.message
+			// 판단은 실패했어도 도구로 이미 한 일은 남긴다.
+			if (toolLog.actions.length || toolLog.proposals.length) entry.tool_done = { actions: toolLog.actions, proposals: toolLog.proposals }
 			this.failures++
 			this.lastError = e.message
 			if (mode) this.lastFailedMode = mode
@@ -633,9 +664,7 @@ export class Agent {
 	getWeather(entityId = null) { return this.#weather(entityId) }
 	getCalendar(days = 2) { return this.#calendar(days) }
 	getRecentNotifications(hours = 24, limit = 15) {
-		const sinceMs = this.clock() - hours * 3600000
-		if (this.store) return this.store.recentNotifications({ sinceMs, limit })
-		return latestBy(readJsonlCached(P.notifications), 'nid').filter(n => Date.parse(n.ts) >= sinceMs).slice(-limit)
+		return this.journal.notifications({ sinceMs: this.clock() - hours * 3600000, limit })
 	}
 
 	async handleProposalAction(pid, decision) {
@@ -733,7 +762,7 @@ export class Agent {
 		])
 		const last = this.runtime.hourly
 		const since = last?.at ?? 0
-		const quietHouse = !this.ring.some(c => c.t > since && significantChange(c, this.isNoise)) && !readJsonlCached(P.feedback).some(f => Date.parse(f.ts) > since)
+		const quietHouse = !this.ring.some(c => c.t > since && significantChange(c, this.isNoise)) && !this.journal.feedbackRows({ sinceMs: since + 1, limit: 1 }).length
 		const hasSysAlert = Boolean(this.runtime.syslog_seen && (sysDelta?.newErrors?.length || sysDelta?.increasedErrors?.length || sysDelta?.newRepairs?.length))
 		const first = hour === this.cfg.active_hours.start || hour === 24
 		const skip = !first && !hasSysAlert && last?.fp === fp && quietHouse && now - since < 6 * 3600000
@@ -825,6 +854,22 @@ export class Agent {
 			this.meta.catOf = catOf
 			this.meta.autoCfg = autoCfg
 		} catch (e) { log('영역·자동화 정보를 가져오지 못함:', e.message) }
+		await this.loadScriptFields([...this.tiers.keys()], { now, force })
+	}
+
+	// 제어할 수 있는 스크립트가 받는 필드(fields)를 HA에서 받아 둔다(6시간 캐시).
+	// 받지 못한 스크립트는 Map에 넣지 않는다 → 정책 엔진이 그 스크립트 실행을 막는다(필드 없이 불러 반대로 동작하는 일 방지).
+	async loadScriptFields(ids, { now = this.clock(), force = false } = {}) {
+		const cache = this.meta.scriptFields ??= new Map()
+		const want = [...new Set(ids)].filter(id => typeof id === 'string' && id.startsWith('script.')
+			&& (force || !cache.has(id) || now - cache.get(id).at >= 6 * 3600000))
+		await Promise.all(want.map(async id => {
+			try {
+				const cfg = (await this.ha.call({ type: 'script/config', entity_id: id }))?.config
+				if (cfg && typeof cfg === 'object') cache.set(id, { fields: cfg.fields && typeof cfg.fields === 'object' ? cfg.fields : {}, at: now })
+			} catch (e) { log(`스크립트 설정을 가져오지 못함(${id}):`, e.message) }
+		}))
+		return cache
 	}
 
 	async #weather(overrideEntity = null) {
@@ -929,9 +974,9 @@ export class Agent {
 		return files
 	}
 
-	async #apply(res, reasons) {
+	async #apply(res, reasons, toolLog = null) {
 		const now = this.clock(), keep = this.cfg.limits.keep_snapshots
-		const out = { added: [], changed: [], deleted: [], rejected: [], wakes: [], memory: res.memory.mode, actions: [], proposals: [], notifications: [] }
+		const out = { added: [], changed: [], deleted: [], rejected: [...(toolLog?.rejected ?? [])], wakes: [], memory: res.memory.mode, actions: [], proposals: [...(toolLog?.proposals ?? [])], notifications: [] }
 		let rules = [...this.engine.rules]
 		for (const id of res.rule_changes.delete) {
 			if (rules.some(r => r.id === id)) { rules = rules.filter(r => r.id !== id); out.deleted.push(id) }
@@ -967,7 +1012,7 @@ export class Agent {
 		this.memoryMgr.applyLegacy(res.memory, out, now, { dry: this.dry, max: this.cfg.limits.memory_chars, keepSnapshots: keep })
 		if (res.memory_ops?.length) this.memoryMgr.applyOps(res.memory_ops, { source: 'cycle', now })
 		const notes = [...res.notifications]
-		out.actions = await this.actionExecutor.applyActions(res.actions, out, reasons)
+		out.actions = [...(toolLog?.actions ?? []), ...await this.actionExecutor.applyActions(res.actions, out, reasons, { used: toolLog?.calls ?? 0 })]
 		const rejectedProposals = []
 		for (const p of res.proposals ?? []) {
 			const pr = await this.createAndNotifyProposal(p)

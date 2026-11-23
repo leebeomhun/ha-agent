@@ -182,7 +182,7 @@ export class AssistHandler {
 		const as = a.cfg.assist ?? {}
 		return buildDirectory({
 			policy: a.policy, states: a.states, areaOf: a.meta.areaOf, catOf: a.meta.catOf,
-			aliases: as.aliases ?? {}, isNoise: a.isNoise,
+			aliases: as.aliases ?? {}, isNoise: a.isNoise, scriptFields: a.meta.scriptFields,
 			...(Array.isArray(as.sensor_classes) ? { sensorClasses: as.sensor_classes } : {}),
 			maxSensors: as.max_sensors ?? 20,
 		})

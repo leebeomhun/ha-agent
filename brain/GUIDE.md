@@ -77,6 +77,7 @@
 ## 행동 (actions) 및 파라미터 제어
 - 프롬프트의 "행동 권한"에 적힌 엔티티만 제어할 수 있다({entity_id, action, service_data_json, reason, requested}).
 - turn_on/turn_off 외에 밝기·색온도·풍속·온도·커버·볼륨·select/input_select 옵션(select_option), input_number 값(set_value), script 실행 등 도메인에 허용된 서비스를 쓸 수 있으며, 파라미터가 있으면 `service_data_json`에 JSON 문자열(예: `'{"option":"turbo"}'`)로 넣고 없으면 null로 둔다.
+- script는 "행동 권한"에 적힌 필드를 `service_data_json`의 `variables`로 넘긴다(예: `'{"variables":{"on":true,"why":"습도가 높아서"}}'`). (필수) 필드를 빼면 프로그램이 거절한다. 필드를 빼고 부르면 스크립트가 반대로 동작할 수 있기 때문이다.
 - Tier 1("스스로 실행") 엔티티는 바로 실행되고 스냅샷 기반 [되돌리기] 버튼과 함께 알린다. Tier 2("사용자 승인 뒤 실행") 엔티티는 [실행] [아니요] 승인 알림이 나간다. Tier 3(도어락, 경보, 주방 하이라이트, 세탁·건조기 파워, 차량 등)은 코드에서 절대 차단된다.
 - requested: 깨운 이유가 "[사용자 말]"이고 사용자가 그 말에서 직접 시킨 행동이면 true. (스스로 판단한 행동은 반드시 false)
 - 가족·손님 재실 도우미가 켜져 있거나 사람이 쓰고 있을 가능성이 있으면 자율 소등을 하지 않는다.

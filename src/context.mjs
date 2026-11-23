@@ -246,7 +246,7 @@ export function buildPrompt(x) {
 	if (act?.tiers?.length) {
 		const tierText = { auto: '스스로 실행(Tier 1)', confirm: '사용자 승인 뒤 실행(Tier 2)' }
 		sec(`행동 권한 (오늘 ${act.today}/${act.perDay}회 사용)`, [
-			...act.tiers.map(t => `- ${t.id} (${t.name ?? ''}) 지금 ${t.state} — ${tierText[t.tier]}`),
+			...act.tiers.map(t => `- ${t.id} (${t.name ?? ''}) 지금 ${t.state} — ${tierText[t.tier]}${t.fields ? ` [${t.fields}]` : ''}`),
 			...(act.adminEnabled ? ['※ HA 관리 제안(proposals): 자동화·스크립트 수정/생성, 통합 리로드, 백업, 규칙 승격, 엔티티 정리는 사전 검증 뒤 Tier 2 승인 요청으로 낼 수 있습니다.'] : []),
 			...(act.onRequest && x.reasons.some(r => r.type === 'user') ? ['※ 사용자가 이번 말에서 직접 시킨 행동은 requested=true로 낸다. 그러면 승인을 묻지 않고 바로 실행된다(조용한 시간에도). 네가 스스로 판단한 행동은 requested=false.'] : []),
 			...(act.recent?.length ? ['최근 행동:', ...act.recent.map(a => `- ${fmt(Date.parse(a.ts))} ${a.name ?? a.entity_id} ${VERB[a.action] ?? a.action} [${ACT_STATUS[a.status] ?? a.status}] ${a.reason}`)] : []),

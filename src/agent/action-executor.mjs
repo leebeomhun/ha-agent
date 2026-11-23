@@ -2,7 +2,8 @@
 import { approvalPayload, actionResultPayload } from '../notify.mjs'
 import { reached } from '../actions.mjs'
 import { loadControl } from '../config.mjs'
-import { P, DAY, appendJsonl, readJsonlCached, latestBy, newId, log } from '../util.mjs'
+import { scriptFieldsText } from '../core/policy.mjs'
+import { DAY, newId, log } from '../util.mjs'
 
 const MIN = 60000
 const iso = ms => new Date(ms).toISOString()
@@ -24,8 +25,8 @@ export class ActionExecutor {
 		return {
 			today: c.actions, perDay: a.cfg.actions.per_day, onRequest: !!a.cfg.actions.on_request,
 			adminEnabled: Boolean(a.cfg.policy?.admin_enabled),
-			tiers: [...a.tiers].map(([id, tier]) => ({ id, tier, name: a.states.get(id)?.attributes?.friendly_name, state: a.states.get(id)?.state ?? '없음' })),
-			recent: latestBy(readJsonlCached(P.actions), 'aid').filter(x => Date.parse(x.ts) >= since).slice(-10),
+			tiers: [...a.tiers].map(([id, tier]) => ({ id, tier, name: a.states.get(id)?.attributes?.friendly_name, state: a.states.get(id)?.state ?? '없음', ...(id.startsWith('script.') ? { fields: a.meta.scriptFields?.has(id) ? scriptFieldsText(a.meta.scriptFields.get(id)) || '받는 값 없음' : '설정을 아직 받지 못해 실행 불가' } : {}) })),
+			recent: a.journal.actions({ sinceMs: since, limit: 10 }),
 		}
 	}
 
@@ -33,6 +34,8 @@ export class ActionExecutor {
 		const ag = this.agent
 		const a = ag.cfg.actions
 		const direct = Boolean(a.on_request && byUser && x.requested === true)
+		// 스크립트는 받는 필드를 알아야 안전하게 부를 수 있다(필드 없이 부르면 반대로 동작할 수 있음).
+		if (typeof x.entity_id === 'string' && x.entity_id.startsWith('script.') && ag.tiers.has(x.entity_id)) await ag.loadScriptFields?.([x.entity_id])
 		const v = ag.policy.evaluateControl(x, {
 			states: ag.states,
 			quiet: direct ? false : ag.isQuiet(),
@@ -41,6 +44,7 @@ export class ActionExecutor {
 			pending: ag.pendingActs,
 			awayOverrideOn: this.isAwayOverrideOn(),
 			requested: direct,
+			scriptFields: ag.meta.scriptFields,
 		})
 		if (!v.ok) return { ok: false, status: 'rejected', error: v.error }
 		if (v.noop) return { ok: true, status: 'noop' }
@@ -56,8 +60,7 @@ export class ActionExecutor {
 		if (direct) rec.requested = true
 		if (!ag.control.send) {
 			rec.status = 'test_mode'
-			appendJsonl(P.actions, rec)
-			ag.store?.upsertAction(rec)
+			ag.journal.action(rec)
 		} else if (v.tier === 'auto' || direct) {
 			await this.execute(rec)
 		} else {
@@ -66,12 +69,13 @@ export class ActionExecutor {
 		return { ok: true, status: rec.status, rec }
 	}
 
-	async applyActions(list, out, reasons = []) {
+	// used: 이번 판단에서 도구로 이미 쓴 행동 수(한도 per_cycle을 함께 쓴다)
+	async applyActions(list, out, reasons = [], { used = 0 } = {}) {
 		const a = this.agent.cfg.actions, results = []
 		const byUser = reasons.some(r => r.type === 'user')
 		for (const [i, x] of list.entries()) {
 			const label = `${x.entity_id} ${x.action}`
-			if (i >= a.per_cycle) { out.rejected.push({ action: label, error: `행동은 한 번에 ${a.per_cycle}개까지` }); continue }
+			if (i + used >= a.per_cycle) { out.rejected.push({ action: label, error: `행동은 한 번에 ${a.per_cycle}개까지` }); continue }
 			const r = await this.executeControlItem(x, { byUser })
 			if (!r.ok) { out.rejected.push({ action: label, error: r.error }); continue }
 			if (r.status === 'noop') { results.push(`noop: ${label} (이미 그 상태)`); continue }
@@ -85,14 +89,15 @@ export class ActionExecutor {
 		const domain = overrideService?.domain ?? rec.domain ?? rec.entity_id.split('.')[0]
 		const service = overrideService?.service ?? rec.service ?? rec.action
 		const data = overrideService?.data ?? rec.service_data ?? {}
+		// 호출 전 상태를 잡아 둔다. 상태 변화 이벤트가 호출 응답보다 먼저 오면 호출 뒤에 잡은 값으로는 변화를 놓친다.
+		const before = ag.states.get(rec.entity_id)
 		try {
 			await ag.ha.callService(domain, service, { ...(Object.keys(data).length ? { data } : {}), target: { entity_id: rec.entity_id } })
-			rec.status = (await this.waitState(rec.entity_id, service, data)) ? 'done' : 'unverified'
+			rec.status = (await this.waitState(rec.entity_id, service, data, before)) ? 'done' : 'unverified'
 			ag.bump(undo ? 'undos' : 'actions')
 		} catch (e) { rec.status = 'error'; rec.error = e.message }
 		rec.done_at = iso(ag.clock())
-		appendJsonl(P.actions, rec)
-		ag.store?.upsertAction(rec)
+		ag.journal.action(rec)
 		log(`행동 ${rec.status}: ${rec.name} ${service} — ${rec.reason}`)
 		const shown = undo && rec.status === 'done' ? { ...rec, status: 'undone' } : rec
 		const undoable = !undo && rec.status !== 'error' && Boolean(ag.policy.buildUndoCall(rec))
@@ -100,13 +105,21 @@ export class ActionExecutor {
 		return rec
 	}
 
-	async waitState(id, action, data = {}) {
+	// 명령이 먹었는지 확인한다. before: 호출 전 상태.
+	// script/scene은 켜짐 상태로 남지 않는다(스크립트는 금방 끝나고, scene의 상태는 마지막 실행 시각) → 실행 흔적이 바뀌었는지로 본다.
+	async waitState(id, action, data = {}, before = this.agent.states.get(id)) {
 		const ag = this.agent
 		const until = Date.now() + ag.cfg.actions.verify_seconds * 1000
-		const prevUpdated = ag.states.get(id)?.last_updated
+		const prevUpdated = before?.last_updated
+		const domain = String(id).split('.')[0]
+		const ran = domain === 'script' || domain === 'scene'
 		for (;;) {
 			const st = ag.states.get(id)
-			if (action === 'turn_on' || action === 'turn_off') {
+			if (ran) {
+				if (st && (st.last_updated !== prevUpdated || st.state !== before?.state
+					|| st.attributes?.last_triggered !== before?.attributes?.last_triggered)) return true
+				if (Date.now() >= until) return false
+			} else if (action === 'turn_on' || action === 'turn_off') {
 				if (reached(action, st?.state)) return true
 			} else if (action === 'select_option' && data.option != null) {
 				if (st?.state === String(data.option)) return true
@@ -133,8 +146,7 @@ export class ActionExecutor {
 				ag.bump('alerts')
 			} catch (e) { rec.status = 'error'; rec.error = e.message }
 		}
-		appendJsonl(P.actions, rec)
-		ag.store?.upsertAction(rec)
+		ag.journal.action(rec)
 		log(`행동 승인 요청 ${rec.status}: ${rec.name} ${rec.action} — ${rec.reason}`)
 	}
 
@@ -149,12 +161,11 @@ export class ActionExecutor {
 		ag.actingAids.add(aid)
 		try {
 			const now = ag.clock()
-			const rec = latestBy(readJsonlCached(P.actions), 'aid').find(a => a.aid === aid) ?? ag.store?.getAction(aid)
+			const rec = ag.journal.getAction(aid)
 			if (!rec) return log('버튼: 행동 기록을 찾지 못함', aid)
 			const close = async (status, extra = {}) => {
 				const r = { ...rec, ...extra, status, decided_at: iso(now) }
-				appendJsonl(P.actions, r)
-				ag.store?.upsertAction(r)
+				ag.journal.action(r)
 				log(`행동 ${status}: ${rec.name} ${rec.action}`)
 				await ag.notifier.send(actionResultPayload(r)).catch(() => {})
 			}
@@ -171,8 +182,7 @@ export class ActionExecutor {
 				}, { undo: true, overrideService: undoCall })
 				if (res.status !== 'error') {
 					const updated = { ...rec, status: 'undone', decided_at: iso(now) }
-					appendJsonl(P.actions, updated)
-					ag.store?.upsertAction(updated)
+					ag.journal.action(updated)
 				}
 				return
 			}
@@ -180,9 +190,11 @@ export class ActionExecutor {
 			ag.pendingActs = ag.pendingActs.filter(p => p.aid !== aid)
 			if (kind === 'NO') return close('declined')
 			if (now > rec.expires) return close('expired')
+			if (typeof rec.entity_id === 'string' && rec.entity_id.startsWith('script.')) await ag.loadScriptFields?.([rec.entity_id])
 			const v = ag.policy.evaluateControl(rec, {
 				states: ag.states, quiet: false, usedToday: ag.todayCounters().actions,
 				perDay: ag.cfg.actions.per_day, awayOverrideOn: false, requested: true,
+				scriptFields: ag.meta.scriptFields,
 			})
 			if (!v.ok) return close('error', { error: v.error })
 			if (v.noop) return close('done')
@@ -199,8 +211,7 @@ export class ActionExecutor {
 		ag.pendingActs = ag.pendingActs.filter(p => !old.includes(p))
 		for (const p of old) {
 			const r = { ...p, status: 'expired', decided_at: iso(now) }
-			appendJsonl(P.actions, r)
-			ag.store?.upsertAction(r)
+			ag.journal.action(r)
 			log(`행동 승인 시간 지남: ${p.name} ${p.action}`)
 			if (ag.ha.connected) await ag.notifier.send(actionResultPayload(r)).catch(() => {})
 		}

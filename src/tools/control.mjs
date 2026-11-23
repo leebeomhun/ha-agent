@@ -7,7 +7,7 @@ export function controlTools() {
 			properties: {
 				entity_id: { type: 'string', description: '대상 엔티티 ID' },
 				service: { type: 'string', description: '서비스 이름(turn_on, turn_off, set_percentage, select_option 등)' },
-				service_data_json: { type: ['string', 'null'], description: '파라미터 JSON 문자열(예: {"option":"turbo"}). 없으면 null' },
+				service_data_json: { type: ['string', 'null'], description: '파라미터 JSON 문자열(예: {"option":"turbo"}). 스크립트는 기기 목록에 적힌 필드를 {"variables":{"on":true,"why":"…"}}처럼 넘긴다(필수 필드를 빼면 거절됨). 없으면 null' },
 				reason: { type: 'string', description: '사용자에게 보여줄 제어 이유(한국어)' },
 				requested: { type: ['boolean', 'null'], description: '사용자가 이번 대화에서 직접 요청한 제어이면 true, 자율 판단이면 false' },
 				speech_if_success: { type: ['string', 'null'], description: 'Assist 대화에서 제어가 성공하면 사용자에게 바로 들려줄 짧은 한국어 문장(예: "주방 불을 켰어요."). 대화가 아니면 null' },

@@ -124,7 +124,10 @@ export class HA extends EventEmitter {
 		this.subs = new Map()
 		ws.onmessage = e => {
 			if (this.ws !== ws) return
-			try { this.#onMessage(JSON.parse(e.data)) } catch (err) { this.#lost(`메시지 파싱 실패: ${err.message}`) }
+			// 파싱 실패만 연결 문제로 본다. 받은 이벤트를 처리하다 난 오류(디스크·DB·규칙 버그)로 연결을 끊지 않는다.
+			let msg
+			try { msg = JSON.parse(e.data) } catch (err) { return this.#lost(`메시지 파싱 실패: ${err.message}`) }
+			this.#onMessage(msg)
 		}
 		ws.onclose = () => { if (this.ws === ws) this.#lost('연결 끊김') }
 		// Node 22의 WebSocket은 접속 자체가 실패하면(연결 거부·네트워크 순간 끊김·101이 아닌 응답) error만 보내고 close는 보내지 않는다.
@@ -169,7 +172,7 @@ export class HA extends EventEmitter {
 			this.#lost('인증 실패')
 		} else if (m.type === 'event') {
 			const name = this.subs.get(m.id)
-			if (name) this.emit(name, m.event.data, m.event)
+			if (name) this.#dispatch(name, m.event?.data, m.event)
 		} else if (this.pending.has(m.id)) {
 			const p = this.pending.get(m.id)
 			this.pending.delete(m.id)
@@ -188,7 +191,25 @@ export class HA extends EventEmitter {
 		this.pingTimer = setInterval(() => {
 			this.call({ type: 'ping' }, 10000).catch(() => { if (this.connected) this.#lost('응답 없음') })
 		}, 30000)
-		this.emit('ready', states)
+		this.#dispatch('ready', states)
+	}
+
+	// 듣는 쪽(agent)의 오류는 기록만 하고 연결은 유지한다. 같은 오류가 이벤트마다 나면 1분에 한 번만 남긴다.
+	#dispatch(name, ...args) {
+		try {
+			this.emit(name, ...args)
+		} catch (err) {
+			const now = Date.now()
+			const w = this.dispatchErrors ??= new Map()
+			const rec = w.get(name) ?? { at: 0, n: 0 }
+			rec.n++
+			if (now - rec.at >= 60000) {
+				log(`HA 이벤트 처리 오류(${name}${rec.n > 1 ? `, 최근 ${rec.n}건` : ''}):`, err?.stack ?? err)
+				rec.at = now
+				rec.n = 0
+			}
+			w.set(name, rec)
+		}
 	}
 
 	#subscribe(event_type, name) {

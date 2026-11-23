@@ -141,10 +141,13 @@ export function actionResultPayload(a, { undo = false } = {}) {
 export const proposalTag = pid => `${TAG_PREFIX}prop-${pid}`
 
 export function proposalApprovalPayload(p) {
-	const diffPreview = p.diff_text ? `\n${String(p.diff_text).split('\n').slice(0, 4).join(' | ').slice(0, 140)}` : ''
+	// diff 앞부분(--- +++ {)으로는 무엇을 하는지 알 수 없어서, 있으면 "트리거·동작" 요약을 보여 준다.
+	const detail = p.validation?.summary_text
+		? `\n${String(p.validation.summary_text).slice(0, 300)}`
+		: p.diff_text ? `\n${String(p.diff_text).split('\n').slice(0, 4).join(' | ').slice(0, 140)}` : ''
 	return {
 		title: `🛠️ 승인 요청: ${p.title}`.slice(0, 60),
-		message: `${p.summary}${diffPreview}`.slice(0, 450),
+		message: `${p.summary}${detail}`.slice(0, 450),
 		data: {
 			tag: proposalTag(p.pid), group: 'ha-agent', notification_icon: ICON, ...CHANNELS.normal,
 			actions: [

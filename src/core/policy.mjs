@@ -26,10 +26,50 @@ export const ADMIN_SERVICES = new Set([
 	'homeassistant.disable_entity', 'homeassistant.enable_entity', 'homeassistant.hide_entity', 'homeassistant.unhide_entity',
 	'backup.create_automatic',
 ])
+// HA 자동화·스크립트 설정 안에 들어갈 수 없는 동작 도메인. 승인 뒤 HA 안에서 돌기 때문에 WS 호출 검사(Tier 3)를 거치지 않는다.
+export const CONFIG_BLOCKED_DOMAINS = new Set([...TIER3_DOMAINS, 'hassio', 'shell_command', 'python_script', 'pyscript'])
+const AUTOMATION_ADMIN_SERVICES = new Set(['automation.turn_on', 'automation.turn_off', 'automation.toggle', 'automation.trigger'])
+// entity_id가 아닌 대상(방·기기·층·라벨). 무엇이 포함될지 미리 알 수 없다.
+export const NON_ENTITY_TARGET_KEYS = ['area_id', 'device_id', 'floor_id', 'label_id']
+const ENTITY_ID_RE = /^[a-z_]+\.[a-z0-9_]+$/
+const SCRIPT_ENTITY_SERVICES = new Set(['turn_on', 'turn_off', 'toggle', 'reload'])
+// 기기를 움직이지 않는 서비스. entity_id는 기록·알림에 붙이는 표시일 뿐이다(예: logbook.log의 entity_id).
+const NON_ACTING_DOMAINS = new Set(['logbook', 'notify', 'persistent_notification', 'system_log'])
+const NON_ACTING_SERVICES = new Set(['homeassistant.update_entity'])
+const hasTemplate = s => typeof s === 'string' && /\{\{|\{%/.test(s)
 
 const isIntOrNum = (v, min, max) => typeof v === 'number' && Number.isFinite(v) && v >= min && v <= max
 const isBool = v => typeof v === 'boolean'
 const isStr = v => typeof v === 'string' && v.trim().length > 0 && v.length <= 120
+const VAR_NAME_RE = /^[a-z_][a-z0-9_]{0,40}$/
+// script.turn_on의 variables: 이름이 단순하고 값이 원시값(참·거짓·수·짧은 글)인 10개 이하의 객체
+const isScriptVars = v => v != null && typeof v === 'object' && !Array.isArray(v)
+	&& Object.keys(v).length <= 10
+	&& Object.entries(v).every(([k, x]) => VAR_NAME_RE.test(k)
+		&& (x === null || typeof x === 'boolean' || (typeof x === 'number' && Number.isFinite(x)) || (typeof x === 'string' && x.length <= 200)))
+
+// 스크립트가 받는 필드(HA script 설정의 fields). 기본값(default)이 없는 필드는 꼭 넘겨야 한다.
+// 필드를 빼고 부르면 템플릿이 빈 값으로 돌아 반대로 동작할 수 있다(예: on이 없으면 switch.turn_off).
+export function requiredScriptFields(info) {
+	return Object.entries(info?.fields ?? {}).filter(([, f]) => f?.default === undefined).map(([k]) => k)
+}
+export function scriptFieldsText(info) {
+	const fields = Object.entries(info?.fields ?? {})
+	if (!fields.length) return ''
+	return `variables: ${fields.map(([k, f]) => `${k}${f?.default === undefined ? '(필수)' : ''}${f?.description ? `=${String(f.description).slice(0, 40)}` : ''}`).join(', ')}`
+}
+// scriptFields: Map(entity_id → { fields }) — 스크립트 설정을 받아 둔 것. 없으면(받지 못함) 실행하지 않는다.
+export function checkScriptVariables(id, vars = {}, scriptFields) {
+	const info = scriptFields?.get?.(id)
+	if (!info) return `${id}의 설정(fields)을 아직 받지 못해 실행하지 않는다`
+	const declared = new Set(Object.keys(info.fields ?? {}))
+	const given = Object.keys(vars ?? {})
+	const unknown = given.filter(k => !declared.has(k))
+	if (unknown.length) return `${id}에 없는 변수: ${unknown.join(', ')}`
+	const missing = requiredScriptFields(info).filter(k => vars?.[k] === undefined || vars?.[k] === null)
+	if (missing.length) return `${id}에는 variables.${missing.join(', variables.')} 값이 필요하다 (service_data_json 예: {"variables":{${missing.map(k => `"${k}":…`).join(',')}}})`
+	return null
+}
 
 export const CONTROL_SPECS = {
 	light: {
@@ -88,7 +128,7 @@ export const CONTROL_SPECS = {
 		},
 	},
 	scene: { turn_on: {} },
-	script: { turn_on: {} },
+	script: { turn_on: { variables: isScriptVars } },
 	vacuum: { start: {}, pause: {}, return_to_base: {} },
 }
 
@@ -165,6 +205,12 @@ export class PolicyEngine {
 		this.enabled = Boolean(a.enabled)
 		this.adminEnabled = Boolean(p.admin_enabled)
 		this.tier3Blocked = globs([...DEFAULT_TIER3_PATTERNS, ...(p.tier3_blocked ?? [])])
+		// Tier 3 엔티티가 있을 수 있는 도메인. 이 도메인의 서비스는 방·기기 단위나 템플릿 대상으로 부를 수 없다.
+		this.tier3Domains = new Set(['homeassistant', ...TIER3_DOMAINS])
+		for (const pat of [...DEFAULT_TIER3_PATTERNS, ...(p.tier3_blocked ?? [])]) {
+			const dom = String(pat).split('.')[0]
+			if (dom && !dom.includes('*')) this.tier3Domains.add(dom)
+		}
 		this.awayOverrideExempt = new Set(p.away_override_exempt ?? ['light.hwanpunggi', 'switch.geosil_gonggiceongjeonggi_power'])
 
 		this.tiers = new Map()
@@ -188,7 +234,7 @@ export class PolicyEngine {
 
 	tiersMap() { return new Map(this.tiers) }
 
-	evaluateControl(req, { states, quiet = false, usedToday = 0, perDay = 20, pending = [], awayOverrideOn = false, requested = false } = {}) {
+	evaluateControl(req, { states, quiet = false, usedToday = 0, perDay = 20, pending = [], awayOverrideOn = false, requested = false, scriptFields = null } = {}) {
 		const id = req?.entity_id
 		const service = req?.service ?? req?.action
 		if (!this.tiers.size) return { ok: false, error: '행동 권한이 꺼져 있다(알림만 가능)' }
@@ -210,6 +256,10 @@ export class PolicyEngine {
 		const dataCheck = validateServiceData(domain, service, req.service_data ?? {}, st)
 		if (typeof dataCheck === 'string') return { ok: false, error: dataCheck }
 		const serviceData = dataCheck.data
+		if (domain === 'script') {
+			const bad = checkScriptVariables(id, serviceData.variables ?? {}, scriptFields)
+			if (bad) return { ok: false, error: bad }
+		}
 		if (isAlreadyReached(domain, service, serviceData, st)) return { ok: true, noop: true }
 		if (usedToday >= perDay) return { ok: false, error: `오늘 행동 한도(${perDay}회)에 닿았다` }
 		if (pending.some(p => p.entity_id === id)) return { ok: false, error: '같은 엔티티의 승인 요청이 이미 기다리는 중' }
@@ -227,13 +277,23 @@ export class PolicyEngine {
 		if (TIER3_SERVICES.has(key)) return `안전 정책(Tier 3)으로 차단된 서비스: ${key}`
 		if (ADMIN_SERVICES.has(key)) {
 			if (!this.adminEnabled) return `HA 관리 서비스 권한이 꺼져 있음: ${key}`
+			// 방·기기·층·라벨 대상이나 'all'은 무엇이 포함될지 알 수 없어 막는다.
+			const nonEntity = NON_ENTITY_TARGET_KEYS.filter(k => msg.target?.[k] != null)
+			if (nonEntity.length) return `관리 서비스는 entity_id 대상만 허용: ${key} (${nonEntity.join(', ')})`
 			const ids = [
 				...toIdList(msg.target?.entity_id),
 				...toIdList(msg.service_data?.entity_id),
 				...toIdList(msg.service_data?.new_entity_id),
 			]
 			for (const id of ids) {
-				if (typeof id !== 'string' || this.isTier3Blocked(id)) return `안전 정책(Tier 3)으로 차단된 대상: ${String(id)}`
+				if (typeof id !== 'string' || !ENTITY_ID_RE.test(id)) return `관리 서비스 대상이 올바른 entity_id가 아님: ${String(id)}`
+				if (this.isTier3Blocked(id)) return `안전 정책(Tier 3)으로 차단된 대상: ${id}`
+			}
+			if (AUTOMATION_ADMIN_SERVICES.has(key)) {
+				if (!ids.length) return `${key}에는 automation 엔티티 대상이 필요하다`
+				const bad = ids.find(id => !id.startsWith('automation.'))
+				if (bad) return `${key}의 대상은 automation 엔티티만 된다: ${bad}`
+				if (NON_ENTITY_TARGET_KEYS.some(k => msg.service_data?.[k] != null)) return `${key}는 entity_id 대상만 허용`
 			}
 			return null
 		}
@@ -244,6 +304,43 @@ export class PolicyEngine {
 		if (id.split('.')[0] !== msg.domain) return `도메인 불일치: ${key} (${id})`
 		const chk = validateServiceData(msg.domain, msg.service, msg.service_data ?? {})
 		return typeof chk === 'string' ? chk : null
+	}
+
+	// 자동화·스크립트 설정의 동작(서비스 호출·기기 동작) 목록을 검사한다. calls는 ha-admin의 collectConfigCalls 결과.
+	// 트리거·조건에서 Tier 3 엔티티의 상태를 읽는 것은 괜찮고, 그것을 움직이는 동작만 막는다. 오류 문장 목록을 돌려준다.
+	checkConfigCalls(calls = []) {
+		const errors = []
+		const add = e => { if (!errors.includes(e)) errors.push(e) }
+		for (const c of calls) {
+			if (c.kind === 'device') {
+				if (CONFIG_BLOCKED_DOMAINS.has(c.domain) || this.tier3Domains.has(c.domain)) {
+					add(`기기 동작(${c.domain}.${c.type})은 대상을 확인할 수 없어 허용하지 않음. 서비스 호출과 entity_id로 적을 것`)
+				}
+				continue
+			}
+			const svc = String(c.service ?? '')
+			const m = /^([a-z_]+)\.(.+)$/.exec(svc)
+			if (!m) { add(`서비스 이름을 확인할 수 없음(템플릿 등): ${svc.slice(0, 60)}`); continue }
+			const [, domain, name] = m
+			if (CONFIG_BLOCKED_DOMAINS.has(domain)) { add(`안전 정책(Tier 3)으로 자동화·스크립트에 넣을 수 없는 동작: ${svc}`); continue }
+			if (TIER3_SERVICES.has(svc)) { add(`안전 정책(Tier 3)으로 차단된 서비스: ${svc}`); continue }
+			if (NON_ACTING_DOMAINS.has(domain) || NON_ACTING_SERVICES.has(svc)) continue
+			// script.<이름>을 서비스처럼 부르는 것은 그 스크립트를 실행하는 것
+			if (domain === 'script' && !hasTemplate(name) && !SCRIPT_ENTITY_SERVICES.has(name) && this.isTier3Blocked(`script.${name}`)) {
+				add(`안전 정책(Tier 3)으로 차단된 대상: script.${name}`)
+			}
+			const risky = this.tier3Domains.has(domain)
+			if (risky && c.non_entity_targets?.length) add(`${svc}을 방·기기 단위(${c.non_entity_targets.join(', ')})로 부르면 Tier 3 기기가 섞일 수 있어 허용하지 않음. entity_id로 적을 것`)
+			for (const id of c.entity_ids ?? []) {
+				if (typeof id !== 'string') continue
+				if (hasTemplate(id) || id === 'all') {
+					if (risky) add(`${svc}의 대상(${id.slice(0, 40)})을 미리 확인할 수 없어 허용하지 않음`)
+					continue
+				}
+				if (ENTITY_ID_RE.test(id) && this.isTier3Blocked(id)) add(`안전 정책(Tier 3)으로 차단된 대상: ${id} (${svc})`)
+			}
+		}
+		return errors
 	}
 
 	captureSnapshot(st) {

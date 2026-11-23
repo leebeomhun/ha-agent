@@ -170,7 +170,16 @@ export class Store {
 			);
 			CREATE INDEX IF NOT EXISTS idx_feedback_ts ON feedback(ts);
 			CREATE INDEX IF NOT EXISTS idx_feedback_nid_kind ON feedback(nid, kind);
+			CREATE INDEX IF NOT EXISTS idx_notifications_tag_ts ON notifications(tag, ts);
+			CREATE INDEX IF NOT EXISTS idx_actions_status ON actions(status);
 		`)
+		this.#addColumn('actions', 'name', 'TEXT')
+	}
+
+	// 예전 판 DB에 없는 칼럼을 더한다(이미 있으면 그대로).
+	#addColumn(table, column, type) {
+		const cols = this.db.prepare(`PRAGMA table_info(${table})`).all().map(c => c.name)
+		if (!cols.includes(column)) this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`)
 	}
 
 	close() {
@@ -204,6 +213,15 @@ export class Store {
 					for (const r of map.values()) this.upsertAction(r)
 					this.db.exec('COMMIT')
 				} catch (e) { this.db.exec('ROLLBACK'); throw e }
+			}
+		}
+		// name 칼럼이 생기기 전에 들어간 행동 기록은 JSONL에서 이름을 채운다(한 번만, 빈 것만).
+		if (Number(this.db.prepare('SELECT COUNT(*) AS n FROM actions WHERE name IS NULL').get().n) > 0) {
+			const names = new Map()
+			for (const r of readJsonlAll(actionsPath)) if (r?.aid && r.name) names.set(r.aid, r.name)
+			if (names.size) {
+				const upd = this.db.prepare('UPDATE actions SET name = ? WHERE aid = ? AND name IS NULL')
+				for (const [aid, name] of names) upd.run(name, aid)
 			}
 		}
 		if (countOf('decisions') === 0) {
@@ -256,6 +274,18 @@ export class Store {
 
 	recordSensorSample(entityId, value, ts) {
 		this.db.prepare('INSERT INTO sensor_samples (ts, entity_id, value) VALUES (?, ?, ?)').run(ts, entityId, value)
+	}
+
+	// 여러 표본을 한 트랜잭션으로. rows: [{ entity_id, value, ts }]
+	recordSensorSamples(rows = []) {
+		if (!rows.length) return 0
+		const ins = this.db.prepare('INSERT INTO sensor_samples (ts, entity_id, value) VALUES (?, ?, ?)')
+		this.db.exec('BEGIN')
+		try {
+			for (const r of rows) ins.run(r.ts, r.entity_id, r.value)
+			this.db.exec('COMMIT')
+		} catch (e) { this.db.exec('ROLLBACK'); throw e }
+		return rows.length
 	}
 
 	getRecentSensorSamples(sinceMs, entityId = null) {
@@ -331,17 +361,22 @@ export class Store {
 		const domain = rec.domain ?? rec.entity_id?.split?.('.')[0] ?? null
 		const service = rec.service ?? rec.action ?? null
 		this.db.prepare(`
-			INSERT INTO actions (aid, ts, entity_id, domain, service, service_data, reason, tier, requested, prev_snapshot, status, error, expires, decided_at, done_at, undo_of)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			INSERT INTO actions (aid, ts, entity_id, domain, service, service_data, reason, tier, requested, prev_snapshot, status, error, expires, decided_at, done_at, undo_of, name)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT(aid) DO UPDATE SET
 				status = excluded.status, error = excluded.error, decided_at = COALESCE(excluded.decided_at, actions.decided_at),
-				done_at = COALESCE(excluded.done_at, actions.done_at), prev_snapshot = COALESCE(excluded.prev_snapshot, actions.prev_snapshot)
+				done_at = COALESCE(excluded.done_at, actions.done_at), prev_snapshot = COALESCE(excluded.prev_snapshot, actions.prev_snapshot),
+				expires = COALESCE(excluded.expires, actions.expires), name = COALESCE(excluded.name, actions.name)
 		`).run(
 			rec.aid, ts, rec.entity_id, domain, service,
 			jsonOrNull(rec.service_data), rec.reason ?? null, rec.tier ?? null,
 			rec.requested ? 1 : 0, jsonOrNull(rec.prev_snapshot ?? (rec.prev != null ? { state: rec.prev } : null)),
-			rec.status, rec.error ?? null, rec.expires ?? null, decidedAt, doneAt, rec.undo_of ?? null,
+			rec.status, rec.error ?? null, rec.expires ?? null, decidedAt, doneAt, rec.undo_of ?? null, rec.name ?? null,
 		)
+	}
+
+	pendingActions() {
+		return this.db.prepare("SELECT * FROM actions WHERE status = 'pending' ORDER BY ts ASC").all().map(r => this.#mapAction(r))
 	}
 
 	getAction(aid) {
@@ -354,14 +389,18 @@ export class Store {
 	}
 
 	#mapAction(r) {
-		return {
-			aid: r.aid, ts: new Date(r.ts).toISOString(), entity_id: r.entity_id, domain: r.domain,
-			action: r.service, service: r.service, service_data: parseJson(r.service_data, null),
+		const prevSnapshot = parseJson(r.prev_snapshot, null)
+		const serviceData = parseJson(r.service_data, null)
+		const out = {
+			aid: r.aid, ts: new Date(r.ts).toISOString(), entity_id: r.entity_id, name: r.name ?? r.entity_id, domain: r.domain,
+			action: r.service, service: r.service,
 			reason: r.reason, tier: r.tier, requested: !!r.requested,
-			prev_snapshot: parseJson(r.prev_snapshot, null), status: r.status, error: r.error,
+			prev: prevSnapshot?.state ?? null, prev_snapshot: prevSnapshot, status: r.status, error: r.error,
 			expires: r.expires, decided_at: r.decided_at ? new Date(r.decided_at).toISOString() : null,
 			done_at: r.done_at ? new Date(r.done_at).toISOString() : null, undo_of: r.undo_of,
 		}
+		if (serviceData && Object.keys(serviceData).length) out.service_data = serviceData
+		return out
 	}
 
 	upsertProposal(p) {
@@ -489,13 +528,23 @@ export class Store {
 		)
 	}
 
+	#mapNotification(r) {
+		return { ...r, ts: new Date(r.ts).toISOString(), related_rule_ids: parseJson(r.related_rule_ids, []) }
+	}
+
 	recentNotifications({ sinceMs = 0, limit = 50 } = {}) {
-		return this.db.prepare('SELECT * FROM notifications WHERE ts >= ? ORDER BY ts DESC LIMIT ?')
-			.all(sinceMs, limit).reverse().map(r => ({
-				...r,
-				ts: new Date(r.ts).toISOString(),
-				related_rule_ids: parseJson(r.related_rule_ids, []),
-			}))
+		return this.db.prepare('SELECT * FROM notifications WHERE ts >= ? ORDER BY ts DESC, rowid DESC LIMIT ?')
+			.all(sinceMs, limit).reverse().map(r => this.#mapNotification(r))
+	}
+
+	getNotification(nid) {
+		const r = this.db.prepare('SELECT * FROM notifications WHERE nid = ?').get(nid)
+		return r ? this.#mapNotification(r) : null
+	}
+
+	latestNotificationByTag(tag) {
+		const r = this.db.prepare('SELECT * FROM notifications WHERE tag = ? ORDER BY ts DESC, rowid DESC LIMIT 1').get(tag)
+		return r ? this.#mapNotification(r) : null
 	}
 
 	recordFeedback(rec) {
@@ -509,8 +558,12 @@ export class Store {
 		)
 	}
 
+	hasFeedback(nid, kind) {
+		return Boolean(this.db.prepare('SELECT 1 FROM feedback WHERE nid = ? AND kind = ? LIMIT 1').get(nid, kind))
+	}
+
 	recentFeedback({ sinceMs = 0, limit = 50 } = {}) {
-		return this.db.prepare('SELECT * FROM feedback WHERE ts >= ? ORDER BY ts DESC LIMIT ?')
+		return this.db.prepare('SELECT * FROM feedback WHERE ts >= ? ORDER BY ts DESC, id DESC LIMIT ?')
 			.all(sinceMs, limit).reverse().map(r => ({
 				...r,
 				ts: new Date(r.ts).toISOString(),

@@ -1,7 +1,7 @@
 // 알림 전달, 재전송 아웃박스, HA 연결 감시, 하트비트, urgent 에스컬레이션
 import { buildPayload, recoveredPayload, tagFor } from '../notify.mjs'
 import { brainMode, MODES } from '../brain.mjs'
-import { P, writeJson, appendJsonl, readJsonlCached, kst, fmt, newId, log } from '../util.mjs'
+import { P, writeJson, kst, fmt, newId, log } from '../util.mjs'
 
 const MIN = 60000
 const SUMMARY_RETRY_MS = 60 * MIN
@@ -47,8 +47,7 @@ export class Notifier {
 				if (n.level === 'urgent') this.oobSend(n.title, n.message)
 			}
 		}
-		appendJsonl(P.notifications, rec)
-		a.store?.upsertNotification(rec)
+		a.journal.notification(rec)
 		log(`알림 ${rec.status}: [${n.level}] ${n.title} — ${n.message}`)
 		return `${rec.status}: ${n.title}`
 	}
@@ -77,8 +76,7 @@ export class Notifier {
 
 	closeQueued(item, status) {
 		const rec = { nid: item.nid, ts: iso(item.ts), ...item.n, tag: tagFor(item.n, item.nid), status }
-		appendJsonl(P.notifications, rec)
-		this.agent.store?.upsertNotification(rec)
+		this.agent.journal.notification(rec)
 		log(`알림 ${{ sent: '다시 보냄', expired: '끝내 못 보냄', replaced: '새 요약으로 대신함' }[status]}: ${item.n.title}`)
 	}
 
@@ -158,8 +156,7 @@ export class Notifier {
 		try {
 			await this.send(recoveredPayload(prev, now, fmt))
 			const rec = { nid: newId(), ts: iso(now), kind: 'system', level: 'quiet', title: '✅ 집 비서가 다시 연결됐어요', message: `${fmt(prev)}부터 ${Math.round((now - prev) / MIN)}분 동안 HA와 신호가 끊겼었어요.`, related_rule_ids: [], tag: 'haagent-heartbeat', status: 'sent' }
-			appendJsonl(P.notifications, rec)
-			a.store?.upsertNotification(rec)
+			a.journal.notification(rec)
 			log(`다시 연결 알림: ${fmt(prev)}부터 ${Math.round((now - prev) / MIN)}분 끊겼었음`)
 		} catch (e) { log('다시 연결 알림 실패:', e.message) }
 	}
@@ -168,7 +165,7 @@ export class Notifier {
 		const a = this.agent
 		const e = a.cfg.escalation
 		if (a.dry || !e.enabled || !a.ha.connected || a.control.paused) return
-		let fb = null, touched = false
+		let touched = false
 		for (const r of a.engine.rules) {
 			const rt = a.runtime.rules[r.id]
 			if (r.priority !== 'urgent' || !rt?.fired || !rt.open || rt.waiting) continue
@@ -176,8 +173,8 @@ export class Notifier {
 			const m = rt.remind
 			if (m.done || m.n >= e.max_reminders || now - m.at < e.remind_minutes * MIN) continue
 			touched = true
-			fb ??= readJsonlCached(P.feedback)
-			if ((rt.muted_until && now < rt.muted_until) || fb.some(f => (f.rules ?? []).includes(r.id) && Date.parse(f.ts) >= rt.open)) { m.done = true; continue }
+			const fb = a.journal.feedbackRows({ sinceMs: rt.open })
+			if ((rt.muted_until && now < rt.muted_until) || fb.some(f => (f.rules ?? []).includes(r.id))) { m.done = true; continue }
 			m.n++
 			m.at = now
 			const st = a.states.get(r.entity_id)

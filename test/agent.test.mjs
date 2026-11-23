@@ -350,7 +350,7 @@ test('정각 요약의 [줄여 줘]: 피드백으로 남고 같은 자리에 결
 test('00시 하루 돌아보기: 전날 알림이 보이고, 24시 요약은 조용한 시간이어도 나간다', async () => {
 	const x = setup({ brain: async () => ({ result: answer({ notifications: [note({ kind: 'hourly_summary', level: 'quiet', title: '하루 마감', related_rule_ids: [] }), note({ title: '보류될 알림', related_rule_ids: [] })] }), ms: 1, tokens: 1 }) })
 	const midnight = Date.parse('2026-11-12T00:00:20+09:00')
-	appendJsonl(P.notifications, { nid: 'old1', ts: new Date(midnight - 30 * MIN).toISOString(), kind: 'alert', level: 'normal', title: '어젯밤 보낸 알림', message: 'm', related_rule_ids: [], tag: 'haagent-old1', status: 'sent' })
+	x.agent.journal.notification({ nid: 'old1', ts: new Date(midnight - 30 * MIN).toISOString(), kind: 'alert', level: 'normal', title: '어젯밤 보낸 알림', message: 'm', related_rule_ids: [], tag: 'haagent-old1', status: 'sent' })
 	await x.agent.tick() // 11일 낮에 한 번 돌아 그날의 횟수 기록이 생긴 상태
 	x.t.now = midnight
 	await x.agent.tick()
@@ -527,7 +527,7 @@ test('행동: 거절과 시간 초과', async () => {
 
 test('답장: 우리 알림에 단 답장만 사용자 말로 받아 바로 판단한다', async () => {
 	const x = setup()
-	appendJsonl(P.notifications, { nid: 'n1', ts: new Date(T0).toISOString(), kind: 'info', level: 'normal', title: '빨래가 끝났어요', message: 'm', related_rule_ids: [], tag: 'haagent-n1', status: 'sent' })
+	x.agent.journal.notification({ nid: 'n1', ts: new Date(T0).toISOString(), kind: 'info', level: 'normal', title: '빨래가 끝났어요', message: 'm', related_rule_ids: [], tag: 'haagent-n1', status: 'sent' })
 	x.ha.emit('action', { action: 'REPLY', reply_text: '다른 앱 답장', tag: 'other-automation' })
 	x.ha.emit('action', { action: 'REPLY', reply_text: '앞으로 빨래 알림은 저녁에만 줘', tag: 'haagent-n1' })
 	await flush()

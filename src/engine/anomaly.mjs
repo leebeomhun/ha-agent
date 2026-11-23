@@ -45,6 +45,26 @@ export class AnomalyEngine {
 		return map
 	}
 
+	// 5분마다 지금 값을 표본으로 남긴다(tick에서 부름). 값이 바뀔 때만 남기면 오래 그대로인 구간이 빠져
+	// 기준값이 "바뀌는 순간"의 값으로 치우친다(예: 꺼져 있는 시간이 긴 전력 센서). 시간 기준으로 고르게 쌓는다.
+	sampleAll(states, now = Date.now()) {
+		if (!this.store || !states) return 0
+		const rows = []
+		for (const [id, st] of states) {
+			if (!this.isTrackable(id, st)) continue
+			const val = Number(st?.state)
+			if (!Number.isFinite(val)) continue
+			if (now - (this.lastSampleAt.get(id) ?? 0) < MIN_SAMPLE_INTERVAL_MS) continue
+			this.lastSampleAt.set(id, now)
+			rows.push({ entity_id: id, value: val, ts: now })
+		}
+		if (!rows.length) return 0
+		if (typeof this.store.recordSensorSamples === 'function') this.store.recordSensorSamples(rows)
+		else for (const r of rows) this.store.recordSensorSample(r.entity_id, r.value, r.ts)
+		return rows.length
+	}
+
+	// 상태 변화 하나를 표본으로(예전 방식, 시험·도구용). 데몬은 sampleAll을 쓴다.
 	onNumericState(entityId, st, now = Date.now()) {
 		if (!this.store || !st) return false
 		if (!this.isTrackable(entityId, st)) return false
@@ -121,7 +141,9 @@ export class AnomalyEngine {
 			const effStd = Math.max(base.stddev, floor)
 			const diff = Math.abs(v - base.avg)
 			const z = diff / effStd
-			if (z > 3.5 && diff > floor) {
+			// 지난 14일 같은 시간대에 실제로 본 범위 안의 값은 평소 값이다(켜짐/꺼짐으로 값이 둘로 갈리는 센서의 오탐 방지).
+			const seen = v >= base.min_val && v <= base.max_val
+			if (z > 3.5 && diff > floor && !seen) {
 				const since = this.pendingSince.get(id) ?? now
 				if (!this.pendingSince.has(id)) this.pendingSince.set(id, now)
 				const lastAlert = this.lastAlertAt.get(id) ?? 0

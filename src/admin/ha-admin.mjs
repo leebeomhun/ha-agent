@@ -2,7 +2,7 @@
 import { mkdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { P, newId, fmt } from '../util.mjs'
-import { ADMIN_SERVICES } from '../core/policy.mjs'
+import { ADMIN_SERVICES, NON_ENTITY_TARGET_KEYS, PolicyEngine } from '../core/policy.mjs'
 
 const ENTITY_REF_RE = /^[a-z_]+\.[a-z0-9_]+$/
 const JINJA_ENTITY_RE = /(?:states|is_state|state_attr|is_state_attr|has_value)\(\s*['"]([a-z_]+\.[a-z0-9_]+)['"]/g
@@ -95,6 +95,56 @@ export function extractDeclaredVars(obj, out = new Set(), parentKey = '') {
 	return out
 }
 
+// 자동화·스크립트 설정에서 "실행되는 것"(서비스 호출·기기 동작)만 모은다. 트리거·조건은 상태를 읽을 뿐이라 건너뛴다.
+// 서비스 호출의 data·target 안(알림 버튼의 action 등)은 동작이 아니므로 들어가지 않는다.
+const ACTION_SKIP_KEYS = new Set(['conditions', 'condition', 'if', 'while', 'until', 'triggers', 'trigger', 'wait_for_trigger', 'data', 'data_template', 'target', 'variables', 'event_data', 'metadata', 'response_variable'])
+const toIds = v => (v == null ? [] : Array.isArray(v) ? v : typeof v === 'string' ? v.split(',').map(s => s.trim()).filter(Boolean) : [v])
+export function collectConfigCalls(kind, config) {
+	const out = []
+	const walk = node => {
+		if (Array.isArray(node)) { for (const x of node) walk(x); return }
+		if (!node || typeof node !== 'object') return
+		const svc = typeof node.action === 'string' ? node.action : typeof node.service === 'string' ? node.service : null
+		if (svc) {
+			const t = node.target && typeof node.target === 'object' ? node.target : {}
+			const data = node.data ?? node.data_template
+			out.push({
+				kind: 'service', service: svc.trim(),
+				entity_ids: [...toIds(t.entity_id), ...toIds(node.entity_id), ...toIds(data && typeof data === 'object' ? data.entity_id : null)],
+				non_entity_targets: NON_ENTITY_TARGET_KEYS.filter(k => t[k] != null),
+			})
+		} else if (typeof node.scene === 'string') {
+			out.push({ kind: 'service', service: 'scene.turn_on', entity_ids: [node.scene], non_entity_targets: [] })
+		} else if (node.device_id && typeof node.domain === 'string' && node.type && !('condition' in node) && !('trigger' in node) && !('platform' in node)) {
+			out.push({ kind: 'device', domain: node.domain, type: String(node.type), device_id: node.device_id })
+		}
+		for (const [k, v] of Object.entries(node)) if (!ACTION_SKIP_KEYS.has(k) && v && typeof v === 'object') walk(v)
+	}
+	if (!config || typeof config !== 'object') return out
+	walk(String(kind).startsWith('script') ? config.sequence : (config.actions ?? config.action))
+	return out
+}
+
+// 승인 알림에 보여 줄 짧은 요약: 무엇이 언제 무엇을 하는가
+export function summarizeConfig(config, calls) {
+	const trig = [].concat(config?.triggers ?? config?.trigger ?? []).filter(t => t && typeof t === 'object').slice(0, 3)
+		.map(t => `${t.trigger ?? t.platform ?? '?'}${t.entity_id ? ` ${[].concat(t.entity_id).join(',')}` : ''}${t.at ? ` ${[].concat(t.at).join(',')}` : ''}`)
+	const acts = [...new Set(calls.map(c => (c.kind === 'device'
+		? `${c.domain}.${c.type}(기기)`
+		: `${c.service}${c.entity_ids?.length ? ` → ${c.entity_ids.join(',')}` : c.non_entity_targets?.length ? ` → ${c.non_entity_targets.join(',')}` : ''}`)))]
+	return [
+		trig.length ? `트리거: ${trig.join(' / ')}` : '',
+		acts.length ? `동작: ${acts.slice(0, 6).join(' / ')}${acts.length > 6 ? ` 외 ${acts.length - 6}개` : ''}` : '동작: 없음',
+	].filter(Boolean).join('\n')
+}
+
+// 키 순서와 상관없이 같은 설정인지 비교하려고 정규화한다.
+export function canonicalJson(v) {
+	if (Array.isArray(v)) return `[${v.map(canonicalJson).join(',')}]`
+	if (v && typeof v === 'object') return `{${Object.keys(v).sort().map(k => `${JSON.stringify(k)}:${canonicalJson(v[k])}`).join(',')}}`
+	return JSON.stringify(v ?? null)
+}
+
 export function ruleToAutomationConfig(rule, notifyTargets = ['mobile_app_ibeomhun']) {
 	if (!PROMOTABLE_OPS.has(rule?.op)) {
 		throw new Error(`${rule?.op ?? '알 수 없음'} 연산자는 HA 자동화 직접 승격을 지원하지 않음`)
@@ -181,8 +231,9 @@ export function ruleToAutomationConfig(rule, notifyTargets = ['mobile_app_ibeomh
 }
 
 export class HaAdmin {
-	constructor({ cfg, ha, store = null, states = new Map(), meta = {}, memory = null, onRulePromoted = null } = {}) {
+	constructor({ cfg, ha, store = null, states = new Map(), meta = {}, memory = null, onRulePromoted = null, policy = null } = {}) {
 		this.cfg = cfg
+		this.policy = policy ?? new PolicyEngine(cfg ?? {})
 		this.ha = ha
 		this.store = store
 		this.states = states
@@ -216,6 +267,10 @@ export class HaAdmin {
 		const refs = [...extractEntityRefs(config)]
 		const missing = this.states.size ? refs.filter(id => !this.states.has(id)) : []
 		if (missing.length) errors.push(`존재하지 않는 엔티티 참조: ${missing.join(', ')}`)
+		// 승인 뒤에는 HA 안에서 돌기 때문에 Tier 3 차단을 여기서 미리 건다.
+		const calls = collectConfigCalls(kind, config)
+		errors.push(...this.policy.checkConfigCalls(calls))
+		const summaryText = summarizeConfig(config, calls)
 		const templates = [...new Set(extractTemplates(config))]
 		const allowedRuntimeVars = new Set([...RUNTIME_TEMPLATE_VARS, ...extractDeclaredVars(config)])
 		const skippedVars = new Set()
@@ -238,7 +293,7 @@ export class HaAdmin {
 		if (skippedCount > 0) {
 			warnings.push(`런타임 변수(${[...skippedVars].join(', ')}) 참조 템플릿 ${skippedCount}건은 문법 검사만 통과`)
 		}
-		return { valid: errors.length === 0, errors, warnings, missing_entities: missing, template_count: templates.length }
+		return { valid: errors.length === 0, errors, warnings, missing_entities: missing, template_count: templates.length, summary_text: summaryText }
 	}
 
 	#resolveConfigId(kind, targetId, payload) {
@@ -253,6 +308,24 @@ export class HaAdmin {
 			return sanitizeConfigId(targetId.replace(/^automation\./, ''))
 		}
 		return sanitizeConfigId(targetId.replace(/^script\./, ''))
+	}
+
+	// 지금 HA에 저장된 설정. 없으면 null, 확인할 수단이 없으면 undefined(시험용 가짜 HA 등). 그 밖의 오류는 던진다.
+	async #currentConfig(domain, configId) {
+		if (typeof this.ha?.getConfigRest !== 'function') return undefined
+		try { return (await this.ha.getConfigRest(domain, configId)) ?? null } catch (e) {
+			if (/(^|\D)404(\D|$)/.test(String(e?.message))) return null
+			throw e
+		}
+	}
+
+	// 제안할 때의 "이전 설정". 캐시(최대 6시간 묵음)가 아니라 HA에서 지금 값을 읽는다. 못 읽으면 캐시로 대신한다.
+	async #snapshotFor(domain, configId, targetId) {
+		try {
+			const cur = await this.#currentConfig(domain, configId)
+			if (cur !== undefined) return cur
+		} catch {}
+		return (domain === 'automation' ? this.meta?.autoCfg?.[targetId] : null) ?? null
 	}
 
 	isRollbackable(p) {
@@ -288,21 +361,19 @@ export class HaAdmin {
 			if (!validation.valid) {
 				return { ok: false, error: `사전 검증 실패: ${validation.errors.join(', ')}`, validation }
 			}
-			if (domain === 'automation' && this.meta?.autoCfg?.[target_id]) preSnapshot = this.meta.autoCfg[target_id]
-			else if (typeof this.ha?.getConfigRest === 'function' && this.ha?.connected && target_id) {
-				try { preSnapshot = await this.ha.getConfigRest(domain, configId) } catch {}
-			}
+			preSnapshot = await this.#snapshotFor(domain, configId, target_id)
 			diffText = unifiedDiff(preSnapshot ? JSON.stringify(preSnapshot, null, 2) : '', JSON.stringify(finalPayload.config, null, 2), target_id || configId)
 		} else if (kind === 'automation_delete' || kind === 'script_delete') {
 			const domain = kind.startsWith('automation') ? 'automation' : 'script'
 			const configId = this.#resolveConfigId(kind, target_id, finalPayload)
 			finalPayload = { config_id: configId }
-			if (domain === 'automation' && this.meta?.autoCfg?.[target_id]) preSnapshot = this.meta.autoCfg[target_id]
-			else if (typeof this.ha?.getConfigRest === 'function' && this.ha?.connected) {
-				try { preSnapshot = await this.ha.getConfigRest(domain, configId) } catch {}
-			}
+			preSnapshot = await this.#snapshotFor(domain, configId, target_id)
+			if (preSnapshot) validation = { ...validation, summary_text: `삭제: ${preSnapshot.alias ?? target_id}` }
 			diffText = unifiedDiff(preSnapshot ? JSON.stringify(preSnapshot, null, 2) : '(기존 설정 없음)', '', target_id)
 		} else if (kind === 'automation_toggle') {
+			if (!/^automation\.[a-z0-9_]+$/.test(String(target_id)) || (this.states.size && !this.states.has(target_id))) {
+				return { ok: false, error: `automation_toggle 대상은 있는 automation 엔티티여야 한다: ${target_id}` }
+			}
 			const cur = this.states.get(target_id)?.state ?? 'unknown'
 			preSnapshot = { state: cur }
 			diffText = `${target_id}: ${cur} → ${finalPayload.state ?? (cur === 'on' ? 'off' : 'on')}`
@@ -322,10 +393,13 @@ export class HaAdmin {
 			if (!validation.valid) {
 				return { ok: false, error: `사전 검증 실패: ${validation.errors.join(', ')}`, validation }
 			}
-			diffText = unifiedDiff('', JSON.stringify(config, null, 2), `automation.${configId}`)
+			preSnapshot = await this.#snapshotFor('automation', configId, `automation.${configId}`)
+			diffText = unifiedDiff(preSnapshot ? JSON.stringify(preSnapshot, null, 2) : '', JSON.stringify(config, null, 2), `automation.${configId}`)
 		} else if (kind === 'entity_admin') {
 			const svc = `homeassistant.${finalPayload.service}`
 			if (!ADMIN_SERVICES.has(svc)) return { ok: false, error: `허용되지 않은 엔티티 관리 서비스: ${svc}` }
+			if (!ENTITY_REF_RE.test(String(target_id))) return { ok: false, error: `entity_admin 대상은 entity_id여야 한다: ${target_id}` }
+			if (this.policy.isTier3Blocked(target_id)) return { ok: false, error: `안전 정책(Tier 3)으로 차단된 대상: ${target_id}` }
 			diffText = `${svc} target=${target_id} data=${JSON.stringify(finalPayload.data ?? {})}`
 		} else {
 			diffText = `${kind} ${target_id} ${JSON.stringify(finalPayload)}`
@@ -389,9 +463,31 @@ export class HaAdmin {
 		if (p.validation && p.validation.valid === false) {
 			return { ok: false, error: `사전 검증 실패: ${(p.validation.errors ?? []).join(', ')}` }
 		}
+		const mutatedConfig = ['automation_upsert', 'automation_delete', 'script_upsert', 'script_delete', 'promote_rule'].includes(p.kind)
+		// 예전 판이 만든 제안도 승인할 때 Tier 3 검사를 다시 거친다.
+		if (['automation_upsert', 'script_upsert', 'promote_rule'].includes(p.kind)) {
+			const errs = this.policy.checkConfigCalls(collectConfigCalls(p.kind === 'script_upsert' ? 'script_upsert' : 'automation_upsert', p.payload?.config))
+			if (errs.length) {
+				const blocked = { ...p, status: 'error', decided_at: now, error: `사전 검증 실패: ${errs.join(', ')}` }
+				this.#saveProposal(blocked)
+				return { ok: false, error: blocked.error, proposal: blocked }
+			}
+		}
+		// 제안 뒤에 HA에서 같은 설정을 손댔으면(UI 수정 등) 덮어쓰지 않는다. 그 수정이 사라지고, 롤백도 옛 판으로 돌아가기 때문이다.
+		if (mutatedConfig) {
+			const domain = p.kind.startsWith('script') ? 'script' : 'automation'
+			let cur
+			try { cur = await this.#currentConfig(domain, p.payload?.config_id) } catch (e) {
+				return { ok: false, error: `지금 HA 설정을 확인하지 못해 적용하지 않음(잠시 뒤 다시 승인): ${e.message}` }
+			}
+			if (cur !== undefined && canonicalJson(cur) !== canonicalJson(p.pre_snapshot ?? null)) {
+				const stale = { ...p, status: 'error', decided_at: now, error: '제안을 만든 뒤 HA에서 이 설정이 바뀌어 적용하지 않았어요. 바뀐 내용을 기준으로 다시 제안해야 해요.' }
+				this.#saveProposal(stale)
+				return { ok: false, error: stale.error, proposal: stale }
+			}
+		}
 		if (p.pre_snapshot) this.#saveSnapFile(pid, 'before', p.pre_snapshot)
 
-		const mutatedConfig = ['automation_upsert', 'automation_delete', 'script_upsert', 'script_delete', 'promote_rule'].includes(p.kind)
 		try {
 			if (p.kind === 'automation_upsert' || p.kind === 'promote_rule') {
 				await this.#withConfigWrite(() => this.ha.saveConfigRest('automation', p.payload.config_id, p.payload.config))
