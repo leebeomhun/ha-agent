@@ -7,8 +7,8 @@ export const CHANNELS = {
 	quiet: { channel: '집 비서 요약', importance: 'low', push: { 'interruption-level': 'passive' } },
 }
 // 버튼 action 이름은 기존 자동화(HOME_*, LATE_* 등)와 겹치지 않게 HAAGENT_ 로 시작한다.
-// UP·MUTE는 알림 피드백, LESS는 정각 요약의 [줄여 줘], DO·NO는 행동 승인, UNDO는 행동 되돌리기.
-export const ACTION_RE = /^HAAGENT_(UP|MUTE|LESS|DO|NO|UNDO)_([a-z0-9]+)$/
+// UP·MUTE는 알림 피드백, LESS는 정각 요약의 [줄여 줘], DO·NO는 행동 승인, UNDO는 행동 되돌리기, APPR·REJ·ROLL은 관리 제안 승인·거절·롤백.
+export const ACTION_RE = /^HAAGENT_(UP|MUTE|LESS|DO|NO|UNDO|APPR|REJ|ROLL)_([a-z0-9]+)$/
 // 안드로이드 앱의 답장 입력 버튼은 action 이름이 반드시 REPLY여야 한다. 우리 알림인지는 tag로 가린다.
 export const REPLY_ACTION = 'REPLY'
 export const TAG_PREFIX = 'haagent-'
@@ -73,14 +73,41 @@ export function recoveredPayload(from, to, fmt) {
 	}
 }
 
-// ── 행동(기기 켜기/끄기) 알림 ──
+// ── 행동(기기 제어) 알림 ──
 export const actionTag = aid => `${TAG_PREFIX}act-${aid}`
-const VERB = { turn_on: ['켤까요', '켰어요', '켜기'], turn_off: ['끌까요', '껐어요', '끄기'] }
+const VERB = {
+	turn_on: ['켤까요', '켰어요', '켜기'],
+	turn_off: ['끌까요', '껐어요', '끄기'],
+	set_percentage: ['세기를 바꿀까요', '세기를 바꿨어요', '세기 조절'],
+	set_preset_mode: ['모드를 바꿀까요', '모드를 바꿨어요', '모드 변경'],
+	set_humidity: ['습도를 바꿀까요', '습도를 바꿨어요', '습도 설정'],
+	set_mode: ['모드를 바꿀까요', '모드를 바꿨어요', '모드 설정'],
+	set_temperature: ['온도를 바꿀까요', '온도를 바꿨어요', '온도 설정'],
+	set_hvac_mode: ['운전 모드를 바꿀까요', '운전 모드를 바꿨어요', '운전 모드 설정'],
+	open_cover: ['열까요', '열었어요', '열기'],
+	close_cover: ['닫을까요', '닫았어요', '닫기'],
+	stop_cover: ['멈출까요', '멈췄어요', '정지'],
+	set_cover_position: ['위치를 바꿀까요', '위치를 바꿨어요', '위치 조절'],
+	media_pause: ['일시정지할까요', '일시정지했어요', '일시정지'],
+	media_play: ['재생할까요', '재생했어요', '재생'],
+	media_stop: ['정지할까요', '정지했어요', '정지'],
+	volume_set: ['음량을 바꿀까요', '음량을 바꿨어요', '음량 조절'],
+	volume_mute: ['음소거할까요', '음소거를 바꿨어요', '음소거'],
+	select_source: ['입력을 바꿀까요', '입력을 바꿨어요', '입력 선택'],
+	select_option: ['옵션을 바꿀까요', '옵션을 바꿨어요', '옵션 변경'],
+	set_value: ['값을 바꿀까요', '값을 바꿨어요', '값 설정'],
+	set_datetime: ['시각을 바꿀까요', '시각을 바꿨어요', '시각 설정'],
+	start: ['시작할까요', '시작했어요', '시작'],
+	pause: ['일시정지할까요', '일시정지했어요', '일시정지'],
+	return_to_base: ['복귀시킬까요', '복귀시켰어요', '복귀'],
+}
+const verbFor = a => VERB[a] ?? ['실행할까요', '실행했어요', '실행']
 
 // 승인이 필요한 행동: [실행] [아니요]
 export function approvalPayload(a, minutes) {
+	const v = verbFor(a.action)
 	return {
-		title: `🤖 ${a.name} ${VERB[a.action][0]}?`.slice(0, 60),
+		title: `🤖 ${a.name} ${v[0]}?`.slice(0, 60),
 		message: `${a.reason} (${minutes}분 안에 눌러 주세요)`,
 		data: {
 			tag: actionTag(a.aid), group: 'ha-agent', notification_icon: ICON, ...CHANNELS.normal,
@@ -91,10 +118,11 @@ export function approvalPayload(a, minutes) {
 
 // 행동 결과. 스스로 한 행동에는 [되돌리기]가 붙고, 승인 알림은 같은 tag라 결과 문구로 바뀐다.
 export function actionResultPayload(a, { undo = false } = {}) {
+	const v = verbFor(a.action)
 	const text = {
-		done: [`🤖 ${a.name} ${VERB[a.action][1]}`, a.reason],
-		unverified: [`🤖 ${a.name} ${VERB[a.action][2]} 확인 안 됨`, `${a.reason} 명령은 보냈지만 상태가 바뀐 것을 확인하지 못했어요.`],
-		error: [`🤖 ${a.name} ${VERB[a.action][2]} 실패`, `${a.reason} (오류: ${a.error ?? '알 수 없음'})`],
+		done: [`🤖 ${a.name} ${v[1]}`, a.reason],
+		unverified: [`🤖 ${a.name} ${v[2]} 확인 안 됨`, `${a.reason} 명령은 보냈지만 상태가 바뀐 것을 확인하지 못했어요.`],
+		error: [`🤖 ${a.name} ${v[2]} 실패`, `${a.reason} (오류: ${a.error ?? '알 수 없음'})`],
 		declined: [`🤖 ${a.name}: 하지 않을게요`, '알겠어요. 이런 제안은 줄일게요.'],
 		expired: [`🤖 ${a.name}: 시간이 지나 취소했어요`, a.reason],
 		undone: [`🤖 ${a.name}: 되돌렸어요`, '알겠어요. 이런 행동은 줄일게요.'],
@@ -105,6 +133,43 @@ export function actionResultPayload(a, { undo = false } = {}) {
 		data: {
 			tag: actionTag(a.undo_of ?? a.aid), group: 'ha-agent', notification_icon: ICON, ...CHANNELS.quiet, alert_once: true,
 			...(undo ? { actions: [{ action: `HAAGENT_UNDO_${a.aid}`, title: '되돌리기' }] } : {}),
+		},
+	}
+}
+
+// ── HA 관리 제안(Tier 2) 승인/결과 알림 ──
+export const proposalTag = pid => `${TAG_PREFIX}prop-${pid}`
+
+export function proposalApprovalPayload(p) {
+	const diffPreview = p.diff_text ? `\n${String(p.diff_text).split('\n').slice(0, 4).join(' | ').slice(0, 140)}` : ''
+	return {
+		title: `🛠️ 승인 요청: ${p.title}`.slice(0, 60),
+		message: `${p.summary}${diffPreview}`.slice(0, 450),
+		data: {
+			tag: proposalTag(p.pid), group: 'ha-agent', notification_icon: ICON, ...CHANNELS.normal,
+			actions: [
+				{ action: `HAAGENT_APPR_${p.pid}`, title: '승인' },
+				{ action: `HAAGENT_REJ_${p.pid}`, title: '거절' },
+				replyButton,
+			],
+		},
+	}
+}
+
+export function proposalResultPayload(p, { rollback = false } = {}) {
+	const text = {
+		applied: [`✅ 적용 완료: ${p.title}`, p.summary],
+		rejected: [`🙅 거절됨: ${p.title}`, '알겠어요. 이 변경은 적용하지 않고 기억해 둘게요.'],
+		expired: [`⌛ 기한 만료: ${p.title}`, '승인 기한이 지나 제안이 자동으로 만료되었어요.'],
+		rolled_back: [`↩️ 롤백됨: ${p.title}`, p.error || '이전 설정으로 되돌렸어요.'],
+		error: [`❌ 적용 실패: ${p.title}`, p.error || '알 수 없는 오류'],
+	}[p.status] ?? [`🛠️ ${p.title}`, p.summary]
+	return {
+		title: text[0].slice(0, 60),
+		message: String(text[1]).slice(0, 450),
+		data: {
+			tag: proposalTag(p.pid), group: 'ha-agent', notification_icon: ICON, ...CHANNELS.quiet, alert_once: true,
+			...(rollback ? { actions: [{ action: `HAAGENT_ROLL_${p.pid}`, title: '롤백' }] } : {}),
 		},
 	}
 }

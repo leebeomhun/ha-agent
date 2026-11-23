@@ -1,12 +1,26 @@
 // API 실행: Codex 없이 OpenAI Responses API를 직접 불러 판단을 받는다.
-// 모델은 HA에도 셸에도 닿지 않는다. brain/ 폴더의 파일을 읽는 도구 네 개만 받고, 답(JSON)만 돌려준다.
+// 모델은 HA에도 셸에도 닿지 않는다. brain/ 폴더의 파일을 읽는 도구(또는 정책 검증된 ToolBroker)만 받고 답을 돌려준다.
 import { execFile } from 'node:child_process'
 import { readFileSync, readdirSync, realpathSync, rmSync, statSync } from 'node:fs'
 import { join, resolve, relative, sep } from 'node:path'
-import { P, ROOT, expandHome } from './util.mjs'
+import { P, ROOT, expandHome, readEnvFile } from './util.mjs'
+import { runToolRound } from './tools/registry.mjs'
 
 const OUT_MAX = 16000 // 도구 한 번이 돌려주는 글자 수
 const BUDGET = 200000 // 한 번의 판단에서 도구가 돌려주는 글자 수 합계
+
+// reasoning 파라미터를 받지 않는 옛 비추론 모델(gpt-4o, gpt-4.1 등). 여기에는 effort none이어도 reasoning을 보내지 않는다.
+const NON_REASONING = /^(gpt-4|gpt-3|chatgpt-4o)/i
+// GPT-6.2부터는 top-level instructions가 input 뒤에 붙어 프롬프트 캐시가 깨지므로 developer 메시지로 맨 앞에 넣는다.
+const DEV_FIRST = /^gpt-(6\.[2-9]|[7-9])/i
+
+// effort 해석: 'off'/'disabled'/빈 값 → reasoning 생략, 'none' → 추론 모델이면 { effort: 'none' }을 명시(생략하면 모델 기본값 medium으로 돈다).
+export function reasoningFor(model, effort) {
+	const e = effort == null ? '' : String(effort).trim().toLowerCase()
+	if (!e || e === 'off' || e === 'disabled') return null
+	if (e === 'none' && NON_REASONING.test(String(model ?? ''))) return null
+	return e === 'none' ? { reasoning: { effort: 'none' } } : { reasoning: { effort: e }, include: ['reasoning.encrypted_content'] }
+}
 const LINE_MAX = 2000
 
 // 키는 파일(api.key_file) → 환경 변수 → 프로젝트 .env 순서로 찾는다.
@@ -19,12 +33,8 @@ export function apiKey(cfg, { env = process.env, envFile = join(ROOT, '.env') } 
 		return k
 	}
 	if (env[a.key_env]?.trim()) return env[a.key_env].trim()
-	let text = ''
-	try { text = readFileSync(envFile, 'utf8') } catch {}
-	for (const line of text.split('\n')) {
-		const m = /^\s*(?:export\s+)?([A-Za-z_]\w*)\s*=\s*(.*?)\s*$/.exec(line)
-		if (m && m[1] === a.key_env && m[2]) return m[2].replace(/^(['"])(.*)\1$/, '$2')
-	}
+	const fileEnv = readEnvFile(envFile)
+	if (fileEnv[a.key_env]) return fileEnv[a.key_env]
 	throw new Error(`API 키를 찾지 못함: 환경 변수 ${a.key_env}, 프로젝트의 .env, config.json의 api.key_file 가운데 하나에 넣어야 함`)
 }
 
@@ -121,6 +131,7 @@ export const TOOLS = [
 		max_lines: { type: ['integer', 'null'], description: '읽을 줄 수(1~2000). null이면 200' },
 	}),
 ]
+export const FILE_TOOL_NAMES = new Set(TOOLS.map(t => t.name))
 
 // 도구 오류는 던지지 않고 글로 돌려준다(모델이 고쳐서 다시 부를 수 있게).
 export async function runTool(name, argsJson, ctx) {
@@ -177,22 +188,24 @@ async function post({ url, key, body, signal, fetchFn }) {
 	}
 }
 
-function finalAnswer(res) {
+function finalAnswer(res, parseJson = true) {
 	if (res.status === 'incomplete') throw new Error(`API 답이 중간에 끊김: ${res.incomplete_details?.reason ?? '이유 모름'}`)
 	const parts = (res.output ?? []).filter(o => o.type === 'message').flatMap(o => o.content ?? [])
 	const refusal = parts.find(c => c.type === 'refusal')
 	if (refusal) throw new Error(`모델이 답을 거절함: ${String(refusal.refusal).slice(0, 200)}`)
 	const text = parts.filter(c => c.type === 'output_text').map(c => c.text).join('')
 	if (!text) throw new Error('API 답에 내용이 없음')
+	if (!parseJson) return text
 	try { return JSON.parse(text) } catch (e) { throw new Error(`API 답을 읽지 못함: ${e.message}; ${text.slice(-200)}`) }
 }
 
 // runCodex와 같은 모양으로 받고 돌려준다. 대화는 OpenAI에 저장하지 않고(store: false) 매번 전체를 다시 보낸다.
-export async function runApi({ cfg, prompt, effort, timeoutSec, model, brainDir = P.brain, runDir = P.run, schema = P.schema, fetchFn = fetch, signal }) {
+export async function runApi({ cfg, prompt, effort, timeoutSec, model, brainDir = P.brain, runDir = P.run, schema = P.schema, fetchFn = fetch, signal, toolBroker = null, toolContext = null, instructions = null, customSchema = null, includeFileTools = true }) {
 	const key = apiKey(cfg)
-	const format = { type: 'json_schema', name: 'ha_agent_answer', strict: true, schema: JSON.parse(readFileSync(schema, 'utf8')) }
-	// Codex가 남긴 지난 답을 자료로 읽지 않게 지운다.
-	rmSync(join(runDir, 'answer.json'), { force: true })
+	const resolvedSchema = customSchema ?? (schema ? JSON.parse(readFileSync(schema, 'utf8')) : null)
+	const format = resolvedSchema ? { type: 'json_schema', name: 'ha_agent_answer', strict: true, schema: resolvedSchema } : { type: 'text' }
+	// Codex가 남긴 지난 답을 자료로 읽지 않게 지운다(파일 도구를 쓰지 않는 Assist 호출에서는 건드리지 않는다).
+	if (includeFileTools && runDir) rmSync(join(runDir, 'answer.json'), { force: true })
 	const url = `${cfg.api.base_url.replace(/\/+$/, '')}/responses`
 	const started = Date.now(), ctl = new AbortController()
 	const timer = setTimeout(() => ctl.abort(new Error(`API 응답 시간 초과 (${timeoutSec}초)`)), timeoutSec * 1000)
@@ -201,21 +214,36 @@ export async function runApi({ cfg, prompt, effort, timeoutSec, model, brainDir 
 		if (signal.aborted) onAbort()
 		else signal.addEventListener('abort', onAbort, { once: true })
 	}
-	const useReasoning = effort && !['none', 'off', 'disabled'].includes(String(effort).toLowerCase())
-	const input = [{ role: 'user', content: prompt }]
-	let tokens = 0, calls = 0, chars = 0
+	const modelName = model ?? cfg.api.model ?? cfg.codex.model
+	const reasoning = reasoningFor(modelName, effort)
+	const input = Array.isArray(prompt) ? [...prompt] : [{ role: 'user', content: prompt }]
+	const activeTools = [
+		...(includeFileTools ? TOOLS : []),
+		...(toolBroker ? toolBroker.tools(toolContext) : []),
+	]
+	const activeInstructions = instructions ?? (toolBroker
+		? `${INSTRUCTIONS}\n추가로 제공된 Home Assistant 조회·제어·제안 도구도 정책 범위 안에서 쓸 수 있다.`
+		: INSTRUCTIONS)
+	const devFirst = DEV_FIRST.test(String(modelName ?? ''))
+	if (devFirst) input.unshift({ role: 'developer', content: activeInstructions })
+	let tokens = 0, calls = 0, chars = 0, rounds = 0
 	const usage = { input: 0, cached: 0, output: 0, reasoning: 0 }
+	const summary = () => {
+		const hasUsage = usage.input || usage.cached || usage.output || usage.reasoning
+		return { ms: Date.now() - started, tokens: tokens || null, usage: hasUsage ? usage : null, tool_calls: calls, rounds }
+	}
 	try {
 		for (;;) {
 			// 도구 호출 한도에 닿으면 도구 없이 답만 받는다.
 			const last = calls >= cfg.api.max_tool_calls || chars >= BUDGET
+			rounds++
 			const res = await post({
 				url, key, signal: ctl.signal, fetchFn,
 				body: {
-					model: model ?? cfg.api.model ?? cfg.codex.model, instructions: INSTRUCTIONS, input,
-					tools: TOOLS, tool_choice: last ? 'none' : 'auto',
+					model: modelName, ...(devFirst ? {} : { instructions: activeInstructions }), input,
+					...(activeTools.length ? { tools: activeTools, tool_choice: last ? 'none' : 'auto' } : {}),
 					text: { format }, store: false,
-					...(useReasoning ? { reasoning: { effort }, include: ['reasoning.encrypted_content'] } : {}),
+					...(reasoning ?? {}),
 				},
 			})
 			const u = res.usage
@@ -228,18 +256,25 @@ export async function runApi({ cfg, prompt, effort, timeoutSec, model, brainDir 
 			}
 			const asked = (res.output ?? []).filter(o => o.type === 'function_call')
 			if (!asked.length || last) {
-				const hasUsage = usage.input || usage.cached || usage.output || usage.reasoning
-				return { result: finalAnswer(res), ms: Date.now() - started, tokens: tokens || null, usage: hasUsage ? usage : null, tool_calls: calls }
+				return { result: finalAnswer(res, Boolean(resolvedSchema)), ...summary() }
 			}
 			// 추론 항목(암호화된 것)과 도구 호출을 그대로 되돌려 보내야 다음 차례가 이어진다.
 			input.push(...res.output)
-			for (const c of asked) {
-				let out = chars >= BUDGET ? '오류: 이번 판단에서 읽을 수 있는 자료 양을 다 썼다. 지금까지 본 것으로 답한다.' : await runTool(c.name, c.arguments, { brainDir })
-				if (typeof out !== 'string') out = String(out)
-				chars += out.length
-				input.push({ type: 'function_call_output', call_id: c.call_id, output: out })
-			}
+			const outs = await runToolRound(asked, async c => {
+				let out
+				if (chars >= BUDGET) out = '오류: 이번 판단에서 읽을 수 있는 자료 양을 다 썼다. 지금까지 본 것으로 답한다.'
+				else if (toolBroker?.has(c.name)) out = await toolBroker.run(c.name, c.arguments, toolContext)
+				else out = await runTool(c.name, c.arguments, { brainDir })
+				return typeof out === 'string' ? out : String(out)
+			}, name => (includeFileTools && FILE_TOOL_NAMES.has(name)) || Boolean(toolBroker?.has(name) && toolBroker.isReadOnly?.(name)))
+			asked.forEach((c, i) => {
+				chars += outs[i].length
+				input.push({ type: 'function_call_output', call_id: c.call_id, output: outs[i] })
+			})
 			calls += asked.length
+			// 제어만 하고 성공했으면 마지막 답을 받으러 한 번 더 왕복하지 않는다.
+			const early = toolContext?.takeEarlyResult?.(asked.map(c => c.name))
+			if (early) return { result: early, ...summary(), early: true }
 		}
 	} catch (e) {
 		if (ctl.signal.aborted) throw ctl.signal.reason

@@ -10,6 +10,8 @@ export const DEFAULTS = {
 	away_override_entity: null,
 	active_hours: { start: 8, end: 24 },
 	hourly_checkin: true,
+	// 브리핑 시각 목록(예: [7, 18]). null이면 기존 hourly_checkin 동작을 유지한다.
+	briefing_hours: null,
 	// 직전 정각 점검 뒤로 집 상태·날씨·일정이 그대로면 Codex를 부르지 않는다(첫 점검과 24시는 항상 실행).
 	hourly_skip_unchanged: true,
 	// 하루 돌아보기 시각(KST 0~23). 활동 시간 밖이어도 돈다. 그때의 요약은 조용한 시간이어도 나간다. null이면 끔.
@@ -48,6 +50,7 @@ export const DEFAULTS = {
 		effort: 'low',
 		effort_hourly: null, // 정각 점검만 따로 낮출 때(null이면 effort 사용)
 		effort_deep: 'medium',
+		effort_weekly: null, // 주간 분석만 따로 둘 때(null이면 effort_deep 사용)
 		timeout_seconds: 240,
 		timeout_deep_seconds: 600,
 		vendor_dir: null,
@@ -63,39 +66,154 @@ export const DEFAULTS = {
 		effort: null,
 		effort_hourly: null,
 		effort_deep: null,
+		effort_weekly: null,
 		timeout_seconds: null,
 		timeout_deep_seconds: null,
 		max_tool_calls: 30, // 한 번의 판단에서 파일 읽기 도구를 부를 수 있는 횟수
 	},
+	// Google Antigravity CLI 설정 (agy --output-format json --disable-slash-commands --sandbox)
+	agy: {
+		bin: 'agy',
+		model: 'gemini-4-hydrogen-medium',
+		fallback_model: null,
+		effort: 'medium',
+		effort_hourly: 'low',
+		effort_deep: 'high',
+		effort_weekly: null,
+		timeout_seconds: 240,
+		timeout_deep_seconds: 600,
+	},
+	// Google Gemini API 직접 호출 설정
+	gemini: {
+		base_url: 'https://generativelanguage.googleapis.com/v1beta',
+		key_env: 'GEMINI_API_KEY',
+		key_file: null,
+		model: null, // null이면 llm.gemini.model('gemini-4-hydrogen') 사용
+		fallback_model: null,
+		effort: null, // null이면 agy 값 상속
+		effort_hourly: null,
+		effort_deep: null,
+		effort_weekly: null,
+		timeout_seconds: null,
+		timeout_deep_seconds: null,
+		max_tool_calls: 30,
+	},
+	// 다중 LLM 프로바이더 및 작업 유형별 라우팅 설정
+	llm: {
+		routes: {},
+		anthropic: { base_url: 'https://api.anthropic.com/v1', key_env: 'ANTHROPIC_API_KEY', key_file: null, model: 'claude-sonnet-4-5', timeout_seconds: 120 },
+		gemini: { base_url: 'https://generativelanguage.googleapis.com/v1beta', key_env: 'GEMINI_API_KEY', key_file: null, model: 'gemini-4-hydrogen', timeout_seconds: 120 },
+		ollama: { base_url: 'http://127.0.0.1:11434', model: 'qwen2.5:14b', timeout_seconds: 120 },
+	},
 	// 주간 분석: 정한 요일(일~토)·시각에 자동화 실행 기록과 기기 조작을 분석해 개선안 보고서를 state/weekly/에 남긴다.
 	// publish: 보고서 전문을 HA 알림 목록(🔔, persistent_notification)에도 올려 휴대폰에서 읽을 수 있게 한다.
 	weekly: { enabled: true, weekday: '일', hour: 21, timeout_seconds: 900, publish: true },
-	// 고른 판단 방식이 after_failures번 연속 실패하면 다른 방식(codex↔api)으로 넘어가 hold_minutes 동안 그쪽에 묻는다.
-	// 넘어갈 쪽을 쓸 수 있을 때만(Codex 실행 파일 또는 API 키) 동작한다.
-	failover: { enabled: true, after_failures: 2, hold_minutes: 120 },
+	// 고른 판단 방식이 after_failures번 연속 실패하면 짝 방식(codex↔api, agy↔gemini)으로 넘어가 hold_minutes 동안 그쪽에 묻는다.
+	// 넘어갈 쪽을 쓸 수 있을 때만 동작한다. target을 직접 정하면 그 방식으로 넘어간다.
+	failover: { enabled: true, after_failures: 2, hold_minutes: 120, target: null },
 	// urgent 규칙이 발동한 뒤 상황이 그대로이고 사용자의 반응도 없으면 다시 알린다. oob_from번째부터는 비상 알림 길로도 보낸다.
 	escalation: { enabled: true, remind_minutes: 15, max_reminders: 3, oob_from: 2 },
 	// HA로 살아 있다는 신호(haagent_heartbeat 이벤트)를 보낸다. HA 쪽 자동화가 끊김을 알린다.
 	// alert_minutes: HA 경고 자동화의 지연(ha/heartbeat-automation.yaml의 delay)과 맞춘다. 신호가 이보다 오래 끊겼다 돌아오면 그 경고를 '다시 연결됐어요'로 바꾼다.
 	heartbeat: { enabled: true, interval_seconds: 60, alert_minutes: 10 },
-	// HA를 거치지 않는 비상 알림 길. type: null(끔) | "ntfy" | "telegram" | "webhook"
-	oob: { type: null, url: null, topic: null, token_file: null, chat_id: null, ha_down_minutes: 15 },
+	// HA를 거치지 않는 비상 알림 길. type: null(끔) | "kakao" | "slack" | "ntfy" | "telegram" | "webhook"
+	oob: {
+		type: null, url: null, topic: null, token_file: null, chat_id: null, channel_id: null,
+		env_file: null, token_env: 'SLACK_BOT_TOKEN', channel_env: 'SLACK_CHANNEL_ID',
+		refresh_token_env: 'KAKAO_REFRESH_TOKEN', client_id_env: 'KAKAO_REST_API_KEY', client_secret_env: 'KAKAO_CLIENT_SECRET',
+		mode: 'friend', recipient_name: null, recipient_uuid: null, fallback_memo: true,
+		fallback: null, ha_down_minutes: 15,
+	},
 	// 기기 켜기/끄기. auto는 스스로 실행, confirm은 휴대폰에서 [실행]을 눌러야 실행. 적지 않은 엔티티는 움직이지 못한다.
 	// on_request: 사용자가 답장·say로 직접 시킨 행동은 confirm 엔티티여도 승인을 다시 묻지 않고 바로 실행한다.
 	actions: { enabled: false, auto: [], confirm: [], per_day: 20, per_cycle: 3, approval_minutes: 30, verify_seconds: 10, on_request: true },
+	// Risk Tier 0~3 정책 엔진 및 HA DevOps 관리 권한
+	policy: {
+		tier1_auto: [],
+		tier2_confirm: [],
+		tier3_blocked: [],
+		admin_enabled: false,
+		proposal_expire_hours: 24,
+		away_override_exempt: ['light.hwanpunggi', 'switch.geosil_gonggiceongjeonggi_power'],
+	},
+	// HA Assist 주력 대화 서버 및 Tailscale 관리 콘솔
+	assist: {
+		enabled: false,
+		host: '0.0.0.0',
+		port: 8787,
+		allowed_networks: null,
+		token_file: '~/.config/ha-agent/assist-token',
+		timeout_seconds: 90,
+		model: null,
+		effort: null,
+		voice: {
+			provider: 'gemini',
+			stt_model: 'gemini-3.5-transcribe',
+			stt_fallback_model: 'gemini-3.5-flash-lite',
+			// transcribe 모델 전사 방식: verbatim(말한 그대로, 기본) | smart(추임새·말 고침 정리)
+			stt_mode: 'verbatim',
+			// 빈 결과가 난 오디오를 state/stt-failures/에 남길 개수 (0이면 끔)
+			stt_debug_keep: 20,
+			tts_model: 'gemini-3.8-flash-lite-tts',
+			tts_voice: 'Kore',
+			tts_language: 'ko-KR',
+			tts_cache_max: 32,
+			stt_timeout_seconds: 25,
+			tts_timeout_seconds: 30,
+			stt_hints: [],
+			// HA STT 컴포넌트의 말 끝 감지(ha/custom_components/ha_agent_assist/endpoint.py). 여기 값이 5분 안에 HA로 전달된다.
+			// 그 밖의 세부 값(start_margin_db, bg_margin_db, near_field_db, end_drop_db, preroll_ms 등)도 같은 이름으로 넣을 수 있다.
+			endpoint: { enabled: true, silence_ms: 700, max_seconds: 10, no_speech_seconds: 6 },
+		},
+	},
 }
 
-const NESTED = ['active_hours', 'limits', 'codex', 'api', 'weekly', 'failover', 'escalation', 'heartbeat', 'oob', 'actions']
+const NESTED = ['active_hours', 'limits', 'codex', 'api', 'agy', 'gemini', 'llm', 'weekly', 'failover', 'escalation', 'heartbeat', 'oob', 'actions', 'policy', 'assist']
+const BRAIN_ALIAS = { openai: 'api', antigravity: 'agy', 'gemini-api': 'gemini' }
+const dropNull = obj => Object.fromEntries(Object.entries(obj ?? {}).filter(([, v]) => v !== undefined && v !== null))
 
 export function mergeConfig(c = {}) {
 	const out = { ...DEFAULTS, ...c }
+	if (typeof out.brain === 'string' && BRAIN_ALIAS[out.brain]) out.brain = BRAIN_ALIAS[out.brain]
 	for (const k of NESTED) out[k] = { ...DEFAULTS[k], ...c[k] }
+	out.assist.voice = { ...DEFAULTS.assist.voice, ...(c.assist?.voice ?? {}) }
+	out.assist.voice.endpoint = { ...DEFAULTS.assist.voice.endpoint, ...(c.assist?.voice?.endpoint ?? {}) }
+	if (c.llm) {
+		out.llm.routes = { ...DEFAULTS.llm.routes, ...c.llm.routes }
+		for (const p of ['anthropic', 'gemini', 'ollama']) out.llm[p] = { ...DEFAULTS.llm[p], ...c.llm[p] }
+	}
+	const gExplicit = { ...dropNull(c.llm?.gemini), ...dropNull(c.gemini) }
+	out.gemini = { ...DEFAULTS.gemini, ...gExplicit }
+	out.llm.gemini = { ...DEFAULTS.llm.gemini, ...gExplicit }
+	if (out.oob.fallback && typeof out.oob.fallback === 'object') {
+		out.oob.fallback = { ...out.oob.fallback }
+	}
 	// 요일은 '일'~'토'로 맞춘다. 숫자(0=일)와 '일요일'도 받는다. 알 수 없는 값이면 기본 요일.
 	const wd = out.weekly.weekday, days = '일월화수목금토'
 	out.weekly.weekday = Number.isInteger(wd) && days[wd] ? days[wd] : typeof wd === 'string' && wd && days.includes(wd[0]) ? wd[0] : DEFAULTS.weekly.weekday
 	return out
 }
 export const loadConfig = () => mergeConfig(readJson(P.config, {}))
+
+function validateOobEntry(o, prefix, errors) {
+	if (!o?.type) return
+	if (o.type === 'ntfy') {
+		if (!o.topic) errors.push(`${prefix}.type이 ntfy인데 ${prefix}.topic이 비어 있음`)
+	} else if (o.type === 'telegram') {
+		if (!o.token_file || !o.chat_id) errors.push(`${prefix}.type이 telegram인데 ${prefix}.token_file 또는 ${prefix}.chat_id가 비어 있음`)
+	} else if (o.type === 'slack') {
+		if (!o.env_file && (!o.token_file || !o.channel_id)) errors.push(`${prefix}.type이 slack인데 ${prefix}.env_file 또는 token_file+channel_id가 비어 있음`)
+	} else if (o.type === 'kakao') {
+		if (!o.env_file && !o.token_file) errors.push(`${prefix}.type이 kakao인데 ${prefix}.env_file 또는 token_file이 비어 있음`)
+		if ((o.mode ?? 'friend') === 'friend' && !o.recipient_name && !o.recipient_uuid) {
+			errors.push(`${prefix}.type이 kakao(friend)인데 recipient_name 또는 recipient_uuid가 비어 있음`)
+		}
+	} else if (o.type === 'webhook') {
+		if (!o.url) errors.push(`${prefix}.type이 webhook인데 ${prefix}.url이 비어 있음`)
+	} else {
+		errors.push(`알 수 없는 ${prefix}.type: ${o.type}`)
+	}
+}
 
 export function validateConfig(cfg) {
 	const errors = [], warnings = []
@@ -105,7 +223,12 @@ export function validateConfig(cfg) {
 	}
 	const rh = cfg?.reflection_hour
 	if (rh != null && (!Number.isInteger(rh) || rh < 0 || rh > 23)) errors.push(`reflection_hour 오류 (${rh}, null 또는 0~23 정수 필요)`)
-	if (!['codex', 'api'].includes(cfg?.brain)) errors.push(`brain 설정 오류 (${cfg?.brain}, codex 또는 api만 가능)`)
+	if (cfg?.briefing_hours != null) {
+		if (!Array.isArray(cfg.briefing_hours) || cfg.briefing_hours.some(h => !Number.isInteger(h) || h < 0 || h > 23)) {
+			errors.push(`briefing_hours 오류 (null 또는 0~23 정수 배열 필요)`)
+		}
+	}
+	if (!['codex', 'api', 'agy', 'gemini'].includes(cfg?.brain)) errors.push(`brain 설정 오류 (${cfg?.brain}, codex/api/agy/gemini만 가능)`)
 	if (!Array.isArray(cfg?.notify_targets) || !cfg.notify_targets.some(t => typeof t === 'string' && t.trim())) {
 		errors.push('notify_targets가 비어 있음')
 	}
@@ -118,21 +241,22 @@ export function validateConfig(cfg) {
 		errors.push(`limits.user_reserve_runs는 0 이상이어야 함 (${cfg?.limits?.user_reserve_runs})`)
 	}
 	const o = cfg?.oob ?? {}
-	if (o.type) {
-		if (o.type === 'ntfy') {
-			if (!o.topic) errors.push('oob.type이 ntfy인데 oob.topic이 비어 있음')
-		} else if (o.type === 'telegram') {
-			if (!o.token_file || !o.chat_id) errors.push('oob.type이 telegram인데 oob.token_file 또는 oob.chat_id가 비어 있음')
-		} else if (o.type === 'webhook') {
-			if (!o.url) errors.push('oob.type이 webhook인데 oob.url이 비어 있음')
-		} else {
-			errors.push(`알 수 없는 oob.type: ${o.type}`)
-		}
+	validateOobEntry(o, 'oob', errors)
+	if (o.fallback?.type) validateOobEntry(o.fallback, 'oob.fallback', errors)
+	if (cfg?.assist?.enabled) {
+		const port = cfg.assist.port
+		if (!Number.isInteger(port) || port < 1 || port > 65535) errors.push(`assist.port 범위 오류 (${port})`)
 	}
 	if ((cfg?.api?.effort == null && cfg?.codex?.effort === 'max')
 		|| (cfg?.api?.effort_deep == null && cfg?.codex?.effort_deep === 'max')
-		|| (cfg?.api?.effort_hourly == null && cfg?.api?.effort == null && cfg?.codex?.effort_hourly === 'max')) {
+		|| (cfg?.api?.effort_hourly == null && cfg?.api?.effort == null && cfg?.codex?.effort_hourly === 'max')
+		|| (cfg?.api?.effort_weekly == null && cfg?.api?.effort_deep == null && cfg?.codex?.effort_weekly === 'max')) {
 		warnings.push('api.effort/effort_deep이 비어 있어 codex의 "max"를 상속합니다 (API 비용 증가·호환성 주의)')
+	}
+	const hasActionsList = Boolean((cfg?.actions?.auto?.length ?? 0) || (cfg?.actions?.confirm?.length ?? 0))
+	const hasPolicyList = Boolean((cfg?.policy?.tier1_auto?.length ?? 0) || (cfg?.policy?.tier2_confirm?.length ?? 0))
+	if (hasActionsList && hasPolicyList) {
+		warnings.push('actions.auto/confirm과 policy.tier1_auto/tier2_confirm이 중복 설정됨 — policy로 단일화 권장')
 	}
 	return { errors, warnings }
 }

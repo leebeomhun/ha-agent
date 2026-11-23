@@ -9,7 +9,11 @@
   "start": 7,
   "end": 23
  },
- "hourly_checkin": true,
+ "hourly_checkin": false,
+ "briefing_hours": [
+  7,
+  18
+ ],
  "reflection_hour": 23,
  "noise_entities": [
   "binary_sensor.*_kiosk_screensaver",
@@ -29,12 +33,14 @@
   "min_gap_minutes": 3,
   "max_rules": 60
  },
+ "brain": "agy",
  "codex": {
   "model": "gpt-6.1-terra",
   "fallback_model": "gpt-6.1-sol",
   "effort": "high",
   "effort_hourly": "low",
-  "effort_deep": "max"
+  "effort_deep": "high",
+  "effort_weekly": "max"
  },
  "api": {
   "model": "gpt-6.1-sol",
@@ -42,19 +48,190 @@
   "effort_hourly": "low",
   "effort_deep": "medium"
  },
+ "agy": {
+  "bin": "agy",
+  "model": "gemini-4-hydrogen",
+  "fallback_model": "gemini-3.8-flash",
+  "effort": "medium",
+  "effort_hourly": "low",
+  "effort_deep": "high"
+ },
+ "gemini": {
+  "model": "gemini-4-hydrogen",
+  "effort": "medium",
+  "effort_hourly": "low",
+  "effort_deep": "high"
+ },
+ "llm": {
+  "routes": {
+   "assist": "api",
+   "default": "agy"
+  }
+ },
+ "oob": {
+  "type": "kakao",
+  "mode": "friend",
+  "recipient_name": "이범훈(알림)",
+  "fallback_memo": true,
+  "env_file": "/home/ubuntu/reserve/.env",
+  "token_env": "KAKAO_ACCESS_TOKEN",
+  "refresh_token_env": "KAKAO_REFRESH_TOKEN",
+  "client_id_env": "KAKAO_REST_API_KEY",
+  "ha_down_minutes": 15,
+  "fallback": {
+   "type": "slack",
+   "env_file": "/home/ubuntu/reserve/.env",
+   "token_env": "SLACK_BOT_TOKEN",
+   "channel_env": "SLACK_CHANNEL_ID"
+  }
+ },
+ "assist": {
+  "enabled": true,
+  "host": "0.0.0.0",
+  "port": 8787,
+  "allowed_networks": [
+   "127.0.0.0/8",
+   "::1",
+   "100.64.0.0/10",
+   "10.0.0.0/8",
+   "172.16.0.0/12",
+   "192.168.0.0/16"
+  ],
+  "token_file": "~/.config/ha-agent/assist-token",
+  "timeout_seconds": 90,
+  "model": "gpt-6-luna",
+  "effort": "low",
+  "fast_path": true,
+  "early_finish": true,
+  "fast_timeout_seconds": 30,
+  "deep": {
+   "route": "gemini",
+   "model": "gemini-4-hydrogen",
+   "effort": "low"
+  },
+  "aliases": {
+   "switch.setagsil_seuwici_seuwici_2": [
+    "주방 불",
+    "주방 조명"
+   ],
+   "switch.setagsil_seuwici_seuwici": [
+    "세탁실 불",
+    "세탁실 조명"
+   ],
+   "switch.geosil_seuwici": [
+    "거실 불",
+    "거실 조명"
+   ],
+   "switch.anbang_seuwici": [
+    "안방 불",
+    "안방 조명"
+   ],
+   "switch.jageunbang_seuwici": [
+    "작은방 불",
+    "작은방 조명"
+   ],
+   "light.bul": [
+    "화장실 불",
+    "화장실 조명"
+   ],
+   "light.hwanpunggi": [
+    "화장실 환풍기",
+    "환풍기"
+   ],
+   "switch.geosil_gonggiceongjeonggi_power": [
+    "공기청정기",
+    "거실 공기청정기"
+   ],
+   "input_boolean.hwanpunggi_auto": [
+    "환풍기 자동 제어",
+    "환풍기 자동"
+   ]
+  },
+  "voice": {
+   "provider": "gemini",
+   "stt_model": "gemini-3.5-transcribe",
+   "stt_fallback_model": "gemini-3.5-flash-lite",
+   "tts_model": "gemini-3.8-flash-lite-tts",
+   "tts_voice": "Kore",
+   "tts_language": "ko-KR",
+   "tts_cache_max": 32,
+   "stt_timeout_seconds": 25,
+   "tts_timeout_seconds": 30,
+   "stt_hints": [
+    "거실",
+    "안방",
+    "작은방",
+    "화장실",
+    "세탁실",
+    "주방",
+    "현관",
+    "공기청정기",
+    "환풍기",
+    "거실 스위치",
+    "안방 스위치",
+    "작은방 스위치",
+    "거실 TV",
+    "애플TV",
+    "지니TV",
+    "세탁기",
+    "건조기",
+    "일괄소등",
+    "하이라이트",
+    "도어락",
+    "재실 도우미",
+    "집 비서"
+   ]
+  }
+ },
  "actions": {
   "enabled": true,
   "auto": [],
-  "confirm": [
+  "confirm": []
+ },
+ "policy": {
+  "admin_enabled": true,
+  "proposal_expire_hours": 24,
+  "away_override_exempt": [
+   "light.hwanpunggi",
+   "switch.geosil_gonggiceongjeonggi_power"
+  ],
+  "tier1_auto": [
+   "light.hwanpunggi",
+   "switch.geosil_gonggiceongjeonggi_power",
+   "select.geosil_gonggiceongjeonggi_operating_mode",
+   "select.geosil_gonggiceongjeonggi_speed",
+   "input_boolean.hwanpunggi_auto",
+   "input_boolean.yeoncha_next_workday",
+   "input_boolean.household_occupied_override",
+   "script.gonggi_power"
+  ],
+  "tier2_confirm": [
    "switch.geosil_seuwici",
    "switch.anbang_seuwici",
    "switch.jageunbang_seuwici",
-   "switch.setagsil_seuwici_seuwici_2",
    "switch.setagsil_seuwici_seuwici",
+   "switch.setagsil_seuwici_seuwici_2",
    "light.bul",
-   "light.hwanpunggi",
-   "switch.geosil_gonggiceongjeonggi_power",
-   "media_player.geosil_geosil_tv_un43ru7150fxkr"
+   "media_player.geosil_geosil_tv_un43ru7150fxkr",
+   "media_player.geosil_appletv",
+   "media_player.geosil_jinitv",
+   "media_player.genietv_stb_a2",
+   "script.dashboard_lights_tv_off",
+   "script.ha_turn_off_and_check",
+   "input_number.household_monthly_kwh"
+  ],
+  "tier3_blocked": [
+   "lock.*",
+   "alarm_control_panel.*",
+   "update.*",
+   "switch.jubang_jubang_hairaiteu*",
+   "switch.geosil_geosil_seumateu_peulreogeu*",
+   "switch.setagsil_setagsil_setaggi_power",
+   "switch.setagsil_setagsil_geonjogi_power",
+   "script.unknown",
+   "input_boolean.kona_*",
+   "select.*_jeongjeon_bosang_*",
+   "select.hwajangsil_seuwici_*"
   ]
  }
 }

@@ -1,0 +1,15 @@
+# 커스텀 컴포넌트(ha/custom_components/ha_agent_assist) 설치 전이나
+# 스크립트·대시보드 버튼에서 ha-agent Assist 서버를 바로 호출할 때 쓰는 예시입니다.
+# secrets.yaml에 다음을 추가하세요:
+#   ha_agent_token: "Bearer <~/.config/ha-agent/assist-token 내용>"
+
+rest_command:
+  ha_agent_assist:
+    url: "http://100.121.130.25:8787/api/assist/converse"
+    method: POST
+    headers:
+      Authorization: !secret ha_agent_token
+      Content-Type: "application/json"
+    payload: >-
+      {{ {"text": text, "conversation_id": conversation_id | default("ha-rest"), "language": "ko"} | to_json }}
+    timeout: 90

@@ -7,8 +7,10 @@
     "rule_changes",
     "next_wakes",
     "memory",
+    "memory_ops",
     "info_requests",
     "actions",
+    "proposals",
     "report"
   ],
   "properties": {
@@ -250,6 +252,45 @@
         }
       }
     },
+    "memory_ops": {
+      "type": "array",
+      "description": "구조화 장기 기억 추가·수정·삭제. 없으면 빈 배열",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "op",
+          "category",
+          "key",
+          "content"
+        ],
+        "properties": {
+          "op": {
+            "type": "string",
+            "enum": [
+              "upsert",
+              "delete"
+            ]
+          },
+          "category": {
+            "type": "string",
+            "enum": [
+              "preference",
+              "standing_order",
+              "incident",
+              "pattern",
+              "rejection"
+            ]
+          },
+          "key": {
+            "type": "string"
+          },
+          "content": {
+            "type": "string"
+          }
+        }
+      }
+    },
     "info_requests": {
       "type": "array",
       "items": {
@@ -266,7 +307,9 @@
             "enum": [
               "history",
               "statistics",
-              "logbook"
+              "logbook",
+              "traces",
+              "config_entries"
             ]
           },
           "entity_ids": {
@@ -283,13 +326,14 @@
     },
     "actions": {
       "type": "array",
-      "description": "기기 켜기/끄기. 행동 권한에 적힌 엔티티만. 없으면 빈 배열",
+      "description": "기기 제어. 행동 권한에 적힌 엔티티만. 없으면 빈 배열",
       "items": {
         "type": "object",
         "additionalProperties": false,
         "required": [
           "entity_id",
           "action",
+          "service_data_json",
           "reason",
           "requested"
         ],
@@ -301,8 +345,37 @@
             "type": "string",
             "enum": [
               "turn_on",
-              "turn_off"
+              "turn_off",
+              "set_percentage",
+              "set_preset_mode",
+              "set_humidity",
+              "set_mode",
+              "set_temperature",
+              "set_hvac_mode",
+              "open_cover",
+              "close_cover",
+              "stop_cover",
+              "set_cover_position",
+              "media_pause",
+              "media_play",
+              "media_stop",
+              "volume_set",
+              "volume_mute",
+              "select_source",
+              "select_option",
+              "set_value",
+              "set_datetime",
+              "start",
+              "pause",
+              "return_to_base"
             ]
+          },
+          "service_data_json": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "추가 파라미터 JSON 문자열(예: {\"option\":\"turbo\"} 또는 {\"brightness_pct\":50}). 필요 없으면 null"
           },
           "reason": {
             "type": "string",
@@ -311,6 +384,54 @@
           "requested": {
             "type": "boolean",
             "description": "깨운 이유가 [사용자 말]이고 사용자가 그 말에서 직접 시킨 행동이면 true(승인을 다시 묻지 않고 바로 실행). 스스로 판단한 행동은 false"
+          }
+        }
+      }
+    },
+    "proposals": {
+      "type": "array",
+      "description": "HA 관리 변경 제안(Tier 2 사용자 승인 필요). 없으면 빈 배열",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "kind",
+          "target_id",
+          "title",
+          "summary",
+          "payload_json"
+        ],
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": [
+              "automation_upsert",
+              "automation_delete",
+              "automation_toggle",
+              "script_upsert",
+              "script_delete",
+              "reload_config_entry",
+              "backup_create",
+              "entity_admin",
+              "promote_rule"
+            ]
+          },
+          "target_id": {
+            "type": "string",
+            "description": "대상 entity_id 또는 config_entry_id 또는 rule_id"
+          },
+          "title": {
+            "type": "string"
+          },
+          "summary": {
+            "type": "string"
+          },
+          "payload_json": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "설정·파라미터 JSON 문자열. 필요 없으면 null"
           }
         }
       }

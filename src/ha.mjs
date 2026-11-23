@@ -1,17 +1,42 @@
-// HA WebSocket 연결: 상태 변화와 알림 버튼 이벤트를 받고, 허용된 읽기·알림 서비스만 호출한다.
-// 기기를 움직이는 서비스는 코드에서 막는다. 예외는 사용자가 config.json의 actions에 직접 적은 엔티티의 켜기/끄기뿐이다.
+// HA WebSocket + REST 연결: 상태 변화와 알림 버튼 이벤트를 받고, 정책 게이트를 통과한 읽기·알림·제어·관리 요청만 호출한다.
+// 기기를 움직이는 서비스와 설정 수정은 checkMessage/checkRest에서 화이트리스트·PolicyEngine으로 검증한다.
 import { readFileSync } from 'node:fs'
 import { EventEmitter } from 'node:events'
 import { log } from './util.mjs'
 
 export const HEARTBEAT_EVENT = 'haagent_heartbeat'
-const READ_TYPES = ['get_states', 'subscribe_events', 'ping', 'history/history_during_period',
+const READ_TYPES = [
+	'get_states', 'subscribe_events', 'ping', 'history/history_during_period',
 	'config/area_registry/list', 'config/device_registry/list', 'config/entity_registry/list',
-	'automation/config', 'repairs/list_issues', 'system_log/list', 'logbook/get_events', 'recorder/statistics_during_period']
+	'config/label_registry/list', 'config/floor_registry/list',
+	'automation/config', 'script/config', 'scene/config',
+	'repairs/list_issues', 'system_log/list', 'logbook/get_events', 'recorder/statistics_during_period',
+	'trace/list', 'trace/get', 'config_entries/get', 'backup/info',
+	'lovelace/dashboards/list', 'lovelace/config',
+	'assist_pipeline/pipeline/list', 'conversation/agent/list',
+]
 const ALLOWED_TYPES = new Set([...READ_TYPES, 'call_service', 'fire_event'])
 const READ_SERVICES = ['weather.get_forecasts', 'calendar.get_events']
-// 행동으로 쓸 수 있는 서비스. 도어락·경보·차고문 같은 도메인은 여기에 없으므로 설정에 적어도 움직이지 못한다.
+// 행동으로 쓸 수 있는 기본 서비스. 도어락·경보·차고문 같은 도메인은 여기에 없다.
 export const ACTION_SERVICES = {
+	light: ['turn_on', 'turn_off'],
+	switch: ['turn_on', 'turn_off'],
+	fan: ['turn_on', 'turn_off', 'set_percentage', 'set_preset_mode'],
+	humidifier: ['turn_on', 'turn_off', 'set_humidity', 'set_mode'],
+	climate: ['turn_on', 'turn_off', 'set_temperature', 'set_hvac_mode'],
+	cover: ['open_cover', 'close_cover', 'stop_cover', 'set_cover_position'],
+	input_boolean: ['turn_on', 'turn_off'],
+	media_player: ['turn_off', 'media_pause', 'media_play', 'media_stop', 'volume_set', 'volume_mute', 'select_source'],
+	select: ['select_option'],
+	input_select: ['select_option'],
+	input_number: ['set_value'],
+	number: ['set_value'],
+	input_datetime: ['set_datetime'],
+	scene: ['turn_on'],
+	script: ['turn_on'],
+	vacuum: ['start', 'pause', 'return_to_base'],
+}
+const LEGACY_ACTION_SERVICES = {
 	light: ['turn_on', 'turn_off'],
 	switch: ['turn_on', 'turn_off'],
 	fan: ['turn_on', 'turn_off'],
@@ -21,29 +46,46 @@ export const ACTION_SERVICES = {
 }
 
 // 보내기 전 검사. 통과하지 못하면 이유를 돌려준다.
-export function checkMessage(msg, { services, actionEntities }) {
+export function checkMessage(msg, { services, actionEntities = new Set(), policy = null }) {
 	if (!ALLOWED_TYPES.has(msg.type)) return `허용되지 않은 명령: ${msg.type}`
 	if (msg.type === 'fire_event' && msg.event_type !== HEARTBEAT_EVENT) return `허용되지 않은 이벤트: ${msg.event_type}`
 	if (msg.type !== 'call_service') return null
 	const key = `${msg.domain}.${msg.service}`
 	if (services.has(key)) return null
+	if (policy) return policy.checkHaServiceCall(msg)
 	const t = msg.target ?? {}
 	const id = t.entity_id
 	const isAction = typeof id === 'string' && Object.keys(t).length === 1 && actionEntities.has(id)
-		&& id.split('.')[0] === msg.domain && (ACTION_SERVICES[msg.domain] ?? []).includes(msg.service)
+		&& id.split('.')[0] === msg.domain && (LEGACY_ACTION_SERVICES[msg.domain] ?? []).includes(msg.service)
 		&& !Object.keys(msg.service_data ?? {}).length
 	return isAction ? null : `허용되지 않은 서비스: ${key}${id ? ` (${id})` : ''}`
+}
+
+const CFG_PATH_RE = /^\/api\/config\/(?:automation|script|scene)\/config\/[^/?#]+$/
+// REST API 호출 검사. 읽기/검증은 기본 허용, 설정 쓰기/삭제는 guard.allowConfigWrite가 참일 때만 통과한다.
+export function checkRest(method, path, { allowConfigWrite = false } = {}) {
+	const m = String(method || '').toUpperCase()
+	const p = String(path || '')
+	if (m === 'GET' && (p === '/api/config' || CFG_PATH_RE.test(p))) return null
+	if (m === 'POST' && (p === '/api/template' || p === '/api/config/core/check_config')) return null
+	if (allowConfigWrite && (m === 'POST' || m === 'DELETE') && CFG_PATH_RE.test(p)) return null
+	return `허용되지 않은 REST 호출: ${m} ${p}`
 }
 
 export class HA extends EventEmitter {
 	// services: 추가로 허용할 서비스(예: 주간 보고서를 올리는 persistent_notification.create)
 	// openTimeoutMs: 접속부터 준비 완료(구독·상태 받기)까지 이 시간 안에 못 끝내면 끊고 다시 연결한다.
-	constructor({ url, tokenFile, notifyTargets, actionEntities = [], services = [], openTimeoutMs = 60000 }) {
+	constructor({ url, tokenFile, notifyTargets, actionEntities = [], services = [], policy = null, allowConfigWrite = false, openTimeoutMs = 60000 }) {
 		super()
 		this.url = url
 		this.tokenFile = tokenFile
 		this.openTimeoutMs = openTimeoutMs
-		this.guard = { services: new Set([...READ_SERVICES, ...notifyTargets.map(t => `notify.${t}`), ...services]), actionEntities: new Set(actionEntities) }
+		this.guard = {
+			services: new Set([...READ_SERVICES, ...notifyTargets.map(t => `notify.${t}`), ...services]),
+			actionEntities: new Set(actionEntities),
+			policy,
+			allowConfigWrite,
+		}
 		this.connected = false
 		this.backoff = 5000
 		this.ws = null
@@ -58,6 +100,19 @@ export class HA extends EventEmitter {
 		clearTimeout(this.reconnect)
 		clearTimeout(this.openTimer)
 		try { this.ws?.close() } catch {}
+	}
+
+	httpBaseUrl() {
+		return String(this.url)
+			.replace(/^ws:\/\//, 'http://')
+			.replace(/^wss:\/\//, 'https://')
+			.replace(/\/api\/websocket\/?$/, '')
+	}
+
+	#readToken() {
+		const token = readFileSync(this.tokenFile, 'utf8').trim()
+		if (!token) throw new Error('토큰 파일이 비어 있음')
+		return token
 	}
 
 	#open() {
@@ -102,9 +157,7 @@ export class HA extends EventEmitter {
 	#onMessage(m) {
 		if (m.type === 'auth_required') {
 			try {
-				const token = readFileSync(this.tokenFile, 'utf8').trim()
-				if (!token) throw new Error('토큰 파일이 비어 있음')
-				this.ws.send(JSON.stringify({ type: 'auth', access_token: token }))
+				this.ws.send(JSON.stringify({ type: 'auth', access_token: this.#readToken() }))
 			} catch (err) {
 				log('HA 인증 준비 실패:', err.message)
 				this.#lost(`인증 준비 실패: ${err.message}`)
@@ -171,6 +224,22 @@ export class HA extends EventEmitter {
 		})
 	}
 
+	async rest(method, path, body = null, { timeoutMs = 15000, fetchFn = fetch } = {}) {
+		const bad = checkRest(method, path, this.guard)
+		if (bad) throw new Error(bad)
+		const token = this.#readToken()
+		const url = `${this.httpBaseUrl()}${path}`
+		const res = await fetchFn(url, {
+			method: method.toUpperCase(),
+			headers: { authorization: `Bearer ${token}`, ...(body != null ? { 'content-type': 'application/json' } : {}) },
+			...(body != null ? { body: JSON.stringify(body) } : {}),
+			signal: AbortSignal.timeout(timeoutMs),
+		})
+		const text = await res.text()
+		if (!res.ok) throw new Error(`HA REST ${res.status}: ${text.slice(0, 200)}`)
+		try { return JSON.parse(text) } catch { return text }
+	}
+
 	// HA 쪽 자동화가 이 신호가 끊기는지 지켜본다(ha/heartbeat-automation.yaml).
 	heartbeat(data) { return this.call({ type: 'fire_event', event_type: HEARTBEAT_EVENT, event_data: data }, 10000) }
 
@@ -197,5 +266,41 @@ export class HA extends EventEmitter {
 	// 무엇이(자동화·사람) 바꿨는지까지 나오는 활동 기록
 	logbook(entityIds, hours) {
 		return this.call({ type: 'logbook/get_events', ...this.#period(hours), entity_ids: entityIds }, 60000)
+	}
+
+	traces(domain = 'automation', itemId = null) {
+		return this.call({ type: 'trace/list', domain, ...(itemId ? { item_id: itemId } : {}) }, 30000)
+	}
+
+	traceDetail(domain, itemId, runId) {
+		return this.call({ type: 'trace/get', domain, item_id: itemId, run_id: runId }, 30000)
+	}
+
+	configEntries() {
+		return this.call({ type: 'config_entries/get' }, 30000)
+	}
+
+	backupInfo() {
+		return this.call({ type: 'backup/info' }, 30000)
+	}
+
+	checkConfig() {
+		return this.rest('POST', '/api/config/core/check_config')
+	}
+
+	renderTemplate(template) {
+		return this.rest('POST', '/api/template', { template })
+	}
+
+	getConfigRest(domain, id) {
+		return this.rest('GET', `/api/config/${encodeURIComponent(domain)}/config/${encodeURIComponent(id)}`)
+	}
+
+	saveConfigRest(domain, id, config) {
+		return this.rest('POST', `/api/config/${encodeURIComponent(domain)}/config/${encodeURIComponent(id)}`, config)
+	}
+
+	deleteConfigRest(domain, id) {
+		return this.rest('DELETE', `/api/config/${encodeURIComponent(domain)}/config/${encodeURIComponent(id)}`)
 	}
 }

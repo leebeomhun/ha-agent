@@ -1,0 +1,18 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "집 비서 (ha-agent) 연결",
+        "description": "ha-agent Assist HTTP 서버 주소와 Bearer 토큰을 입력하세요.",
+        "data": {
+          "url": "서버 URL",
+          "token": "Assist Bearer 토큰"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "서버에 연결할 수 없습니다.",
+      "invalid_auth": "Bearer 토큰이 올바르지 않습니다."
+    }
+  }
+}

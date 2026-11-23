@@ -503,7 +503,8 @@ test('행동: 스스로 실행(확인·되돌리기), 승인 뒤 실행, 목록 
 	assert.equal(x.ha.calls.at(-1), 'light.a turn_on')
 	const log = latestBy(readJsonl(P.actions), 'aid')
 	assert.deepEqual(log.map(a => a.status), ['undone', 'done', 'done'])
-	assert.equal(readJson(P.counters, {}).actions, 3)
+	assert.equal(readJson(P.counters, {}).actions, 2)
+	assert.equal(readJson(P.counters, {}).undos, 1)
 	// 다음 판단에서 되돌린 사실이 보인다
 	x.t.brain = async () => ({ result: answer(), ms: 1, tokens: 1 })
 	await x.agent.cycle([{ type: 'manual', reason: '시험' }])

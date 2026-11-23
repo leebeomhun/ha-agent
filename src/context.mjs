@@ -2,18 +2,25 @@
 import { fmt, kst, globs } from './util.mjs'
 import { recentFires } from './rules.mjs'
 
-const SKIP_DOMAINS = new Set(['button', 'scene', 'tts', 'stt', 'conversation', 'ai_task', 'wake_word', 'assist_satellite',
-	'image', 'event', 'todo', 'zone', 'sun', 'number', 'text', 'time', 'date', 'siren', 'notify', 'tag', 'camera', 'automation'])
+const SKIP_DOMAINS = new Set(['button', 'tts', 'stt', 'conversation', 'ai_task', 'wake_word', 'assist_satellite',
+	'image', 'notify', 'tag', 'automation'])
 const KEEP_ATTRS = {
-	climate: ['current_temperature', 'temperature', 'hvac_action', 'current_humidity'],
-	fan: ['percentage', 'preset_mode'],
-	light: ['brightness'],
-	media_player: ['media_title', 'source', 'app_name'],
+	climate: ['current_temperature', 'temperature', 'hvac_action', 'current_humidity', 'hvac_modes'],
+	fan: ['percentage', 'preset_mode', 'preset_modes'],
+	light: ['brightness', 'color_temp_kelvin', 'supported_color_modes'],
+	media_player: ['media_title', 'source', 'app_name', 'volume_level', 'is_volume_muted', 'source_list'],
 	cover: ['current_position'],
 	vacuum: ['battery_level'],
 	weather: ['temperature', 'humidity'],
 	calendar: ['message', 'start_time', 'end_time'],
 	person: ['source'],
+	select: ['options'],
+	input_select: ['options'],
+	input_number: ['min', 'max', 'step'],
+	number: ['min', 'max', 'step'],
+	script: ['last_triggered'],
+	lock: ['changed_by'],
+	update: ['installed_version', 'latest_version', 'release_summary', 'release_url'],
 }
 const isNum = v => v !== null && v !== undefined && v !== '' && Number.isFinite(Number(v))
 
@@ -43,6 +50,7 @@ export const automationList = (states, configs = null) => [...states.values()]
 	.map(s => {
 		const c = configs?.[s.entity_id]
 		const o = { id: s.entity_id, name: s.attributes?.friendly_name, state: s.state, last_triggered: fmt(Date.parse(s.attributes?.last_triggered)) }
+		if (c?.id != null) o.config_id = String(c.id)
 		if (c?.description) o.description = c.description
 		if (c) {
 			const one = x => (Array.isArray(x) ? x : x ? [x] : [])
@@ -53,7 +61,7 @@ export const automationList = (states, configs = null) => [...states.values()]
 	})
 
 const RING_DOMAINS = new Set(['binary_sensor', 'lock', 'switch', 'light', 'cover', 'fan', 'climate', 'media_player', 'person',
-	'device_tracker', 'input_boolean', 'input_select', 'vacuum', 'alarm_control_panel', 'humidifier', 'water_heater', 'calendar'])
+	'device_tracker', 'input_boolean', 'input_select', 'vacuum', 'alarm_control_panel', 'humidifier', 'water_heater', 'calendar', 'select'])
 
 // 사람이 읽을 만한 상태 변화만 남긴다(숫자 센서 출렁임, 속성만 바뀐 것은 뺀다).
 export function notableChange(d) {
@@ -159,8 +167,9 @@ function describeReason(r) {
 		case 'bootstrap': return '[처음 시작] 아직 감시 규칙이 없다. 집을 파악하고 규칙과 메모를 만들어라.' + again
 		case 'rule': return `[규칙 발동] ${r.rule_id}: ${r.description} — ${r.entity_id} 현재 값 ${JSON.stringify(r.value)} (${fmt(r.since)}부터)`
 			+ (r.pre_notified ? ' ※ urgent 규칙이라 규칙 설명이 이미 긴급 알림으로 나갔다. 보탤 내용이 있을 때만 같은 related_rule_ids로 후속 알림을 낸다.' : '') + again
+		case 'anomaly': return `[이상 패턴 감지] ${r.entity_id} (${r.name ?? ''}) 현재 값 ${r.value} (평소 평균 ${r.avg}, 편차 ${r.z}σ)` + again
 		case 'scheduled': return `[예약] ${r.reason} (예약 시각 ${fmt(r.at)})` + again
-		case 'hourly': return `[정각 점검] ${r.hour}시` + again
+		case 'hourly': return (r.briefing ? `[정기 브리핑] ${r.hour}시` : `[정각 점검] ${r.hour}시`) + again
 		case 'reflection': return `[하루 돌아보기 + 정각 점검] ${r.hour}시` + again
 		case 'weekly': return '[주간 분석] 지난 7일의 자동화 실행과 기기 조작을 분석해 개선안과 새 자동화 제안을 report에 쓴다(지침의 "주간 분석").' + again
 		case 'held': return '[밤사이 보류] 아래 "밤사이 보류된 것"을 보고 아직 유효한 것만 처리한다.'
@@ -175,7 +184,7 @@ const FEEDBACK_MARK = { up: '👍 도움됐어요', mute: '🔕 이건 그만', 
 const STATUS = { sent: '보냄', held: '보류(조용한 시간)', test_mode: '시험 모드라 안 보냄', over_limit: '한도 초과로 안 보냄', error: '발송 오류', queued: '발송 실패, 다시 보내는 중', expired: '끝내 못 보냄', replaced: '못 보낸 사이 새 요약으로 대신함' }
 const ACT_STATUS = { done: '실행함', unverified: '실행했지만 상태 확인 안 됨', error: '실패', pending: '승인 기다리는 중', declined: '사용자가 거절', expired: '승인 없이 시간 지남', undone: '사용자가 되돌림', test_mode: '시험 모드라 안 함' }
 const VERB = { turn_on: '켜기', turn_off: '끄기' }
-const INFO_KIND = { history: '상태 기록', statistics: '통계(평균·최소·최대)', logbook: '활동 기록(무엇이 바꿨는지)' }
+const INFO_KIND = { history: '상태 기록', statistics: '통계(평균·최소·최대)', logbook: '활동 기록(무엇이 바꿨는지)', traces: '자동화 실행 추적(trace)', config_entries: '통합 구성 요소 상태' }
 
 function ruleLine(r, rt, now) {
 	const cond = c => `${c.entity_id}${c.attribute ? `[${c.attribute}]` : ''} ${c.op}${c.value != null ? ` ${JSON.stringify(c.value)}` : ''}`
@@ -201,10 +210,16 @@ export function buildPrompt(x) {
 	const sec = (title, body) => lines.push(`\n## ${title}\n${body}`)
 
 	lines.push(guideFor(x.guide, x.reasons).trim())
+	if (x.homeProfile?.trim()) sec('이 집의 프로필', x.homeProfile.trim())
 	lines.push('\n---\n# 이번 깨움')
 	lines.push(`- 지금: ${now.date}(${now.wd}) ${now.hm} KST, ${x.quiet ? '조용한 시간(urgent만 실제로 나감)' : '활동 시간'}`)
 	const hrs = x.hours
-	if (hrs) lines.push(`- 하루 시간표: 활동 시간 ${hrs.start}~${hrs.end}시(그 밖은 조용한 시간)${hrs.checkins?.length ? `, 정각 점검 ${hrs.checkins[0]}~${hrs.checkins.at(-1)}시` : ', 정각 점검 없음'}${hrs.reflection != null ? `, 하루 돌아보기 ${hrs.reflection}시` : ''}`)
+	if (hrs) {
+		const checkinDesc = hrs.briefings?.length
+			? `정기 브리핑 ${hrs.briefings.join(', ')}시`
+			: hrs.checkins?.length ? `정각 점검 ${hrs.checkins[0]}~${hrs.checkins.at(-1)}시` : '정각 점검 없음'
+		lines.push(`- 하루 시간표: 활동 시간 ${hrs.start}~${hrs.end}시(그 밖은 조용한 시간), ${checkinDesc}${hrs.reflection != null ? `, 하루 돌아보기 ${hrs.reflection}시` : ''}`)
+	}
 	if (x.awayOverride) lines.push(`- 재실·방해금지 도우미: ${x.awayOverride.name ?? x.awayOverride.id} (${x.awayOverride.id}) = ${x.awayOverride.state}`)
 	lines.push('- 깨운 이유:')
 	x.reasons.forEach((r, i) => lines.push(`  ${i + 1}. ${describeReason(r)}`))
@@ -221,23 +236,33 @@ export function buildPrompt(x) {
 
 	if (x.held?.length) sec('밤사이 보류된 것', x.held.map(h => h.type === 'rule'
 		? `- ${fmt(h.at)} 규칙 발동 ${h.rule_id}: ${h.description} (값 ${JSON.stringify(h.value)})`
-		: `- ${fmt(Date.parse(h.ts))} 보내지 않은 알림 [${h.level}] ${h.title} — ${h.message}`).join('\n'))
+		: h.type === 'anomaly'
+			? `- ${fmt(h.at)} 이상 패턴 감지 ${h.entity_id} (${h.name ?? ''}): 값 ${h.value} (평균 ${h.avg}, ${h.z}σ)`
+			: `- ${fmt(Date.parse(h.ts))} 보내지 않은 알림 [${h.level}] ${h.title} — ${h.message}`).join('\n'))
 
 	sec(`감시 규칙 (${x.rules.length}개)`, x.rules.length ? x.rules.map(r => ruleLine(r, x.runtime[r.id] ?? {}, x.now)).join('\n') : '(없음)')
 
 	const act = x.actions
 	if (act?.tiers?.length) {
-		const tierText = { auto: '스스로 실행', confirm: '사용자 승인 뒤 실행' }
+		const tierText = { auto: '스스로 실행(Tier 1)', confirm: '사용자 승인 뒤 실행(Tier 2)' }
 		sec(`행동 권한 (오늘 ${act.today}/${act.perDay}회 사용)`, [
 			...act.tiers.map(t => `- ${t.id} (${t.name ?? ''}) 지금 ${t.state} — ${tierText[t.tier]}`),
+			...(act.adminEnabled ? ['※ HA 관리 제안(proposals): 자동화·스크립트 수정/생성, 통합 리로드, 백업, 규칙 승격, 엔티티 정리는 사전 검증 뒤 Tier 2 승인 요청으로 낼 수 있습니다.'] : []),
 			...(act.onRequest && x.reasons.some(r => r.type === 'user') ? ['※ 사용자가 이번 말에서 직접 시킨 행동은 requested=true로 낸다. 그러면 승인을 묻지 않고 바로 실행된다(조용한 시간에도). 네가 스스로 판단한 행동은 requested=false.'] : []),
-			...(act.recent?.length ? ['최근 행동:', ...act.recent.map(a => `- ${fmt(Date.parse(a.ts))} ${a.name ?? a.entity_id} ${VERB[a.action]} [${ACT_STATUS[a.status] ?? a.status}] ${a.reason}`)] : []),
+			...(act.recent?.length ? ['최근 행동:', ...act.recent.map(a => `- ${fmt(Date.parse(a.ts))} ${a.name ?? a.entity_id} ${VERB[a.action] ?? a.action} [${ACT_STATUS[a.status] ?? a.status}] ${a.reason}`)] : []),
 		].join('\n'))
 	} else sec('행동 권한', '없음. actions는 빈 배열로 둔다(알림만 가능).')
+
+	if (x.pendingProposals?.length) {
+		sec(`승인 대기 중인 HA 관리 제안 (${x.pendingProposals.length}건)`, x.pendingProposals.map(p => `- [${p.pid}] (${p.kind}) ${p.title} — ${p.summary}`).join('\n'))
+	}
 
 	sec('예약된 깨움', x.schedule.length ? x.schedule.map(w => `- ${fmt(Date.parse(w.at))} ${w.reason}`).join('\n') : '(없음)')
 	if (x.rejected?.length) sec('지난 답에서 거절된 변경 (고쳐서 다시 내도 된다)', x.rejected.map(r => `- ${JSON.stringify(r)}`).join('\n'))
 	sec('메모', x.memory.trim() || '(비어 있음)')
+	if (x.assistHistory?.length) {
+		sec('최근 24시간 HA Assist 대화', x.assistHistory.map(m => `- ${fmt(m.ts)} [${m.role === 'user' ? '사용자' : '비서'}] ${String(m.text ?? '').replace(/\s+/g, ' ').slice(0, 160)}`).join('\n'))
+	}
 	if (x.metrics) sec('지난 7일 지표', Object.entries(x.metrics).map(([k, v]) => `${k}=${v}`).join(', '))
 
 	const recent = changeLines(x.ring.filter(c => x.now - c.t < 2 * 3600000), globs(x.noise))
@@ -265,6 +290,7 @@ export function buildPrompt(x) {
 		...(x.reasons.some(r => r.type === 'weekly') ? [
 			'- run/weekly-automations.json: 자동화별 지난 7일 실행 횟수(runs)·날짜별(by_day)·시간대별(by_hour)·무엇이 실행시켰는지(triggers). period.oldest_record가 HA에 남은 가장 오래된 기록',
 			'- run/weekly-devices.json: 기기별 지난 7일 상태 변화의 출처(by_source), 자동화가 아닌 조작(manual), 자동화가 한 일을 사람이 곧 되돌린 일(reverted)과 그 반대(overridden), 자동화가 남긴 설명(automation_notes)',
+			'- run/weekly-health.json: 깨진 엔티티 참조, 통합 오류, 최근 오류 트레이스, 대기 업데이트 점검 결과',
 		] : []),
 		...(x.lastReport ? [`- run/weekly-last-report.md: 지난 주간 분석 보고서 (${x.lastReport.replace('.md', '')})`] : []),
 		...(x.infoFiles ?? []).map(h => `- ${h.file}: ${h.entity_ids.join(', ')} 최근 ${h.hours}시간 ${INFO_KIND[h.kind]} (요청한 것)`),

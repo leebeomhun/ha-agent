@@ -15,10 +15,18 @@ for (const e of cfgCheck.errors) log('설정 오류:', e)
 // 주 루프(15초마다 tick)가 오래 멈추면 프로세스를 끝내 systemd가 다시 띄우게 한다.
 const beat = cfg.watchdog_minutes > 0 ? startWatchdog(cfg.watchdog_minutes * 60000) : undefined
 const agent = new Agent({ cfg, beat })
-const bye = sig => {
+let shuttingDown = false
+const bye = async sig => {
+	if (shuttingDown) return
+	shuttingDown = true
 	log(`종료 신호 ${sig}`)
+	try {
+		await Promise.race([
+			Promise.resolve(agent.stop()),
+			new Promise(r => setTimeout(r, 8000)),
+		])
+	} catch {}
 	try { unlinkSync(P.pid) } catch {}
-	agent.stop()
 	process.exit(0)
 }
 process.on('SIGTERM', () => bye('SIGTERM'))

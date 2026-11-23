@@ -3,9 +3,16 @@ import { writeFileSync, mkdirSync, existsSync, readFileSync, rmSync, cpSync, cop
 import { join } from 'node:path'
 import { P, ROOT, readJson, writeJson, readJsonlAll, latestBy, fmt, kst, newId, expandHome } from './util.mjs'
 import { loadConfig, loadControl, saveControl, validateConfig } from './config.mjs'
-import { MODES, MODE_LABEL, brainMode, brainSettings, selfCheck } from './brain.mjs'
+import { MODES, MODE_LABEL, normalizeMode, brainMode, brainSettings, selfCheck } from './brain.mjs'
 import { recentFires } from './rules.mjs'
 import { rangeStats } from './records.mjs'
+import { PolicyEngine } from './core/policy.mjs'
+import { Store } from './core/store.mjs'
+import { MemoryManager } from './core/memory.mjs'
+import { checkOobSlackConfig, checkOobKakaoConfig } from './oob.mjs'
+import { HA } from './ha.mjs'
+import { HaAdmin } from './admin/ha-admin.mjs'
+import { geminiKey } from './llm/providers/gemini.mjs'
 
 const [cmd, ...rest] = process.argv.slice(2)
 const daemonPid = () => { const p = Number(existsSync(P.pid) ? readFileSync(P.pid, 'utf8') : 0); try { return p && process.kill(p, 0) ? p : 0 } catch { return 0 } }
@@ -14,12 +21,45 @@ const toInbox = obj => {
 	writeJson(join(P.inbox, `${Date.now()}-${newId()}.json`), obj)
 }
 const VERB = { turn_on: '켜기', turn_off: '끄기' }
-const MODE_DESC = { codex: 'Codex CLI', api: 'OpenAI API 직접 호출' }
-// 지금 판단 방식 한 줄: 방식, 모델, 추론 노력, 어디서 정해졌는지
+const MODE_DESC = { codex: 'OpenAI Codex CLI', api: 'OpenAI API 직접 호출', agy: 'Gemini Antigravity CLI', gemini: 'Gemini API 직접 호출' }
 const brainLine = (cfg, c) => {
 	const mode = brainMode(cfg, c), s = brainSettings(cfg, mode)
 	const from = MODES.includes(c.brain) ? `cli brain으로 바꿈, config.json은 ${brainMode(cfg)}` : 'config.json'
 	return `판단 방식: ${mode} (${MODE_DESC[mode]}) | 모델 ${s.model}, 노력 ${s.effort_hourly}/${s.effort}/${s.effort_deep} | ${from}`
+}
+
+async function assistIpc(cfg, method, path, body = null) {
+	const a = cfg.assist ?? {}
+	if (!a.enabled || !daemonPid()) return null
+	const tokPath = expandHome(a.token_file || '~/.config/ha-agent/assist-token')
+	if (!existsSync(tokPath)) return null
+	const tok = readFileSync(tokPath, 'utf8').trim()
+	if (!tok) return null
+	const rawHost = a.host
+	const host = (!rawHost || rawHost === '0.0.0.0' || rawHost === '::') ? '127.0.0.1' : rawHost
+	const url = `http://${host}:${a.port ?? 8787}${path}`
+	const res = await fetch(url, {
+		method,
+		headers: { authorization: `Bearer ${tok}`, ...(body != null ? { 'content-type': 'application/json' } : {}) },
+		...(body != null ? { body: JSON.stringify(body) } : {}),
+		signal: AbortSignal.timeout((a.timeout_seconds ?? 90) * 1000),
+	})
+	const json = await res.json().catch(() => ({}))
+	if (!res.ok) throw new Error(json.error || `HTTP ${res.status}`)
+	return json
+}
+
+async function withLiveHa(cfg, fn) {
+	const policy = new PolicyEngine(cfg)
+	const ha = new HA({ url: cfg.ha_ws_url, tokenFile: expandHome(cfg.token_file), notifyTargets: cfg.notify_targets, policy })
+	ha.start()
+	try {
+		const states = await new Promise((resolve, reject) => {
+			const t = setTimeout(() => reject(new Error('HA 연결 시간 초과')), 15000)
+			ha.once('ready', list => { clearTimeout(t); resolve(new Map(list.map(s => [s.entity_id, s]))) })
+		})
+		return await fn(ha, states)
+	} finally { ha.stop() }
 }
 
 const cmds = {
@@ -31,16 +71,22 @@ const cmds = {
 		const last = readJsonlAll(P.decisions).slice(-1)[0]
 		console.log(`데몬: ${daemonPid() ? `실행 중 (pid ${daemonPid()})` : '꺼짐'} | ${c.paused ? '일시정지' : '동작'} | 알림 발송 ${c.send ? '켜짐' : '꺼짐(시험 모드)'}`)
 		console.log(brainLine(cfg, c))
-		console.log(`오늘(${cnt.date ?? '-'}): 판단 ${cnt.runs ?? 0}회, 알림 ${cnt.alerts ?? 0}개, 요약 ${cnt.summaries ?? 0}개, 행동 ${cnt.actions ?? 0}회`)
+		console.log(`오늘(${cnt.date ?? '-'}): 판단 ${cnt.runs ?? 0}회, 알림 ${cnt.alerts ?? 0}개, 요약 ${cnt.summaries ?? 0}개, 행동 ${cnt.actions ?? 0}회, 되돌리기 ${cnt.undos ?? 0}회`)
 		console.log(`규칙 ${rules?.rules?.length ?? 0}개 (지금 조건 참: ${Object.values(rt).filter(r => r.fired).length}개), 예약 ${sched.length}개, 밤사이 보류 ${held.length}개`)
 		console.log(`대기 중인 깨움 ${(q.queue ?? []).length}건, 다시 보낼 알림 ${outbox.length}개, 승인 기다리는 행동 ${pending.length}개`)
-		const a = cfg.actions
-		console.log(`행동: ${a.enabled ? `켜짐 (스스로 ${a.auto.length}개, 승인 뒤 ${a.confirm.length}개 엔티티)` : '꺼짐(알림만)'} | 비상 알림 길: ${cfg.oob.type ?? '꺼짐'} | heartbeat: ${cfg.heartbeat.enabled ? '켜짐' : '꺼짐'}`)
+		const pol = new PolicyEngine(cfg).describe()
+		const oobLabel = cfg.oob?.type ? `${cfg.oob.type}${cfg.oob.recipient_name ? `:${cfg.oob.recipient_name}` : ''}${cfg.oob.fallback?.type ? `→${cfg.oob.fallback.type}` : ''}` : '꺼짐'
+		console.log(`정책: ${pol.enabled ? `Tier1 자율 ${pol.tier1_auto.length}개, Tier2 승인 ${pol.tier2_confirm.length}개` : '행동 꺼짐'} | HA 관리 ${pol.admin_enabled ? '켜짐' : '꺼짐'} | 비상 알림 길: ${oobLabel} | Assist: ${cfg.assist?.enabled ? `포트 ${cfg.assist.port}` : '꺼짐'}`)
 		const wk = cfg.weekly, lastWeekly = readJson(P.runtime, {}).last_weekly
-		console.log(`주간 분석: ${wk.enabled ? `매주 ${wk.weekday}요일 ${wk.hour}시` : '꺼짐'}${lastWeekly ? ` | 마지막 ${lastWeekly}` : ''} | 하루 돌아보기: ${cfg.reflection_hour == null ? '꺼짐' : `${cfg.reflection_hour}시`} | 활동 시간 ${cfg.active_hours.start}~${cfg.active_hours.end}시`)
-		console.log(`자동 전환(codex↔api): ${cfg.failover.enabled ? `${cfg.failover.after_failures}번 연속 실패 시, ${MODES.filter(m => m !== brainMode(cfg, c)).map(m => `${m} ${selfCheck(cfg, m) ? '쓸 수 없음' : '쓸 수 있음'}`).join('')}` : '꺼짐'} | urgent 다시 알림: ${cfg.escalation.enabled ? `${cfg.escalation.remind_minutes}분마다 ${cfg.escalation.max_reminders}번` : '꺼짐'}`)
+		const schedLabel = Array.isArray(cfg.briefing_hours) && cfg.briefing_hours.length ? `브리핑 ${cfg.briefing_hours.join(',')}시` : `활동 시간 ${cfg.active_hours.start}~${cfg.active_hours.end}시`
+		console.log(`주간 분석: ${wk.enabled ? `매주 ${wk.weekday}요일 ${wk.hour}시` : '꺼짐'}${lastWeekly ? ` | 마지막 ${lastWeekly}` : ''} | 하루 돌아보기: ${cfg.reflection_hour == null ? '꺼짐' : `${cfg.reflection_hour}시`} | ${schedLabel}`)
+		console.log(`자동 전환(codex↔api · agy↔gemini): ${cfg.failover.enabled ? `${cfg.failover.after_failures}번 연속 실패 시 (${MODES.filter(m => m !== brainMode(cfg, c)).map(m => `${m} ${selfCheck(cfg, m) ? '쓸 수 없음' : '쓸 수 있음'}`).join(', ')})` : '꺼짐'} | urgent 다시 알림: ${cfg.escalation.enabled ? `${cfg.escalation.remind_minutes}분마다 ${cfg.escalation.max_reminders}번` : '꺼짐'}`)
 		for (const w of sched) console.log(`  예약 ${fmt(Date.parse(w.at))} ${w.reason}`)
 		if (last) console.log(`마지막 판단 ${fmt(Date.parse(last.ts))} (${Math.round(last.total_ms / 1000)}초): ${last.error ? `실패 ${last.error}` : last.summary}`)
+	},
+	policy() {
+		const pol = new PolicyEngine(loadConfig()).describe()
+		console.log(JSON.stringify(pol, null, 2))
 	},
 	rules() {
 		const rules = readJson(P.rules, null)?.rules ?? [], rt = readJson(P.runtime, { rules: {} }).rules ?? {}
@@ -57,7 +103,7 @@ const cmds = {
 		const n = Number(rest[0]) || 10
 		for (const d of readJsonlAll(P.decisions).slice(-n)) {
 			const u = d.usage ? ` (입력 ${d.usage.input}/캐시 ${d.usage.cached}/출력 ${d.usage.output}/추론 ${d.usage.reasoning})` : ''
-			console.log(`${fmt(Date.parse(d.ts))} [${d.reasons.join(', ')}] ${Math.round(d.total_ms / 1000)}초 토큰 ${d.tokens ?? '?'}${u}${d.rounds > 1 ? ` (${d.rounds}번 물음)` : ''}${d.skipped ? ' (건너뜀)' : ''}${d.deferred ? ' (미룸)' : ''}${d.brain === 'api' ? ' [api]' : ''}${d.failover ? ' (자동 전환)' : ''}`)
+			console.log(`${fmt(Date.parse(d.ts))} [${d.reasons.join(', ')}] ${Math.round(d.total_ms / 1000)}초 토큰 ${d.tokens ?? '?'}${u}${d.rounds > 1 ? ` (${d.rounds}번 물음)` : ''}${d.skipped ? ' (건너뜀)' : ''}${d.deferred ? ' (미룸)' : ''}${d.brain && d.brain !== 'codex' ? ` [${d.brain}]` : ''}${d.failover ? ' (자동 전환)' : ''}`)
 			console.log(`  ${d.error ? `실패: ${d.error}` : d.summary}`)
 			const a = d.applied
 			if (a) {
@@ -66,7 +112,8 @@ const cmds = {
 				if (a.changed?.length) parts.push(`규칙 수정 ${a.changed.join(', ')}`)
 				if (a.deleted?.length) parts.push(`규칙 삭제 ${a.deleted.join(', ')}`)
 				if (a.wakes?.length) parts.push(`예약 ${a.wakes.join(', ')}`)
-				if (a.memory !== 'keep') parts.push(`메모 ${a.memory}`)
+				if (a.memory && a.memory !== 'keep') parts.push(`메모 ${a.memory}`)
+				if (a.proposals?.length) parts.push(`제안 ${a.proposals.join(', ')}`)
 				if (a.report) parts.push(`주간 보고서 ${a.report}`)
 				if (a.rejected?.length) parts.push(`거절 ${a.rejected.length}건`)
 				if (a.backtest?.length) parts.push(`백테스트 ${a.backtest.join(', ')}`)
@@ -83,11 +130,125 @@ const cmds = {
 	actions() {
 		const n = Number(rest[0]) || 20
 		const list = latestBy(readJsonlAll(P.actions), 'aid').slice(-n)
-		for (const a of list) console.log(`${fmt(Date.parse(a.ts))} [${a.tier}/${a.status}] ${a.name} ${VERB[a.action]} — ${a.reason}${a.error ? ` (${a.error})` : ''}`)
+		for (const a of list) console.log(`${fmt(Date.parse(a.ts))} [${a.tier}/${a.status}] ${a.name} ${VERB[a.action] ?? a.action} — ${a.reason}${a.error ? ` (${a.error})` : ''}`)
 		if (!list.length) console.log('행동 기록 없음')
 	},
-	memory() { console.log(existsSync(P.memory) ? readFileSync(P.memory, 'utf8') : '(비어 있음)') },
-	// 주간 분석 보고서: 인자 없으면 가장 최근 것, list는 목록, run은 지금 분석시키기, publish는 최근 것을 HA 알림 목록에 올리기, 날짜(YYYY-MM-DD)는 그날 것.
+	memory() {
+		const sub = rest[0]
+		if (!sub) {
+			console.log(existsSync(P.memory) ? readFileSync(P.memory, 'utf8') : '(비어 있음)')
+			if (existsSync(P.db)) {
+				const st = new Store()
+				try {
+					const items = st.listMemory()
+					if (items.length) {
+						console.log('=== 구조화 장기 기억 ===')
+						for (const it of items) console.log(`- [${it.category}] ${it.key}: ${it.content}`)
+					}
+				} finally { st.close() }
+			}
+			return
+		}
+		const st = new Store()
+		const mgr = new MemoryManager({ store: st })
+		try {
+			if (sub === 'list') {
+				const items = mgr.list(rest[1] ?? null)
+				for (const it of items) console.log(`[${it.category}] ${it.key}: ${it.content}`)
+				if (!items.length) console.log('구조화 기억 없음')
+			} else if (sub === 'search') {
+				const q = rest.slice(1).join(' ')
+				for (const it of mgr.search(q)) console.log(`[${it.category}] ${it.key}: ${it.content}`)
+			} else if (sub === 'add' && rest.length >= 4) {
+				const [, cat, key, ...txt] = rest
+				console.log(JSON.stringify(mgr.applyOps([{ op: 'upsert', category: cat, key, content: txt.join(' ') }], { source: 'cli' })))
+			} else if (sub === 'rm' && rest[1]) {
+				console.log(JSON.stringify(mgr.applyOps([{ op: 'delete', key: rest[1] }], { source: 'cli' })))
+			} else {
+				console.log('쓰는 법: memory [list [cat]|search <키워드>|add <cat> <key> <내용>|rm <key>]')
+			}
+		} finally { st.close() }
+	},
+	async proposals() {
+		const cfg = loadConfig()
+		const sub = rest[0] || 'list', pid = rest[1]
+		if (sub === 'list') {
+			const ipc = await assistIpc(cfg, 'GET', '/api/proposals').catch(() => null)
+			let list = ipc?.proposals
+			if (!list) {
+				const st = new Store()
+				try { list = st.listProposals({ limit: 30 }) } finally { st.close() }
+			}
+			for (const p of list) console.log(`${p.pid} [${p.status}] (${p.kind}) ${p.title} — ${p.summary}`)
+			if (!list.length) console.log('제안 없음')
+			return
+		}
+		if (sub === 'show' && pid) {
+			const st = new Store()
+			try {
+				const p = st.getProposal(pid)
+				console.log(p ? JSON.stringify(p, null, 2) : `찾지 못함: ${pid}`)
+			} finally { st.close() }
+			return
+		}
+		if (['approve', 'reject', 'rollback'].includes(sub) && pid) {
+			const ipc = await assistIpc(cfg, 'POST', `/api/proposals/${encodeURIComponent(pid)}/${sub}`).catch(() => null)
+			if (ipc) return console.log(JSON.stringify(ipc, null, 2))
+			const st = new Store()
+			try {
+				if (sub === 'reject') {
+					const adm = new HaAdmin({ cfg, store: st, memory: new MemoryManager({ store: st }) })
+					return console.log(JSON.stringify(adm.rejectProposal(pid), null, 2))
+				}
+				const res = await withLiveHa(cfg, async (ha, states) => {
+					const adm = new HaAdmin({ cfg, ha, store: st, states, memory: new MemoryManager({ store: st }) })
+					return sub === 'approve' ? adm.approveProposal(pid) : adm.rollbackProposal(pid)
+				})
+				console.log(JSON.stringify(res, null, 2))
+			} finally { st.close() }
+			return
+		}
+		console.log('쓰는 법: proposals [list|show <pid>|approve <pid>|reject <pid>|rollback <pid>]')
+	},
+	async audit() {
+		const cfg = loadConfig()
+		const ipc = await assistIpc(cfg, 'POST', '/api/audit').catch(() => null)
+		if (ipc) return console.log(JSON.stringify(ipc, null, 2))
+		const res = await withLiveHa(cfg, async (ha, states) => {
+			const autoCfg = {}
+			for (const id of states.keys()) {
+				if (!id.startsWith('automation.')) continue
+				try { autoCfg[id] = (await ha.call({ type: 'automation/config', entity_id: id }))?.config } catch {}
+			}
+			const adm = new HaAdmin({ cfg, ha, states, meta: { autoCfg } })
+			return adm.auditHealth()
+		})
+		console.log(JSON.stringify(res, null, 2))
+	},
+	async traces() {
+		const cfg = loadConfig(), target = rest[0] ?? null
+		const rows = await withLiveHa(cfg, async ha => {
+			let itemId = null
+			if (target) itemId = (await ha.call({ type: 'automation/config', entity_id: target }))?.config?.id ?? target.replace(/^automation\./, '')
+			return ha.traces('automation', itemId ? String(itemId) : null)
+		})
+		for (const t of (rows ?? []).slice(0, 20)) {
+			console.log(`${t.timestamp?.start ?? ''} [${t.state}/${t.script_execution}] ${t.item_id} (${t.run_id}) step=${t.last_step ?? '-'}${t.error ? ` err=${t.error}` : ''}`)
+		}
+	},
+	async assist() {
+		if (!rest.length) return console.log('쓰는 법: assist <집 비서에게 할 말>')
+		const cfg = loadConfig()
+		const sessPath = join(P.state, 'cli-assist-session.txt')
+		const text = rest.join(' ')
+		const convId = existsSync(sessPath) ? readFileSync(sessPath, 'utf8').trim() : null
+		try {
+			const r = await assistIpc(cfg, 'POST', '/api/assist/converse', { text, conversation_id: convId || undefined, channel: 'cli_assist' })
+			if (!r) return console.log('Assist 서버가 꺼져 있거나 데몬이 실행 중이 아니에요. (say 명령을 쓰세요)')
+			if (r.conversation_id) writeFileSync(sessPath, r.conversation_id)
+			console.log(r.response?.speech ?? JSON.stringify(r))
+		} catch (e) { console.log(`Assist 오류: ${e.message}`) }
+	},
 	async weekly() {
 		const { listWeekly, readWeekly } = await import('./records.mjs')
 		const arg = rest[0]
@@ -110,24 +271,29 @@ const cmds = {
 		const w = loadConfig().weekly
 		console.log(r ? r.text : arg ? `그 날짜의 보고서가 없어요: ${arg}. 'weekly list'로 확인하세요.` : `아직 보고서가 없어요. ${w.enabled ? `매주 ${w.weekday}요일 ${w.hour}시에 분석합니다.` : '주간 분석이 꺼져 있어요(config.json의 weekly.enabled).'} 지금 하려면 'weekly run'.`)
 	},
-	wake() {
-		toInbox({ cmd: 'wake', reason: rest.join(' ') || '수동 점검' })
+	async wake() {
+		const cfg = loadConfig(), reason = rest.join(' ') || '수동 점검'
+		const ipc = await assistIpc(cfg, 'POST', '/api/wake', { reason }).catch(() => null)
+		if (ipc?.ok) return console.log('깨움 요청을 즉시 전달했어요.')
+		toInbox({ cmd: 'wake', reason })
 		console.log(daemonPid() ? '깨움 요청을 넣었어요. 15초 안에 판단을 시작합니다.' : '데몬이 꺼져 있어 요청만 넣어 두었어요.')
 	},
-	say() {
+	async say() {
 		if (!rest.length) return console.log('쓰는 법: say <집 비서에게 할 말>')
-		toInbox({ cmd: 'say', text: rest.join(' ') })
+		const cfg = loadConfig(), text = rest.join(' ')
+		const ipc = await assistIpc(cfg, 'POST', '/api/say', { text }).catch(() => null)
+		if (ipc?.speech) return console.log(ipc.speech)
+		toInbox({ cmd: 'say', text })
 		console.log(daemonPid() ? '말을 전했어요. 15초 안에 판단을 시작합니다.' : '데몬이 꺼져 있어 말만 넣어 두었어요.')
 	},
-	// 판단 방식 보기·바꾸기. 바꾼 값은 state/control.json에 남고, 데몬은 재시작 없이 다음 판단부터 따른다.
 	brain() {
-		const cfg = loadConfig(), c = loadControl(), want = rest[0]
-		if (!want) {
+		const cfg = loadConfig(), c = loadControl(), wantRaw = rest[0], want = wantRaw ? normalizeMode(wantRaw) : null
+		if (!wantRaw) {
 			console.log(brainLine(cfg, c))
-			for (const m of MODES) console.log(`  ${m}: ${selfCheck(cfg, m) ?? '쓸 수 있음'}`)
-			return console.log('바꾸기: node src/cli.mjs brain codex|api  (config.json 값으로 되돌리기: brain default)')
+			for (const m of MODES) console.log(`  ${m} (${MODE_DESC[m]}): ${selfCheck(cfg, m) ?? '쓸 수 있음'}`)
+			return console.log(`바꾸기: node src/cli.mjs brain ${MODES.join('|')}  (config.json 값으로 되돌리기: brain default)`)
 		}
-		if (want === 'default') {
+		if (wantRaw === 'default') {
 			const { brain, ...keep } = c
 			saveControl(keep)
 			return console.log(`config.json 값으로 되돌렸어요.\n${brainLine(cfg, keep)}`)
@@ -138,7 +304,7 @@ const cmds = {
 		const next = { ...c, brain: want }
 		saveControl(next)
 		console.log(`${brainLine(cfg, next)}\n${daemonPid() ? '다음 판단부터 이 방식으로 묻습니다(재시작 필요 없음).' : '데몬이 꺼져 있어요. 켜지면 이 방식으로 묻습니다.'}`)
-		if (want === 'api') console.log('API 방식은 쓴 토큰만큼 요금이 나가요. 쓴 양은 `log`의 토큰으로 봅니다.')
+		if (want === 'api' || want === 'gemini') console.log(`${MODE_LABEL[want]} 방식은 쓴 토큰만큼 요금이 나가요. 쓴 양은 \`log\`의 토큰으로 봅니다.`)
 	},
 	pause() { saveControl({ ...loadControl(), paused: true }); console.log('일시정지: 규칙 감시는 계속하지만 AI 판단·알림·행동을 멈춥니다.') },
 	resume() { saveControl({ ...loadControl(), paused: false }); console.log('다시 동작합니다.') },
@@ -167,21 +333,19 @@ const cmds = {
 		const { listRuns } = await import('./records.mjs')
 		for (const n of listRuns().slice(-(Number(rest[0]) || 20))) console.log(n)
 	},
-	// 보관해 둔 판단을 지금의 지침(GUIDE.md)으로 다시 물어본다. 결과만 보여주고 아무것도 바꾸지 않는다. AI를 한 번 쓴다.
-	// 둘째 인자로 codex나 api를 주면 그 방식으로 묻는다(같은 상황에서 두 방식 견주기).
 	async replay() {
 		const { listRuns } = await import('./records.mjs')
 		const { buildPrompt } = await import('./context.mjs')
 		const { runBrain, validateResponse } = await import('./brain.mjs')
-		if (rest[1] && !MODES.includes(rest[1])) return console.log(`쓰는 법: replay [이름|latest] [${MODES.join('|')}]`)
+		const reqMode = rest[1] ? normalizeMode(rest[1]) : null
+		if (reqMode && !MODES.includes(reqMode)) return console.log(`쓰는 법: replay [이름|latest] [${MODES.join('|')}]`)
 		const name = !rest[0] || rest[0] === 'latest' ? listRuns().at(-1) : rest[0]
 		const dir = join(P.runs, name ?? '')
 		if (!name || !existsSync(join(dir, 'input.json'))) return console.log(`보관된 판단이 없어요: ${rest[0] ?? '(없음)'}. 'runs'로 이름을 확인하세요.`)
 		const cfg = loadConfig()
-		const mode = rest[1] ?? brainMode(cfg, loadControl()), bs = brainSettings(cfg, mode)
+		const mode = reqMode ?? brainMode(cfg, loadControl()), bs = brainSettings(cfg, mode)
 		const problem = selfCheck(cfg, mode)
 		if (problem) return console.log(`${mode} 방식을 쓸 수 없어요: ${problem}`)
-		// 데몬이 쓰는 brain/run/과 겹치지 않게 replay/ 폴더에서 돌린다.
 		rmSync(P.replay, { recursive: true, force: true })
 		mkdirSync(join(P.replay, 'run'), { recursive: true })
 		if (existsSync(join(dir, 'files'))) cpSync(join(dir, 'files'), join(P.replay, 'run'), { recursive: true })
@@ -190,7 +354,7 @@ const cmds = {
 			copyFileSync(join(P.run, 'automation-configs.json'), replayAutoCfg)
 		}
 		let input = readJson(join(dir, 'input.json'), null)
-		if (typeof input === 'string') input = JSON.parse(input) // 예전 보관분은 문자열로 한 번 더 감싸여 있다
+		if (typeof input === 'string') input = JSON.parse(input)
 		const weekly = input.reasons.some(r => r.type === 'weekly')
 		const deep = weekly || input.reasons.some(r => r.type === 'bootstrap' || r.type === 'reflection')
 		const pureHourly = !deep && input.reasons.length === 1 && input.reasons[0].type === 'hourly'
@@ -205,7 +369,7 @@ const cmds = {
 		console.log(`── 지금의 답 (${MODE_LABEL[mode]}, ${Math.round(r.ms / 1000)}초, 토큰 ${r.tokens ?? '?'}${r.tool_calls != null ? `, 파일 도구 ${r.tool_calls}번` : ''}) ──`)
 		console.log(JSON.stringify(validateResponse(r.result), null, 1))
 	},
-	doctor() {
+	async doctor() {
 		const cfg = loadConfig(), c = loadControl(), rt = readJson(P.runtime, {})
 		let errors = 0, warnings = 0
 		const ok = msg => console.log(`[OK]   ${msg}`)
@@ -225,10 +389,12 @@ const cmds = {
 		const mainChk = selfCheck(cfg, mode)
 		if (mainChk) fail(`주 판단 방식(${mode}): ${mainChk}`)
 		else ok(`주 판단 방식(${mode}): 사용 가능 (모델 ${brainSettings(cfg, mode).model})`)
-		const other = MODES.find(m => m !== mode)
-		const altChk = selfCheck(cfg, other)
-		if (altChk) warn(`대체 판단 방식(${other}): ${altChk}`)
-		else ok(`대체 판단 방식(${other}): 사용 가능 (모델 ${brainSettings(cfg, other).model})`)
+		for (const m of MODES) {
+			if (m === mode) continue
+			const chk = selfCheck(cfg, m)
+			if (chk) warn(`보조 판단 방식(${m}): ${chk}`)
+			else ok(`보조 판단 방식(${m}): 사용 가능 (모델 ${brainSettings(cfg, m).model})`)
+		}
 
 		const checkPerm = (label, filePath, required = false) => {
 			if (!filePath) return
@@ -240,8 +406,31 @@ const cmds = {
 		}
 		checkPerm('HA 토큰', cfg.token_file, true)
 		checkPerm('.env', join(ROOT, '.env'), false)
-		checkPerm('API 키 파일', cfg.api.key_file, false)
+		checkPerm('OpenAI API 키 파일', cfg.api.key_file, false)
+		checkPerm('Gemini API 키 파일', cfg.gemini?.key_file ?? cfg.llm?.gemini?.key_file, false)
 		checkPerm('OOB 토큰 파일', cfg.oob.token_file, false)
+		checkPerm('OOB env 파일', cfg.oob.env_file, false)
+		if (cfg.assist?.enabled) checkPerm('Assist 토큰 파일', cfg.assist.token_file, false)
+
+		if (existsSync(P.homeProfile)) ok('집 프로필(state/home-profile.md) 존재')
+		else warn('집 프로필(state/home-profile.md) 없음')
+
+		if (existsSync(P.db)) {
+			try {
+				const st = new Store()
+				const s = st.stats()
+				st.close()
+				const dbSizeMb = (statSync(P.db).size / (1024 * 1024)).toFixed(2)
+				const walPath = `${P.db}-wal`
+				const walBytes = existsSync(walPath) ? statSync(walPath).size : 0
+				const walMb = (walBytes / (1024 * 1024)).toFixed(2)
+				ok(`SQLite DB 정상 (이벤트 ${s.events}, 기억 ${s.memory_items}, 제안 대기 ${s.proposals_pending}, DB ${dbSizeMb}MB, WAL ${walMb}MB)`)
+				if (walBytes > 10 * 1024 * 1024) warn(`SQLite WAL 파일이 큼 (${walMb}MB): 체크포인트 권장`)
+			} catch (e) { fail(`SQLite DB 오류: ${e.message}`) }
+		} else warn('SQLite DB 미생성 (데몬 시작 시 자동 생성)')
+
+		const pol = new PolicyEngine(cfg).describe()
+		ok(`Risk 정책: ${pol.enabled ? `Tier1 ${pol.tier1_auto.length}개 / Tier2 ${pol.tier2_confirm.length}개` : '꺼짐'}, HA 관리=${pol.admin_enabled ? '켜짐' : '꺼짐'}`)
 
 		const baks = []
 		for (const dir of [ROOT, join(ROOT, 'src'), join(ROOT, 'test'), P.brain]) {
@@ -252,8 +441,53 @@ const cmds = {
 		if (baks.length) warn(`잔여 백업 파일 ${baks.length}개: ${baks.join(', ')}`)
 		else ok('잔여 백업 파일 없음')
 
-		if (cfg.oob?.type) ok(`비상 알림 길(oob): ${cfg.oob.type} 설정됨`)
-		else warn('비상 알림 길(oob) 꺼짐 (HA 단절 시 외부 알림 없음)')
+		const checkOobEntry = (entry, label, isFallback = false) => {
+			const rep = isFallback ? warn : fail
+			if (entry.type === 'slack') {
+				const sErr = checkOobSlackConfig({ oob: entry })
+				if (sErr) rep(`${label}(slack): ${sErr}`)
+				else ok(`${label}(slack): 토큰·채널 설정 확인됨`)
+			} else if (entry.type === 'kakao') {
+				const kErr = checkOobKakaoConfig({ oob: entry })
+				if (kErr) rep(`${label}(kakao): ${kErr}`)
+				else ok(`${label}(kakao): 토큰·수신자(${entry.recipient_name || entry.recipient_uuid || entry.mode || 'memo'}) 설정 확인됨`)
+			} else if (entry.type) {
+				ok(`${label}(oob): ${entry.type} 설정됨`)
+			}
+		}
+		if (cfg.oob?.type) {
+			checkOobEntry(cfg.oob, '비상 알림 길', false)
+			if (cfg.oob.fallback?.type) checkOobEntry(cfg.oob.fallback, '대체 비상 알림 길', true)
+		} else warn('비상 알림 길(oob) 꺼짐 (HA 단절 시 외부 알림 없음)')
+
+			if (cfg.assist?.enabled) {
+				const aHost = cfg.assist.host
+				if ((!aHost || aHost === '0.0.0.0' || aHost === '::') && !(Array.isArray(cfg.assist.allowed_networks) && cfg.assist.allowed_networks.length)) {
+					warn('Assist 서버가 0.0.0.0에 열려 있고 allowed_networks 제한이 없음')
+				}
+				try {
+					const hr = await fetch(`http://127.0.0.1:${cfg.assist.port}/health`, { signal: AbortSignal.timeout(3000) })
+					if (hr.ok) ok(`Assist HTTP 서버 정상 (포트 ${cfg.assist.port})`)
+					else fail(`Assist HTTP 서버 비정상 응답 (${hr.status})`)
+				} catch (e) {
+					if (pid) fail(`Assist HTTP 서버 연결 실패: ${e.message}`)
+					else warn(`Assist HTTP 서버 대기 중 (데몬 꺼짐, 포트 ${cfg.assist.port})`)
+				}
+				const assistProv = normalizeMode(cfg.llm?.routes?.assist ?? mode)
+				const assistBs = ['codex', 'api', 'agy', 'gemini'].includes(assistProv) ? brainSettings(cfg, assistProv) : { model: cfg.llm?.[assistProv]?.model ?? null, effort: null }
+				const assistMdl = cfg.assist?.model ?? assistBs.model
+				const assistEff = cfg.assist?.effort ?? assistBs.effort
+				ok(`Assist 대화 AI: ${assistProv} (${assistMdl}${assistEff ? `, 노력 ${assistEff}` : ''})`)
+				if (cfg.assist?.voice?.provider === 'gemini') {
+					const v = cfg.assist.voice
+					try {
+						geminiKey(cfg)
+						ok(`Assist 음성(Gemini Interactions API): STT ${v.stt_model} / TTS ${v.tts_model} (${v.tts_voice})`)
+					} catch (e) {
+						warn(`Assist 음성(Gemini): API 키 없음 (${e.message})`)
+					}
+				}
+			} else warn('Assist HTTP 서버 꺼짐 (config.json assist.enabled=false)')
 
 		if (cfg.heartbeat?.enabled) {
 			const beatAgeMin = rt.last_beat_ok ? Math.round((Date.now() - rt.last_beat_ok) / 60000) : null
@@ -300,8 +534,22 @@ const cmds = {
 		const fired = rules.map(r => [r.id, recentFires(rt[r.id], now).length]).filter(([, n]) => n > 0).sort((a, b) => b[1] - a[1])
 		if (fired.length) console.log(`규칙 7일 발동: ${fired.map(([id, n]) => `${id}(${n}회)`).join(', ')}`)
 	},
+	// Assist 모델 비교: node src/cli.mjs bench-assist [provider:model[:effort] ...] [--repeat N] [--case "말" ...]
+	// 실제 HA 상태·프롬프트·도구로 돌리지만 기기는 움직이지 않는다(제어는 정책 판정만 하고 성공으로 흉내).
+	async 'bench-assist'() {
+		const { benchAssist, DEFAULT_MODELS, DEFAULT_CASES } = await import('./bench-assist.mjs')
+		const models = [], texts = []
+		let repeat = 1
+		for (let i = 0; i < rest.length; i++) {
+			if (rest[i] === '--repeat') repeat = Math.max(1, Number(rest[++i]) || 1)
+			else if (rest[i] === '--case') texts.push(rest[++i])
+			else models.push(rest[i])
+		}
+		const cases = texts.length ? texts.map(t => DEFAULT_CASES.find(c => c.text === t) ?? { text: t, expect: null }) : DEFAULT_CASES
+		await benchAssist({ cfg: loadConfig(), models: models.length ? models : DEFAULT_MODELS, cases, repeat })
+		process.exit(0)
+	},
 	async once() {
-		// 데몬과 따로 한 번 판단해 보고 결과만 보여준다(상태 파일·알림은 건드리지 않음).
 		if (daemonPid()) { console.log('데몬이 실행 중이라 once는 쓰지 않아요. wake를 쓰세요.'); return }
 		const { Agent } = await import('./agent.mjs')
 		const a = new Agent({ dry: true })
@@ -316,7 +564,7 @@ const cmds = {
 }
 
 if (!cmds[cmd]) {
-	console.log('명령: status | rules | log [n] | notes [YYYY-MM-DD] | actions [n] | memory | stats [일수] | doctor | weekly [list|run|publish|YYYY-MM-DD] | wake [이유] | say <말> | brain [codex|api|default] | pause | resume | send-on | send-off | history | restore <파일> | runs [n] | replay [이름|latest] [codex|api] | oob-test | once [bootstrap|hourly|weekly|manual] [이유]')
+	console.log('명령: status | policy | rules | log [n] | notes [YYYY-MM-DD] | actions [n] | memory [list|search|add|rm] | proposals [list|show|approve|reject|rollback] | audit | traces [id] | assist <말> | stats [일수] | doctor | weekly [list|run|publish|YYYY-MM-DD] | wake [이유] | say <말> | brain [codex|api|agy|gemini|default] | pause | resume | send-on | send-off | history | restore <파일> | runs [n] | replay [이름|latest] [codex|api|agy|gemini] | oob-test | once [bootstrap|hourly|weekly|manual] [이유] | bench-assist [provider:model[:effort] ...] [--repeat N] [--case 말]')
 	process.exit(cmd ? 1 : 0)
 }
 await cmds[cmd]()

@@ -1,5 +1,5 @@
 [Unit]
-Description=HA 집 비서 (규칙 감시 + Codex 판단)
+Description=HA 집 비서 (규칙 감시 + 다중 AI 판단 + Assist 서버)
 After=network-online.target
 Wants=network-online.target
 
@@ -7,9 +7,11 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=/home/ubuntu/ha-agent
 ExecStart=/usr/bin/env node /home/ubuntu/ha-agent/src/main.mjs
-Environment=PATH=/home/ubuntu/.npm-global/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PATH=/home/ubuntu/.local/bin:/home/ubuntu/.npm-global/bin:/usr/local/bin:/usr/bin:/bin
 Restart=always
 RestartSec=15
+TimeoutStopSec=15
+MemoryMax=512M
 
 [Install]
 WantedBy=default.target

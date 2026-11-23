@@ -8,3 +8,5 @@ brain/run/
 replay/
 .claude/
 node_modules/
+__pycache__/
+*.pyc
