@@ -160,14 +160,31 @@ export function readTools() {
 		},
 		{
 			name: 'memory_search',
-			description: '구조화 장기 기억(선호, 지시사항, 거절 이력, 장애 이력, 생활 패턴)을 검색한다',
+			description: '구조화 장기 기억(선호, 지시사항, 거절 이력, 장애 이력, 생활 패턴)을 하이브리드(FTS5·유사도·엔티티)로 검색한다',
 			properties: {
-				query: { type: 'string', description: '검색 키워드' },
+				query: { type: 'string', description: '검색 키워드 또는 문장' },
 				category: { type: ['string', 'null'], enum: ['preference', 'standing_order', 'incident', 'pattern', 'rejection', null], description: '카테고리 필터. null이면 전체' },
+				include_archived: { type: ['boolean', 'null'], description: 'true면 만료·삭제된 아카이브 기억까지 함께 검색. null이면 활성 기억만' },
 			},
 			async run(ctx, a) {
 				if (!ctx.memory) return '[]'
-				return clip(ctx.memory.search(a.query, a.category ?? null))
+				const hits = typeof ctx.memory.searchAsync === 'function'
+					? await ctx.memory.searchAsync(a.query, a.category ?? null, { includeArchived: Boolean(a.include_archived) })
+					: ctx.memory.search(a.query, a.category ?? null, { includeArchived: Boolean(a.include_archived) })
+				return clip(hits.map(({ embedding, ...rest }) => rest))
+			},
+		},
+		{
+			name: 'memory_history',
+			description: '구조화 장기 기억의 변경 이력(생성·수정·삭제·만료)을 조회한다',
+			properties: {
+				key: { type: ['string', 'null'], description: '조회할 기억 키. null이면 전체 최근 변경 이력' },
+				limit: { type: ['integer', 'null'], description: '최대 개수(1~30). null이면 15' },
+			},
+			async run(ctx, a) {
+				if (!ctx.memory) return '[]'
+				const lim = Math.min(Math.max(Number(a.limit) || 15, 1), 30)
+				return clip(ctx.memory.history(a.key ?? null, lim))
 			},
 		},
 		{

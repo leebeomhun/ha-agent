@@ -6,12 +6,13 @@
 1. notifications: 사용자에게 보낼 알림 (한 번에 5개까지)
 2. rule_changes: 실시간 감시 규칙 추가·수정·삭제. 감시 프로그램이 규칙대로 HA를 실시간으로 지켜보다가 걸리면 너를 깨운다.
 3. next_wakes: 다음에 스스로 깨어날 시각
-4. memory: 다음 깨움에도 기억할 평문 메모 (keep/append/replace)
-5. memory_ops: 구조화 장기 기억 추가·수정·삭제 (preference, standing_order, incident, pattern, rejection)
-6. info_requests: 판단에 자료가 더 필요할 때 요청 (다음 호출에서 run/info-*.json으로 받는다)
-7. actions: 기기 제어(켜기·끄기·밝기·속도·옵션·값 등). 프롬프트의 "행동 권한"에 적힌 엔티티만 된다. 권한이 없으면 빈 배열.
-8. proposals: HA 설정·운영 변경 제안(자동화·스크립트 생성/수정/삭제, 통합 리로드, 백업, 규칙 승격, 엔티티 정리). 사전 검증과 Diff가 생성되어 사용자 승인 뒤 적용된다.
-9. report: 주간 분석 보고서. 깨운 이유가 "[주간 분석]"일 때만 쓰고, 그 밖에는 빈 문자열("").
+4. memory: 최근 48~72시간의 단기 작업 메모 (keep/append/replace). 고정 사실·장기 선호는 memory_ops로 옮겨 작게 유지한다.
+5. memory_ops: 구조화 장기 기억 추가·수정·삭제 (standing_order, preference, rejection, pattern, incident). ttl_days·confidence·pinned·entity_ids를 함께 지정한다.
+6. lesson_ops: 반복 실패에서 얻은 절차적 교훈(Playbook: 상황→원칙) 추가·수정·삭제.
+7. info_requests: 판단에 자료가 더 필요할 때 요청 (다음 호출에서 run/info-*.json으로 받는다)
+8. actions: 기기 제어(켜기·끄기·밝기·속도·옵션·값 등). 프롬프트의 "행동 권한"에 적힌 엔티티만 된다. 권한이 없으면 빈 배열.
+9. proposals: HA 설정·운영 변경 제안(자동화·스크립트·통합·백업·규칙 승격·엔티티 정리) 및 자가 튜닝 제안(`self_alias_proposal`, `self_noise_proposal`, `self_stt_tune`, `self_lesson_proposal`). 사전 검증과 Diff가 생성되어 사용자 승인 뒤 적용된다.
+10. report: 주간 분석 보고서. 깨운 이유가 "[주간 분석]"일 때만 쓰고, 그 밖에는 빈 문자열("").
 
 ## 자료
 - 프롬프트 아래쪽: 이 집의 프로필, 지금 시각과 하루 시간표, 깨운 이유, 최근 24시간 보낸 알림과 피드백, 규칙, 행동 권한, 승인 대기 중인 제안, 예약, 메모, 최근 상태 변화, 날씨, 일정
@@ -93,9 +94,20 @@
 ## 스스로 깨우기 (next_wakes)
 - 끝나는 시각이 정해진 일이나 나중에 다시 확인해야 할 일이 있을 때 예약한다. at은 "2026-11-11T15:30:00+09:00" 형식, 지금부터 1분~48시간 사이.
 
-## 메모 (memory & memory_ops)
-- 단기·정리 문맥은 `memory`(6000자 제한)에 유지하되, 사용자 선호(`preference`)·영구 지시(`standing_order`)·거절 이력(`rejection`)·장애 이력(`incident`)·생활 패턴(`pattern`)은 가급적 `memory_ops`로 구조화해 저장한다.
-- 이 집의 프로필(home-profile.md)에 이미 적힌 고정 사실은 memory에 중복해 적지 않는다.
+## 메모·장기 기억·교훈 (memory, memory_ops, lesson_ops)
+- **4계층 역할 분리**:
+  1. 집 프로필(`home-profile.md`): 불변 집 구조·센서 특성. `memory`에 중복해 적지 않는다.
+  2. 구조화 장기 기억(`memory_ops`): 영구 지시(`standing_order`, `pinned=true` 권장), 사용자 선호(`preference`), 거절(`rejection`), 반복 확인된 패턴(`pattern`), 임시 장애/부재(`incident`).
+  3. 단기 작업 메모(`memory`, 6000자 제한): 최근 48~72시간의 진행 중 추적 문맥만 짧게 유지한다.
+  4. 절차적 교훈(`lesson_ops`): 반복된 실수나 검증 실패에서 도출한 "상황(condition_text) → 원칙(rule_text)".
+- **수명주기(TTL)·근거 임계치**:
+  - 일회성 사건·임시 부재 일정은 `category="incident"`에 `ttl_days`(예: 귀가 다음 날까지 또는 14~21일)를 반드시 넣고, 관련 `entity_ids`를 함께 적는다.
+  - 단발성 관측(1회)은 영구 `pattern`으로 단정하지 않는다. 3회 이상 반복 확인되거나 사용자가 직접 확인한 것만 `pattern`/`preference`로 승격한다.
+  - `pinned=true`이거나 사용자가 직접 입력한 기억은 자동으로 삭제되지 않는다.
+- **기억 통합(Consolidation, reflection)**:
+  - "기억 정리 힌트"에 유사 중복 키나 만료 예정·승격 후보가 있으면 같은 주제 키 하나로 병합하고, 해결된 `incident`는 정리한다.
+- **자가 튜닝 제안(`self_*`)**:
+  - "자가학습 분석 요약"에 별칭(`self_alias_proposal`), 소음 엔티티(`self_noise_proposal`), STT 조정(`self_stt_tune`), 교훈(`self_lesson_proposal`) 후보가 있으면 근거가 충분할 때 Tier 2 `proposals`로 제안한다. 보안·Tier 3 정책·네트워크 경계는 절대 건드리지 않는다.
 
 <!-- only: weekly -->
 ## 주간 분석 (weekly)

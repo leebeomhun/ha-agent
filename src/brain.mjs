@@ -17,8 +17,13 @@ export const MODE_LABEL = { codex: 'Codex', api: 'OpenAI API', agy: 'Antigravity
 export const BRAIN_ALIAS = { openai: 'api', antigravity: 'agy', 'gemini-api': 'gemini' }
 export const normalizeMode = m => BRAIN_ALIAS[m] ?? m
 const ALL_ACTIONS = new Set(Object.values(ACTION_SERVICES).flat())
-const PROPOSAL_KINDS = new Set(['automation_upsert', 'automation_delete', 'automation_toggle', 'script_upsert', 'script_delete', 'reload_config_entry', 'backup_create', 'entity_admin', 'promote_rule'])
+const PROPOSAL_KINDS = new Set([
+	'automation_upsert', 'automation_delete', 'automation_toggle', 'script_upsert', 'script_delete',
+	'reload_config_entry', 'backup_create', 'entity_admin', 'promote_rule',
+	'self_alias_proposal', 'self_noise_proposal', 'self_stt_tune', 'self_lesson_proposal',
+])
 const MEMORY_CATS = new Set(['preference', 'standing_order', 'incident', 'pattern', 'rejection'])
+const LESSON_SCOPES = new Set(['all', 'assist', 'cycle', 'weekly', 'proposal'])
 
 // 판단 방식: state/control.json의 brain(실행 중에 바꾼 것)이 있으면 그것, 없으면 config.json의 brain.
 export function brainMode(cfg, control) {
@@ -235,12 +240,34 @@ export function validateResponse(x) {
 			mode: ['keep', 'append', 'replace'].includes(x.memory?.mode) ? x.memory.mode : 'keep',
 			text: str(x.memory?.text, 8000),
 		},
-		memory_ops: arr(x.memory_ops).slice(0, 20).map(m => ({
-			op: ['upsert', 'delete'].includes(m?.op) ? m.op : 'upsert',
-			category: MEMORY_CATS.has(m?.category) ? m.category : 'pattern',
-			key: str(m?.key, 80),
-			content: str(m?.content, 500),
-		})).filter(m => m.key && (m.op === 'delete' || m.content)),
+		memory_ops: arr(x.memory_ops).slice(0, 20).map(m => {
+			const item = {
+				op: ['upsert', 'delete'].includes(m?.op) ? m.op : 'upsert',
+				category: MEMORY_CATS.has(m?.category) ? m.category : 'pattern',
+				key: str(m?.key, 80),
+				content: str(m?.content, 500),
+			}
+			if (m?.ttl_days !== undefined && m?.ttl_days !== null && Number.isFinite(Number(m.ttl_days))) {
+				item.ttl_days = Math.min(Math.max(Math.round(Number(m.ttl_days)), 0), 3650)
+			}
+			if (m?.confidence !== undefined && m?.confidence !== null && Number.isFinite(Number(m.confidence))) {
+				item.confidence = Math.min(Math.max(Number(m.confidence), 0), 1)
+			}
+			if (typeof m?.pinned === 'boolean') item.pinned = m.pinned
+			if (Array.isArray(m?.entity_ids)) {
+				item.entity_ids = ids(m.entity_ids).slice(0, 16)
+			}
+			return item
+		}).filter(m => m.key && (m.op === 'delete' || m.content)),
+		lesson_ops: arr(x.lesson_ops).slice(0, 10).map(l => ({
+			op: ['upsert', 'delete'].includes(l?.op) ? l.op : 'upsert',
+			key: str(l?.key, 80),
+			scope: LESSON_SCOPES.has(l?.scope) ? l.scope : 'all',
+			condition_text: str(l?.condition_text, 200),
+			rule_text: str(l?.rule_text, 300),
+			evidence: l?.evidence ? str(l.evidence, 240) : null,
+			...(typeof l?.pinned === 'boolean' ? { pinned: l.pinned } : {}),
+		})).filter(l => l.key && (l.op === 'delete' || (l.condition_text && l.rule_text))),
 		// 주간 분석 보고서(마크다운). 주간 분석이 아닐 때는 빈 문자열.
 		report: str(x.report, 20000),
 		info_requests: arr(x.info_requests).slice(0, 3).map(r => {

@@ -15,12 +15,14 @@ Home Assistant(HA)를 실시간으로 감시하고, **HA Assist 대화**·**기�
    - Gemini Interactions API 기반 빠른 음성·대화 파이프라인(`/api/assist/stt`: `gemini-3.5-transcribe`, `/api/assist/converse`: 단순 켜기/끄기는 LLM 없는 로컬 빠른 경로, 그 밖에는 `gpt-6-luna` `low`(복잡한 요청·실패 시 `gemini-4-hydrogen` `low`), `/api/assist/tts`: `gemini-3.8-flash-lite-tts` + WAV 캐시)과 멀티턴 대화 세션(`src/orchestrator/session.mjs`)·정책 검증 도구(`src/tools/`)를 통해 음성 입력→조회·제어→음성 응답까지 한 번에 처리한다.
 4. **HA DevOps 관리 (`src/admin/ha-admin.mjs`)**:
    - 자동화/스크립트 CRUD, 엔티티·Jinja 템플릿 사전 검증, Unified Diff, 승인/거절, 적용 후 `check_config` 검증 및 실패 시 자동 롤백, 감시 규칙의 HA 자동화 승격(`promote_rule`), 종합 건강 감사(`auditHealth`).
-5. **영속 저장소 & 계층형 기억 (`src/core/store.mjs`, `src/core/memory.mjs`)**:
-   - Node 22 내장 `node:sqlite`(WAL 모드)에 이벤트, 센서 표본, 베이스라인, 결정 로그, 제어 스냅샷, 관리 제안, 대화 세션, 구조화 장기 기억을 저장한다.
-   - 알림·피드백·행동·상태 변화 기록의 원본은 SQLite(`src/core/journal.mjs`)이고, `state/*.jsonl`은 하루·주간 보고서와 CLI용 내보내기다. 판단 기록(`logs/decisions.jsonl`)은 분석용 원본으로 그대로 둔다.
-   - 이상탐지는 5분마다 숫자 센서의 지금 값을 표본으로 쌓아(값이 그대로여도) 요일 유형·시간대별 기준값을 만들고, 지난 14일 같은 시간대에 본 범위를 벗어날 때만 이상으로 본다.
+5. **영속 저장소 & 지능형 계층 기억 (`src/core/store.mjs`, `src/core/memory.mjs`, `src/core/memory-extractor.mjs`, `src/core/embeddings.mjs`)**:
+   - Node 22 내장 `node:sqlite`(WAL 모드)에 이벤트, 센서 표본, 컨텍스트별 베이스라인(`weekday`/`weekend`/`away`), 결정 로그, 제어 스냅샷, 관리 제안, 대화 세션, 구조화 장기 기억(`memory_items` + FTS5 + 변경 이력 `memory_history`), 절차적 교훈(`lessons`), 암묵적 피드백(`implicit_feedback`), 사후 검증 실험 원장(`experiments`), 장기 일·월 롤업(`daily_rollups`/`monthly_rollups`)을 저장한다.
+   - 구조화 기억은 `pinned`·카테고리 우선순위(`standing_order → preference → rejection → pattern → incident`) 순으로 예산을 우선 보장해 영구 지시·선호가 일회성 사건에 밀려 잘리지 않으며, `ttl_days`/`expires_at` 자동 만료·아카이브, `pinned`/사용자 등록 기억 자동 삭제 차단, FTS5 + 한국어 2-gram + **Gemini Embedding 2(`gemini-embedding-2`, 768d MRL + 공식 접두어, 오프라인 시 512d 로컬 폴백)** 하이브리드 의미 검색, 맥락 기반 회상(Contextual Recall), 대화 직후 비동기 기억 추출기(Post-Turn Extractor)를 제공한다.
+   - 알림·피드백·행동·상태 변화 기록의 원본은 SQLite(`src/core/journal.mjs`)이며 일일·주간·기간 통계(`src/records.mjs`)도 SQLite 단일 원본으로 집계한다. `maintain()`으로 원시 기록을 정리하기 전 일/월 롤업을 영구 보존한다.
+   - 이상탐지는 5분마다 숫자 센서의 지금 값을 컨텍스트(`weekday`/`weekend`[공휴일·연차 포함]/`away`)와 함께 표본으로 쌓아 지난 14일 범위를 벗어날 때만 이상으로 본다.
+   - 자가개선 엔진(`src/engine/learning.mjs`)이 암묵적 피드백(제어 되돌림·Assist 재발화/정정/거짓 제어·제안 실패), HA 재시작 스파이크를 제외한 통계적 루틴 마이너, 규칙 정밀도 스코어카드, 실패→회귀 평가셋(`state/evals/cases.json`), Tier 2 자가 튜닝 제안(`self_alias_proposal`/`self_noise_proposal`/`self_stt_tune`/`self_lesson_proposal`, 불변 코어 보호 + 롤백), 사전 백테스트 과다발동 게이트, 제안 검증 실패 1회 Self-Repair, 변경 후 7일 효과 검증 실험을 수행한다.
    - 관리 제안의 이전 설정은 HA에서 새로 읽고, 승인 직전에 다시 읽어 그사이 HA에서 바뀌었으면 덮어쓰지 않는다.
-   - 집 특화 정보는 `state/home-profile.md`로 분리하고, 선호·지시·거절 이력은 `memory_items`로 관리한다.
+   - 집 특화 정보는 `state/home-profile.md`로 분리하고, `state/memory.md`는 단기 작업 메모, 선호·지시·거절 이력은 `memory_items`로 관리한다.
 6. **다중 LLM 라우터 및 OpenAI / Gemini 듀얼 플랫폼 (`src/llm/router.mjs`, `src/brain.mjs`)**:
    - **OpenAI**: `codex` (Codex CLI 샌드박스) ↔ `api` (OpenAI Responses API)
    - **Gemini**: `agy` (Antigravity CLI `--sandbox`) ↔ `gemini` (Gemini Interactions API `/v1beta/interactions`, `response_format` + `step_list` 도구 루프)
@@ -42,7 +44,12 @@ node src/cli.mjs assist <말>                      # HA Assist 대화(멀티턴 
 node src/cli.mjs audit                            # 깨진 자동화 참조·통합 오류·트레이스·고아 엔티티 감사
 node src/cli.mjs traces [automation.id]           # 최근 자동화 실행 추적(trace) 조회
 node src/cli.mjs proposals [list|show|approve|reject|rollback]  # HA 관리 제안 조회·승인·롤백
-node src/cli.mjs memory [list|search|add|rm]      # 메모리 및 구조화 장기 기억 관리
+node src/cli.mjs memory [list|search|add|rm|pin|unpin|history|restore|consolidate|reindex]  # 계층 기억·고정·이력·통합·임베딩 재색인 관리
+node src/cli.mjs learning                         # 암묵적 피드백·교훈·실험·루틴·규칙 정밀도·자가튜닝 현황
+node src/cli.mjs routines [일수]                  # 통계적 출퇴근·기기 조작 루틴 분석
+node src/cli.mjs experiments [eval]               # 변경 사후 검증 실험 조회·평가
+node src/cli.mjs self-tune [propose]              # 자가 튜닝 제안 후보 조회·Tier 2 등록
+node src/cli.mjs evals                            # 실패 사례에서 자동 축적된 회귀 평가셋 조회
 node src/cli.mjs rules                            # 감시 규칙 목록
 node src/cli.mjs log [n]                          # 최근 판단 기록
 node src/cli.mjs stats [일수]                     # 운영·토큰·빈 호출 통계

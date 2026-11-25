@@ -2,7 +2,7 @@
  "notify_targets": [
   "mobile_app_ibeomhun"
  ],
- "weather_entity": "weather.seoul_weather",
+ "weather_entity": "weather.kma_weather",
  "weather_fallback_entity": "weather.jib",
  "away_override_entity": "input_boolean.household_occupied_override",
  "active_hours": {
@@ -17,14 +17,16 @@
  "reflection_hour": 23,
  "noise_entities": [
   "binary_sensor.*_kiosk_screensaver",
-  "binary_sensor.seoul_weatheri_*",
   "sensor.*_wi_fi_connection",
   "sensor.*_battery_state",
   "sensor.*_charger_type",
   "device_tracker.*",
   "input_select.gonggi_*",
-  "sensor.seoul_*",
-  "sensor.jib_biseo_*"
+  "sensor.jib_biseo_*",
+  "sensor.kma_*",
+  "binary_sensor.kma_weather_*",
+  "media_player.genietv_stb_a2",
+  "sensor.geosil_gonggiceongjeonggi_overall_air_quality"
  ],
  "limits": {
   "brain_runs_per_day": 80,
@@ -32,6 +34,13 @@
   "summaries_per_day": 20,
   "min_gap_minutes": 3,
   "max_rules": 60
+ },
+ "memory": {
+  "post_turn_extract": true,
+  "post_turn_llm": true,
+  "embedding_model": "gemini-embedding-2",
+  "embedding_dims": 768,
+  "semantic_threshold": 0.66
  },
  "brain": "agy",
  "codex": {

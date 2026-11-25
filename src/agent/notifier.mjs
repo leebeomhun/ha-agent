@@ -120,13 +120,14 @@ export class Notifier {
 		}
 	}
 
-	heartbeat(now) {
+	heartbeat(now, { force = false } = {}) {
 		const a = this.agent
 		const h = a.cfg.heartbeat
-		if (a.dry || !h.enabled || !a.ha.connected || now - a.lastBeat < h.interval_seconds * 1000) return
+		if (a.dry || !h.enabled || !a.ha.connected || (!force && now - a.lastBeat < h.interval_seconds * 1000)) return
 		a.lastBeat = now
 		const c = a.todayCounters()
 		const last = a.lastRun
+		const lastAssist = a.lastAssist
 		const brain = a.failover
 			? (a.failover.mode ?? MODES.find(m => m !== a.failover.primary))
 			: brainMode(a.cfg, a.control)
@@ -139,6 +140,8 @@ export class Notifier {
 			pending_proposals: a.haAdmin.listProposals({ status: 'pending' }).length,
 			last_run: last ? fmt(Date.parse(last.ts)) : null, last_ok: last ? !last.error : null,
 			last_summary: last ? String(last.error ? `실패: ${last.error}` : last.summary ?? '').replace(/\s+/g, ' ').slice(0, 200) : null,
+			last_assist_run: lastAssist ? fmt(Date.parse(lastAssist.ts)) : null,
+			last_assist_summary: lastAssist ? String(lastAssist.error ? `실패: ${lastAssist.error}` : lastAssist.summary ?? '').replace(/\s+/g, ' ').slice(0, 200) : null,
 		}
 		Promise.resolve().then(() => a.ha.heartbeat(data))
 			.then(() => this.beatDelivered(now))

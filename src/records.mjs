@@ -2,6 +2,7 @@
 import { mkdirSync, writeFileSync, readdirSync, rmSync, cpSync, existsSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { P, DAY, kst, readJson, writeJson, readJsonlAll, rotateIfBig, latestBy } from './util.mjs'
+import { filterRestartSpikes } from './engine/learning.mjs'
 
 const stamp = ms => kst(new Date(ms)).iso.slice(0, 19).replace(/[-:]/g, '').replace('T', '-')
 const list = dir => { try { return readdirSync(dir).sort() } catch { return [] } }
@@ -51,11 +52,12 @@ const ACTIVE = new Set([
 	'auto', 'dry', 'fan_only', 'heat_cool',
 ])
 
-export function dailyDigest(date, events, until = Infinity) {
+export function dailyDigest(date, events, until = Infinity, { filterRestarts = true } = {}) {
 	const start = Date.parse(`${date}T00:00:00+09:00`), end = Math.min(start + DAY, until)
+	const inWindow = (events ?? []).filter(e => e.t >= start && e.t < end)
+	const cleanEvents = filterRestarts ? filterRestartSpikes(inWindow).events : inWindow
 	const by = new Map()
-	for (const e of events) {
-		if (e.t < start || e.t >= end) continue
+	for (const e of cleanEvents) {
 		if (!by.has(e.id)) by.set(e.id, [])
 		by.get(e.id).push(e)
 	}
@@ -76,23 +78,53 @@ export function dailyDigest(date, events, until = Infinity) {
 
 const inDay = (ts, date) => kst(new Date(ts)).date === date
 
-// 날짜가 바뀔 때 전날 것을 state/daily/에 남긴다.
-export function writeDaily(date, keepDays = 60) {
-	const notes = latestBy(readJsonlAll(P.notifications), 'nid').filter(n => inDay(n.ts, date))
-	const fb = readJsonlAll(P.feedback).filter(f => inDay(f.ts, date))
-	const dec = readJsonlAll(P.decisions).filter(d => inDay(d.ts, date))
-	const acts = latestBy(readJsonlAll(P.actions), 'aid').filter(a => inDay(a.ts, date))
+// 날짜가 바뀔 때 전날 것을 state/daily/와 SQLite daily_rollups에 남긴다. store가 있으면 SQLite를 단일 원본으로 읽는다.
+export function writeDaily(date, keepDays = 60, { store = null } = {}) {
+	const start = Date.parse(`${date}T00:00:00+09:00`), end = start + DAY
+	const notes = store ? store.notificationsInRange(start, end) : latestBy(readJsonlAll(P.notifications), 'nid').filter(n => inDay(n.ts, date))
+	const fb = store ? store.feedbackInRange(start, end) : readJsonlAll(P.feedback).filter(f => inDay(f.ts, date))
+	const dec = store ? store.decisionsInRange(start, end) : readJsonlAll(P.decisions).filter(d => inDay(d.ts, date))
+	const acts = store ? store.actionsInRange(start, end) : latestBy(readJsonlAll(P.actions), 'aid').filter(a => inDay(a.ts, date))
+	const evs = store ? store.eventsInRange(start, end) : readJsonlAll(P.events)
 	const count = (arr, f) => arr.reduce((m, x) => { const k = f(x); m[k] = (m[k] ?? 0) + 1; return m }, {})
+	const okRuns = dec.filter(d => !d.skipped && !d.deferred && !d.error)
+	const noop = okRuns.filter(d => {
+		const a = d.applied
+		return !(a?.notifications?.length || a?.actions?.length || a?.added?.length || a?.changed?.length || a?.deleted?.length || a?.report)
+	}).length
+	let sensorStats = null
+	if (store) {
+		try {
+			const samps = store.db.prepare('SELECT entity_id, value FROM sensor_samples WHERE ts >= ? AND ts < ?').all(start, end)
+			if (samps.length) {
+				const acc = {}
+				for (const s of samps) {
+					const c = (acc[s.entity_id] ??= { sum: 0, n: 0, min: Infinity, max: -Infinity })
+					c.sum += s.value; c.n++; c.min = Math.min(c.min, s.value); c.max = Math.max(c.max, s.value)
+				}
+				sensorStats = Object.fromEntries(Object.entries(acc).map(([id, v]) => [id, { avg: Math.round((v.sum / v.n) * 100) / 100, min: v.min, max: v.max, n: v.n }]))
+			}
+		} catch {}
+	}
 	const doc = {
 		date, weekday: kst(new Date(`${date}T12:00:00+09:00`)).wd,
-		runs: dec.filter(d => !d.skipped && !d.deferred).length, failed: dec.filter(d => d.error).length, tokens: dec.reduce((s, d) => s + (d.tokens ?? 0), 0),
+		runs: dec.filter(d => !d.skipped && !d.deferred).length, failed: dec.filter(d => d.error).length,
+		skipped: dec.filter(d => d.skipped).length, noop,
+		tokens: dec.reduce((s, d) => s + (d.tokens ?? 0), 0),
 		notifications: count(notes, n => `${n.kind}/${n.status}`),
 		feedback: count(fb, f => f.kind),
 		actions: count(acts, a => a.status),
-		entities: dailyDigest(date, readJsonlAll(P.events)),
+		entities: dailyDigest(date, evs),
+		...(sensorStats ? { sensor_stats: sensorStats } : {}),
 	}
 	writeJson(join(P.daily, `${date}.json`), doc)
 	prune(P.daily, keepDays)
+	if (store) {
+		try {
+			store.upsertDailyRollup(doc)
+			store.recomputeMonthlyRollups()
+		} catch {}
+	}
 	return doc
 }
 export const recentDaily = (days = 14) => list(P.daily).slice(-days).map(n => readJson(join(P.daily, n), null)).filter(Boolean)
@@ -112,14 +144,14 @@ export function readWeekly(name = listWeekly().at(-1)) {
 	try { return { name, text: readFileSync(join(P.weekly, name), 'utf8') } } catch { return null }
 }
 
-// ── 지난 7일 지표(하루 돌아보기 때 보여준다) ──
-export function weekMetrics(now) {
+// ── 지난 7일 지표(하루 돌아보기 때 보여준다). store가 있으면 SQLite를 단일 원본으로 읽는다. ──
+export function weekMetrics(now, { store = null } = {}) {
 	const since = now - 7 * DAY
 	const recent = arr => arr.filter(x => Date.parse(x.ts) >= since)
-	const dec = recent(readJsonlAll(P.decisions))
-	const notes = recent(latestBy(readJsonlAll(P.notifications), 'nid')).filter(n => n.status === 'sent')
-	const fb = recent(readJsonlAll(P.feedback))
-	const acts = recent(latestBy(readJsonlAll(P.actions), 'aid'))
+	const dec = store ? store.decisionsInRange(since) : recent(readJsonlAll(P.decisions))
+	const notes = (store ? store.notificationsInRange(since) : recent(latestBy(readJsonlAll(P.notifications), 'nid'))).filter(n => n.status === 'sent')
+	const fb = store ? store.feedbackInRange(since) : recent(readJsonlAll(P.feedback))
+	const acts = store ? store.actionsInRange(since) : recent(latestBy(readJsonlAll(P.actions), 'aid'))
 	const n = (arr, f) => arr.filter(f).length
 	return {
 		runs: n(dec, d => !d.skipped && !d.deferred), failed: n(dec, d => d.error), skipped_hourly: n(dec, d => d.skipped), deferred_disconnected: n(dec, d => d.deferred),
@@ -132,14 +164,14 @@ export function weekMetrics(now) {
 	}
 }
 
-// ── 기간별 운영 통계 (cli.mjs stats) ──
-export function rangeStats(days = 7, now = Date.now()) {
+// ── 기간별 운영 통계 (cli.mjs stats). store가 있으면 SQLite를 단일 원본으로 읽는다. ──
+export function rangeStats(days = 7, now = Date.now(), { store = null } = {}) {
 	const since = now - days * DAY
 	const recent = arr => arr.filter(x => Date.parse(x.ts) >= since)
-	const dec = recent(readJsonlAll(P.decisions))
-	const notes = recent(latestBy(readJsonlAll(P.notifications), 'nid'))
-	const fb = recent(readJsonlAll(P.feedback))
-	const acts = recent(latestBy(readJsonlAll(P.actions), 'aid'))
+	const dec = store ? store.decisionsInRange(since) : recent(readJsonlAll(P.decisions))
+	const notes = store ? store.notificationsInRange(since) : recent(latestBy(readJsonlAll(P.notifications), 'nid'))
+	const fb = store ? store.feedbackInRange(since) : recent(readJsonlAll(P.feedback))
+	const acts = store ? store.actionsInRange(since) : recent(latestBy(readJsonlAll(P.actions), 'aid'))
 	const real = dec.filter(d => !d.skipped && !d.deferred)
 	const okRuns = real.filter(d => !d.error)
 	const noop = okRuns.filter(d => {

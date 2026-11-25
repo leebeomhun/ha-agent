@@ -8,7 +8,9 @@ import { recentFires } from './rules.mjs'
 import { rangeStats } from './records.mjs'
 import { PolicyEngine } from './core/policy.mjs'
 import { Store } from './core/store.mjs'
+import { Journal } from './core/journal.mjs'
 import { MemoryManager } from './core/memory.mjs'
+import { mineRoutines, scoreRules, generateSelfProposals, loadEvalCases, evaluateDueExperiments, ImplicitFeedbackTracker } from './engine/learning.mjs'
 import { checkOobSlackConfig, checkOobKakaoConfig } from './oob.mjs'
 import { HA } from './ha.mjs'
 import { HaAdmin } from './admin/ha-admin.mjs'
@@ -67,8 +69,14 @@ const cmds = {
 		const c = loadControl(), cfg = loadConfig(), rules = readJson(P.rules, null), rt = readJson(P.runtime, { rules: {} }).rules ?? {}
 		const cnt = readJson(P.counters, {}), sched = readJson(P.schedule, []), held = readJson(P.held, [])
 		const q = readJson(P.queue, {}), outbox = readJson(P.outbox, [])
-		const pending = latestBy(readJsonlAll(P.actions), 'aid').filter(a => a.status === 'pending')
-		const last = readJsonlAll(P.decisions).slice(-1)[0]
+		const st = existsSync(P.db) ? new Store() : null
+		let pending = [], last = null, lastAssist = null
+		try {
+			const journal = new Journal({ store: st })
+			pending = journal.pendingActions()
+			last = journal.latestDecision({ excludeAssist: true, excludeSkipped: true, excludeDeferred: true })
+			lastAssist = journal.latestDecision({ onlyAssist: true })
+		} finally { st?.close() }
 		console.log(`데몬: ${daemonPid() ? `실행 중 (pid ${daemonPid()})` : '꺼짐'} | ${c.paused ? '일시정지' : '동작'} | 알림 발송 ${c.send ? '켜짐' : '꺼짐(시험 모드)'}`)
 		console.log(brainLine(cfg, c))
 		console.log(`오늘(${cnt.date ?? '-'}): 판단 ${cnt.runs ?? 0}회, 알림 ${cnt.alerts ?? 0}개, 요약 ${cnt.summaries ?? 0}개, 행동 ${cnt.actions ?? 0}회, 되돌리기 ${cnt.undos ?? 0}회`)
@@ -82,7 +90,8 @@ const cmds = {
 		console.log(`주간 분석: ${wk.enabled ? `매주 ${wk.weekday}요일 ${wk.hour}시` : '꺼짐'}${lastWeekly ? ` | 마지막 ${lastWeekly}` : ''} | 하루 돌아보기: ${cfg.reflection_hour == null ? '꺼짐' : `${cfg.reflection_hour}시`} | ${schedLabel}`)
 		console.log(`자동 전환(codex↔api · agy↔gemini): ${cfg.failover.enabled ? `${cfg.failover.after_failures}번 연속 실패 시 (${MODES.filter(m => m !== brainMode(cfg, c)).map(m => `${m} ${selfCheck(cfg, m) ? '쓸 수 없음' : '쓸 수 있음'}`).join(', ')})` : '꺼짐'} | urgent 다시 알림: ${cfg.escalation.enabled ? `${cfg.escalation.remind_minutes}분마다 ${cfg.escalation.max_reminders}번` : '꺼짐'}`)
 		for (const w of sched) console.log(`  예약 ${fmt(Date.parse(w.at))} ${w.reason}`)
-		if (last) console.log(`마지막 판단 ${fmt(Date.parse(last.ts))} (${Math.round(last.total_ms / 1000)}초): ${last.error ? `실패 ${last.error}` : last.summary}`)
+		if (last) console.log(`마지막 판단 ${fmt(Date.parse(last.ts))} (${Math.round((last.total_ms ?? 0) / 1000)}초): ${last.error ? `실패 ${last.error}` : last.summary}`)
+		if (lastAssist) console.log(`마지막 Assist ${fmt(Date.parse(lastAssist.ts))} (${Math.round((lastAssist.total_ms ?? 0) / 1000)}초): ${lastAssist.error ? `실패 ${lastAssist.error}` : lastAssist.summary}`)
 	},
 	policy() {
 		const pol = new PolicyEngine(loadConfig()).describe()
@@ -101,7 +110,12 @@ const cmds = {
 	},
 	log() {
 		const n = Number(rest[0]) || 10
-		for (const d of readJsonlAll(P.decisions).slice(-n)) {
+		let rows = readJsonlAll(P.decisions)
+		if (!rows.length && existsSync(P.db)) {
+			const st = new Store()
+			try { rows = st.decisionsInRange(0) } finally { st.close() }
+		}
+		for (const d of rows.slice(-n)) {
 			const u = d.usage ? ` (입력 ${d.usage.input}/캐시 ${d.usage.cached}/출력 ${d.usage.output}/추론 ${d.usage.reasoning})` : ''
 			console.log(`${fmt(Date.parse(d.ts))} [${d.reasons.join(', ')}] ${Math.round(d.total_ms / 1000)}초 토큰 ${d.tokens ?? '?'}${u}${d.rounds > 1 ? ` (${d.rounds}번 물음)` : ''}${d.skipped ? ' (건너뜀)' : ''}${d.deferred ? ' (미룸)' : ''}${d.brain && d.brain !== 'codex' ? ` [${d.brain}]` : ''}${d.failover ? ' (자동 전환)' : ''}`)
 			console.log(`  ${d.error ? `실패: ${d.error}` : d.summary}`)
@@ -133,8 +147,9 @@ const cmds = {
 		for (const a of list) console.log(`${fmt(Date.parse(a.ts))} [${a.tier}/${a.status}] ${a.name} ${VERB[a.action] ?? a.action} — ${a.reason}${a.error ? ` (${a.error})` : ''}`)
 		if (!list.length) console.log('행동 기록 없음')
 	},
-	memory() {
+	async memory() {
 		const sub = rest[0]
+		const cfg = loadConfig()
 		if (!sub) {
 			console.log(existsSync(P.memory) ? readFileSync(P.memory, 'utf8') : '(비어 있음)')
 			if (existsSync(P.db)) {
@@ -150,23 +165,99 @@ const cmds = {
 			return
 		}
 		const st = new Store()
-		const mgr = new MemoryManager({ store: st })
+		const mgr = new MemoryManager({ store: st, cfg })
 		try {
 			if (sub === 'list') {
 				const items = mgr.list(rest[1] ?? null)
-				for (const it of items) console.log(`[${it.category}] ${it.key}: ${it.content}`)
+				for (const it of items) {
+					const exp = it.expires_at ? ` (만료 ${fmt(it.expires_at)})` : ''
+					const embTag = it.embedding?.model ? ` [${it.embedding.model}/${it.embedding.dims}d]` : ''
+					console.log(`${it.pinned ? '📌 ' : ''}[${it.category}|P${it.priority ?? 3}] ${it.key}${embTag}: ${it.content}${exp}`)
+				}
 				if (!items.length) console.log('구조화 기억 없음')
 			} else if (sub === 'search') {
 				const q = rest.slice(1).join(' ')
-				for (const it of mgr.search(q)) console.log(`[${it.category}] ${it.key}: ${it.content}`)
+				const hits = await mgr.searchAsync(q, null, { includeArchived: true })
+				for (const it of hits) console.log(`[${it.category}${it.active ? '' : '/보관'}] ${it.key}: ${it.content}`)
+				if (!hits.length) console.log('검색 결과 없음')
 			} else if (sub === 'add' && rest.length >= 4) {
 				const [, cat, key, ...txt] = rest
-				console.log(JSON.stringify(mgr.applyOps([{ op: 'upsert', category: cat, key, content: txt.join(' ') }], { source: 'cli' })))
+				const res = mgr.applyOps([{ op: 'upsert', category: cat, key, content: txt.join(' ') }], { source: 'cli' })
+				await mgr.flushEmbeddings()
+				console.log(JSON.stringify(res))
 			} else if (sub === 'rm' && rest[1]) {
-				console.log(JSON.stringify(mgr.applyOps([{ op: 'delete', key: rest[1] }], { source: 'cli' })))
+				console.log(JSON.stringify(mgr.applyOps([{ op: 'delete', key: rest[1] }], { source: 'cli', force: true })))
+			} else if ((sub === 'pin' || sub === 'unpin') && rest[1]) {
+				const item = mgr.setPinned(rest[1], sub === 'pin', { source: 'cli' })
+				console.log(item ? `${item.key}: pinned=${item.pinned}` : `찾지 못함: ${rest[1]}`)
+			} else if (sub === 'history') {
+				for (const h of mgr.history(rest[1] ?? null, 20)) {
+					console.log(`#${h.id} ${fmt(h.ts)} [${h.op}/${h.source}] ${h.memory_key}: ${h.new_content ?? h.prev_content ?? ''}`)
+				}
+			} else if (sub === 'restore' && rest[1]) {
+				const res = mgr.restoreVersion(Number(rest[1]), { source: 'cli' })
+				await mgr.flushEmbeddings()
+				console.log(JSON.stringify(res, null, 2))
+			} else if (sub === 'consolidate') {
+				const dry = rest.includes('--dry')
+				const res = mgr.consolidate({ dry })
+				await mgr.flushEmbeddings()
+				console.log(JSON.stringify(res, null, 2))
+			} else if (sub === 'reindex') {
+				const res = await mgr.backfillEmbeddings({ includeArchived: true })
+				console.log(JSON.stringify(res, null, 2))
 			} else {
-				console.log('쓰는 법: memory [list [cat]|search <키워드>|add <cat> <key> <내용>|rm <key>]')
+				console.log('쓰는 법: memory [list [cat]|search <키워드>|add <cat> <key> <내용>|rm <key>|pin <key>|unpin <key>|history [key]|restore <이력번호>|consolidate [--dry]|reindex]')
 			}
+		} finally { st.close() }
+	},
+	learning() {
+		const cfg = loadConfig(), rules = readJson(P.rules, null)?.rules ?? [], rt = readJson(P.runtime, { rules: {} }).rules ?? {}
+		const st = new Store()
+		try {
+			const now = Date.now()
+			const impl = new ImplicitFeedbackTracker({ store: st }).summarize({ sinceMs: now - 14 * 86400000 })
+			const lessons = st.listLessons({ limit: 30 })
+			const exps = st.listExperiments({ limit: 20 })
+			const scores = scoreRules({ rules, runtime: rt, store: st, now })
+			const routines = mineRoutines({ store: st, now })
+			const evals = loadEvalCases()
+			const cands = generateSelfProposals({ store: st, cfg, rules, now })
+			console.log('=== 자가학습 현황 ===')
+			console.log('암묵적 피드백(14일):', JSON.stringify(impl))
+			console.log(`교훈(Playbook) ${lessons.length}건:`)
+			for (const l of lessons) console.log(`  - [${l.scope}] ${l.key} (신뢰 ${l.confidence}, 근거 ${l.evidence_count}): ${l.condition_text} → ${l.rule_text}`)
+			console.log(`실험 원장 ${exps.length}건:`)
+			for (const e of exps) console.log(`  - [${e.status}] ${e.eid} ${e.title}${e.notes ? ` (${e.notes})` : ''}`)
+			console.log('규칙 정밀도 주의:', scores.filter(s => s.grade === 'noisy' || s.grade === 'muted').map(s => `${s.id}(${s.grade})`).join(', ') || '없음')
+			console.log(`루틴 발견: 재실 ${routines.presence_routines.length}건, 기기 ${routines.device_routines.length}건 (재시작 노이즈 ${routines.filtered_restart_events}건 제외)`)
+			console.log(`학습된 회귀 평가 케이스: ${evals.length}건`)
+			console.log(`자가 튜닝 제안 후보: ${cands.length}건`)
+			for (const c of cands) console.log(`  - (${c.kind}) ${c.title}: ${c.summary}`)
+		} finally { st.close() }
+	},
+	routines() {
+		const st = new Store()
+		try { console.log(JSON.stringify(mineRoutines({ store: st, days: Number(rest[0]) || 42 }), null, 2)) } finally { st.close() }
+	},
+	experiments() {
+		const st = new Store()
+		try {
+			if (rest[0] === 'eval') console.log(JSON.stringify(evaluateDueExperiments(st), null, 2))
+			else console.log(JSON.stringify(st.listExperiments({ limit: 30 }), null, 2))
+		} finally { st.close() }
+	},
+	evals() {
+		console.log(JSON.stringify(loadEvalCases(), null, 2))
+	},
+	async 'self-tune'() {
+		const cfg = loadConfig(), rules = readJson(P.rules, null)?.rules ?? []
+		const ipc = rest[0] === 'propose' ? await assistIpc(cfg, 'POST', '/api/learning/propose-self').catch(() => null) : null
+		if (ipc) return console.log(JSON.stringify(ipc, null, 2))
+		const st = new Store()
+		try {
+			const cands = generateSelfProposals({ store: st, cfg, rules })
+			console.log(JSON.stringify(cands, null, 2))
 		} finally { st.close() }
 	},
 	async proposals() {
@@ -419,12 +510,28 @@ const cmds = {
 			try {
 				const st = new Store()
 				const s = st.stats()
+				const memMgr = new MemoryManager({ store: st, cfg })
+				const embStats = memMgr.embeddingStats()
 				st.close()
 				const dbSizeMb = (statSync(P.db).size / (1024 * 1024)).toFixed(2)
 				const walPath = `${P.db}-wal`
 				const walBytes = existsSync(walPath) ? statSync(walPath).size : 0
 				const walMb = (walBytes / (1024 * 1024)).toFixed(2)
-				ok(`SQLite DB 정상 (이벤트 ${s.events}, 기억 ${s.memory_items}, 제안 대기 ${s.proposals_pending}, DB ${dbSizeMb}MB, WAL ${walMb}MB)`)
+				ok(`SQLite DB 정상 (이벤트 ${s.events}, 기억 ${s.memory_items}[고정 ${s.memory_pinned ?? 0}], 교훈 ${s.lessons ?? 0}, 실험 ${s.experiments_active ?? 0}, 롤업 ${s.daily_rollups ?? 0}일/${s.monthly_rollups ?? 0}월, 제안 대기 ${s.proposals_pending}, DB ${dbSizeMb}MB, WAL ${walMb}MB)`)
+				if (embStats.enabled) {
+					try {
+						geminiKey(cfg)
+						if (embStats.active_total > 0 && embStats.active_matching < embStats.active_total) {
+							warn(`기억 임베딩(${embStats.target_model}/${embStats.target_dims}d): ${embStats.active_matching}/${embStats.active_total}건 색인됨 — 'node src/cli.mjs memory reindex' 실행 권장`)
+						} else {
+							ok(`기억 임베딩 정상 (${embStats.target_model}/${embStats.target_dims}d, ${embStats.active_matching}/${embStats.active_total}건)`)
+						}
+					} catch (e) {
+						warn(`기억 임베딩(${embStats.target_model}): Gemini API 키 없음 (${e.message}) — 로컬 폴백 사용 중`)
+					}
+				} else {
+					ok('기억 임베딩: 로컬(local) 모드')
+				}
 				if (walBytes > 10 * 1024 * 1024) warn(`SQLite WAL 파일이 큼 (${walMb}MB): 체크포인트 권장`)
 			} catch (e) { fail(`SQLite DB 오류: ${e.message}`) }
 		} else warn('SQLite DB 미생성 (데몬 시작 시 자동 생성)')
@@ -514,7 +621,9 @@ const cmds = {
 	},
 	stats() {
 		const days = Math.max(1, Number(rest[0]) || 7)
-		const s = rangeStats(days)
+		const st = existsSync(P.db) ? new Store() : null
+		let s
+		try { s = rangeStats(days, Date.now(), { store: st }) } finally { st?.close() }
 		console.log(`=== 최근 ${s.days}일 통계 ===`)
 		console.log(`판단: 전체 ${s.total}회 (실행 ${s.real}, 건너뜀 ${s.skipped}, 미룸 ${s.deferred}, 실패 ${s.errors})`)
 		console.log(`빈 호출(알림·행동·규칙변경 없음): ${s.noop}회 (${s.noop_pct}%)`)
@@ -539,14 +648,15 @@ const cmds = {
 	async 'bench-assist'() {
 		const { benchAssist, DEFAULT_MODELS, DEFAULT_CASES } = await import('./bench-assist.mjs')
 		const models = [], texts = []
-		let repeat = 1
+		let repeat = 1, includeLearned = false
 		for (let i = 0; i < rest.length; i++) {
 			if (rest[i] === '--repeat') repeat = Math.max(1, Number(rest[++i]) || 1)
+			else if (rest[i] === '--learned') includeLearned = true
 			else if (rest[i] === '--case') texts.push(rest[++i])
 			else models.push(rest[i])
 		}
 		const cases = texts.length ? texts.map(t => DEFAULT_CASES.find(c => c.text === t) ?? { text: t, expect: null }) : DEFAULT_CASES
-		await benchAssist({ cfg: loadConfig(), models: models.length ? models : DEFAULT_MODELS, cases, repeat })
+		await benchAssist({ cfg: loadConfig(), models: models.length ? models : DEFAULT_MODELS, cases, includeLearned, repeat })
 		process.exit(0)
 	},
 	async once() {
@@ -564,7 +674,7 @@ const cmds = {
 }
 
 if (!cmds[cmd]) {
-	console.log('명령: status | policy | rules | log [n] | notes [YYYY-MM-DD] | actions [n] | memory [list|search|add|rm] | proposals [list|show|approve|reject|rollback] | audit | traces [id] | assist <말> | stats [일수] | doctor | weekly [list|run|publish|YYYY-MM-DD] | wake [이유] | say <말> | brain [codex|api|agy|gemini|default] | pause | resume | send-on | send-off | history | restore <파일> | runs [n] | replay [이름|latest] [codex|api|agy|gemini] | oob-test | once [bootstrap|hourly|weekly|manual] [이유] | bench-assist [provider:model[:effort] ...] [--repeat N] [--case 말]')
+	console.log('명령: status | policy | rules | log [n] | notes [YYYY-MM-DD] | actions [n] | memory [list|search|add|rm|pin|unpin|history|restore|consolidate] | learning | routines [일수] | experiments [eval] | evals | self-tune [propose] | proposals [list|show|approve|reject|rollback] | audit | traces [id] | assist <말> | stats [일수] | doctor | weekly [list|run|publish|YYYY-MM-DD] | wake [이유] | say <말> | brain [codex|api|agy|gemini|default] | pause | resume | send-on | send-off | history | restore <파일> | runs [n] | replay [이름|latest] [codex|api|agy|gemini] | oob-test | once [bootstrap|hourly|weekly|manual] [이유] | bench-assist [provider:model[:effort] ...] [--repeat N] [--learned] [--case 말]')
 	process.exit(cmd ? 1 : 0)
 }
 await cmds[cmd]()

@@ -3,7 +3,8 @@ import { createServer } from 'node:http'
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
-import { expandHome, log } from '../util.mjs'
+import { expandHome, log, DAY } from '../util.mjs'
+import { mineRoutines, scoreRules, generateSelfProposals, loadEvalCases, evaluateExperiment, evaluateDueExperiments } from '../engine/learning.mjs'
 
 const MAX_BODY = 256 * 1024
 const MAX_AUDIO_BODY = 10 * 1024 * 1024
@@ -161,7 +162,9 @@ pre{background:#0b1220;padding:10px;border-radius:8px;overflow:auto;font-size:12
 <nav>
   <button id="t-chat" class="active" onclick="tab('chat')">Assist 채팅</button>
   <button id="t-prop" onclick="tab('prop')">승인/제안 큐</button>
-  <button id="t-sys" onclick="tab('sys')">상태·정책·메모리</button>
+  <button id="t-mem" onclick="tab('mem')">메모리 관리</button>
+  <button id="t-learn" onclick="tab('learn')">자가학습·실험</button>
+  <button id="t-sys" onclick="tab('sys')">상태·정책</button>
 </nav>
 <main>
   <section id="p-chat" class="card">
@@ -177,10 +180,52 @@ pre{background:#0b1220;padding:10px;border-radius:8px;overflow:auto;font-size:12
   </section>
   <section id="p-prop" class="card hidden">
     <div class="row" style="justify-content:space-between;margin-bottom:8px">
-      <strong>HA 관리 제안 (Tier 2 승인·롤백)</strong>
+      <strong>HA 관리 · 자가 튜닝 제안 (Tier 2 승인·롤백)</strong>
       <button class="sec" onclick="loadProposals()">새로고침</button>
     </div>
     <div id="propList" class="muted">토큰을 입력하면 목록이 표시됩니다.</div>
+  </section>
+  <section id="p-mem" class="card hidden">
+    <div class="row" style="justify-content:space-between;margin-bottom:10px">
+      <strong>구조화 장기 기억 관리 (고정·만료·이력·의미 검색)</strong>
+      <div class="row">
+        <button class="sec" onclick="reindexMem()">임베딩 재색인</button>
+        <button class="sec" onclick="consolidateMem()">기억 통합 정리</button>
+        <button class="sec" onclick="loadMemory()">새로고침</button>
+      </div>
+    </div>
+    <form class="row" style="margin-bottom:10px" onsubmit="event.preventDefault();loadMemory()">
+      <input id="mSearch" placeholder="하이브리드 의미 검색 (예: 전원 복구, 욕실 배기팬...)" style="flex:1">
+      <label class="muted" style="display:flex;align-items:center;gap:4px"><input id="mArch" type="checkbox" onchange="loadMemory()">보관함 포함</label>
+      <button type="submit" class="sec">검색</button>
+      <button type="button" class="sec" onclick="document.getElementById('mSearch').value='';loadMemory()">초기화</button>
+    </form>
+    <form class="row" style="margin-bottom:10px" onsubmit="addMemory(event)">
+      <select id="mCat" style="background:#0b1220;color:var(--fg);border:1px solid var(--line);border-radius:8px;padding:6px">
+        <option value="standing_order">지시사항</option>
+        <option value="preference">선호</option>
+        <option value="pattern">패턴</option>
+        <option value="incident">장애·임시</option>
+        <option value="rejection">거절</option>
+      </select>
+      <input id="mKey" placeholder="키(영문_밑줄)" size="16" required>
+      <input id="mContent" placeholder="기억할 내용(한국어)" style="flex:1" required>
+      <input id="mTtl" type="number" placeholder="만료일" style="width:74px" min="0">
+      <label class="muted" style="display:flex;align-items:center;gap:4px"><input id="mPin" type="checkbox">고정</label>
+      <button type="submit">저장</button>
+    </form>
+    <div id="memHygiene" class="muted" style="margin-bottom:8px"></div>
+    <div id="memList" class="muted">토큰을 입력하면 목록이 표시됩니다.</div>
+  </section>
+  <section id="p-learn" class="card hidden">
+    <div class="row" style="justify-content:space-between;margin-bottom:10px">
+      <strong>자가학습 · 교훈(Playbook) · 사후 검증 실험</strong>
+      <div class="row">
+        <button class="sec" onclick="proposeSelf()">자가 튜닝 후보 제안 등록</button>
+        <button class="sec" onclick="loadLearning()">새로고침</button>
+      </div>
+    </div>
+    <div id="learnOut" class="muted">토큰을 입력하면 학습 현황이 표시됩니다.</div>
   </section>
   <section id="p-sys" class="card hidden">
     <div class="row" style="margin-bottom:10px">
@@ -194,7 +239,7 @@ pre{background:#0b1220;padding:10px;border-radius:8px;overflow:auto;font-size:12
 let convId = sessionStorage.getItem('haagent_conv') || '';
 const tokInput = document.getElementById('tok');
 tokInput.value = sessionStorage.getItem('haagent_tok') || '';
-function saveTok(){ sessionStorage.setItem('haagent_tok', tokInput.value.trim()); loadProposals(); loadSys(); }
+function saveTok(){ sessionStorage.setItem('haagent_tok', tokInput.value.trim()); loadProposals(); loadMemory(); loadLearning(); loadSys(); }
 async function api(path, opt = {}) {
   const t = tokInput.value.trim() || sessionStorage.getItem('haagent_tok') || '';
   const r = await fetch(path, { ...opt, headers: { 'content-type': 'application/json', 'authorization': 'Bearer ' + t, ...(opt.headers || {}) } });
@@ -203,11 +248,13 @@ async function api(path, opt = {}) {
   return j;
 }
 function tab(name){
-  for (const k of ['chat','prop','sys']) {
+  for (const k of ['chat','prop','mem','learn','sys']) {
     document.getElementById('p-'+k).classList.toggle('hidden', k !== name);
     document.getElementById('t-'+k).classList.toggle('active', k === name);
   }
   if (name === 'prop') loadProposals();
+  if (name === 'mem') loadMemory();
+  if (name === 'learn') loadLearning();
   if (name === 'sys') loadSys();
 }
 function addMsg(role, text){
@@ -301,7 +348,93 @@ async function toggleMic(){
     infoEl.textContent = '듣고 있어요... 다시 누르면 전송합니다.';
   } catch (err) { infoEl.textContent = '마이크 오류: ' + err.message; }
 }
-const ROLLBACK_KINDS = new Set(['automation_upsert','automation_delete','automation_toggle','script_upsert','script_delete','promote_rule']);
+const ROLLBACK_KINDS = new Set(['automation_upsert','automation_delete','automation_toggle','script_upsert','script_delete','promote_rule','self_alias_proposal','self_noise_proposal','self_stt_tune','self_lesson_proposal']);
+async function loadMemory(){
+  try {
+    const q = (document.getElementById('mSearch')?.value || '').trim();
+    const arch = document.getElementById('mArch')?.checked ? '1' : '';
+    const qs = new URLSearchParams();
+    if (q) qs.set('q', q);
+    if (arch) qs.set('archived', '1');
+    const data = await api('/api/memory' + (qs.toString() ? '?' + qs.toString() : ''));
+    const hy = document.getElementById('memHygiene');
+    const emb = data.embedding;
+    const embText = emb ? ('임베딩: ' + (emb.target_model || 'local') + (emb.target_dims ? '/' + emb.target_dims + 'd' : '') + ' (' + (emb.active_matching ?? emb.matching_target ?? 0) + '/' + (emb.active_total ?? emb.total ?? 0) + ')') : '';
+    const parts = [];
+    if (embText) parts.push(embText);
+    if (data.hygiene && data.hygiene.length) parts.push('정리 힌트: ' + data.hygiene.join(' | '));
+    hy.textContent = parts.join(' · ');
+    const box = document.getElementById('memList');
+    box.textContent = '';
+    if (!data.items || !data.items.length) {
+      const empty = document.createElement('div'); empty.className = 'muted'; empty.textContent = q ? '검색 결과가 없습니다.' : '등록된 구조화 기억이 없습니다.';
+      box.appendChild(empty); return;
+    }
+    for (const it of data.items) {
+      const d = document.createElement('div'); d.className = 'card';
+      const hdr = document.createElement('div'); hdr.className = 'row'; hdr.style.justifyContent = 'space-between';
+      const left = document.createElement('b');
+      left.textContent = (it.pinned ? '📌 ' : '') + '[' + it.category + '] ' + it.key;
+      const meta = document.createElement('span'); meta.className = 'muted';
+      const exp = it.expires_at ? ('만료 ' + new Date(it.expires_at).toLocaleDateString('ko-KR')) : '무기한';
+      meta.textContent = '우선 ' + (it.priority || 3) + ' · 조회 ' + (it.hit_count || 0) + ' · ' + exp;
+      hdr.append(left, meta);
+      const body = document.createElement('p'); body.textContent = it.content;
+      const btns = document.createElement('div'); btns.className = 'row';
+      const bPin = document.createElement('button'); bPin.className = 'sec'; bPin.textContent = it.pinned ? '고정 해제' : '고정';
+      bPin.onclick = async () => { await api('/api/memory/' + encodeURIComponent(it.key) + '/pin', { method: 'POST', body: JSON.stringify({ pinned: !it.pinned }) }); loadMemory(); };
+      const bDel = document.createElement('button'); bDel.className = 'bad'; bDel.textContent = '삭제';
+      bDel.onclick = async () => { await api('/api/memory/' + encodeURIComponent(it.key), { method: 'DELETE' }); loadMemory(); };
+      btns.append(bPin, bDel);
+      d.append(hdr, body, btns); box.appendChild(d);
+    }
+  } catch (err) { document.getElementById('memList').textContent = '불러오기 실패: ' + err.message; }
+}
+async function addMemory(e){
+  e.preventDefault();
+  const ttlRaw = document.getElementById('mTtl').value;
+  await api('/api/memory', {
+    method: 'POST',
+    body: JSON.stringify({
+      category: document.getElementById('mCat').value,
+      key: document.getElementById('mKey').value.trim(),
+      content: document.getElementById('mContent').value.trim(),
+      ttl_days: ttlRaw === '' ? null : Number(ttlRaw),
+      pinned: document.getElementById('mPin').checked
+    })
+  });
+  document.getElementById('mKey').value = '';
+  document.getElementById('mContent').value = '';
+  document.getElementById('mTtl').value = '';
+  document.getElementById('mPin').checked = false;
+  loadMemory();
+}
+async function consolidateMem(){
+  await api('/api/memory/consolidate', { method: 'POST' });
+  loadMemory();
+}
+async function reindexMem(){
+  const r = await api('/api/memory/reindex', { method: 'POST' });
+  alert('임베딩 재색인 완료 (' + r.model + '): 갱신 ' + r.updated + '건 / 스킵 ' + r.skipped + '건 / 실패 ' + r.failed + '건');
+  loadMemory();
+}
+async function loadLearning(){
+  try {
+    const d = await api('/api/learning');
+    const box = document.getElementById('learnOut');
+    box.textContent = '';
+    const pre = document.createElement('pre');
+    pre.textContent = JSON.stringify(d, null, 2);
+    box.appendChild(pre);
+  } catch (err) { document.getElementById('learnOut').textContent = '불러오기 실패: ' + err.message; }
+}
+async function proposeSelf(){
+  try {
+    const r = await api('/api/learning/propose-self', { method: 'POST' });
+    loadProposals(); loadLearning();
+    alert('자가 튜닝 제안 등록: ' + (r.created ? r.created.length : 0) + '건');
+  } catch (err) { alert('실패: ' + err.message); }
+}
 async function loadProposals(){
   try {
     const { proposals } = await api('/api/proposals');
@@ -571,13 +704,116 @@ export class AssistServer {
 		}
 		if (method === 'GET' && path === '/api/memory') {
 			const q = url.searchParams.get('q')
-			const items = q ? this.agent.memoryMgr.search(q) : this.agent.memoryMgr.list()
-			return sendJson(res, 200, { legacy: this.agent.memoryMgr.readLegacy(), items })
+			const includeArchived = url.searchParams.get('archived') === '1'
+			const rawItems = q
+				? await this.agent.memoryMgr.searchAsync(q, null, { includeArchived })
+				: this.agent.memoryMgr.list(null, { includeArchived })
+			const items = rawItems.map(({ embedding, ...rest }) => rest)
+			return sendJson(res, 200, {
+				legacy: this.agent.memoryMgr.readLegacy(),
+				items,
+				embedding: this.agent.memoryMgr.embeddingStats(),
+				hygiene: this.agent.memoryMgr.hygieneHints(this.agent.clock()),
+				history: this.agent.memoryMgr.history(null, 20),
+			})
+		}
+		if (method === 'POST' && path === '/api/memory/reindex') {
+			return sendJson(res, 200, await this.agent.memoryMgr.backfillEmbeddings({ includeArchived: true }))
+		}
+		if (method === 'POST' && path === '/api/memory') {
+			const body = await readJsonBody(req)
+			if (!body.key || !body.content) return sendJson(res, 400, { error: 'key와 content가 필요하다' })
+			const r = this.agent.memoryMgr.applyOps([{
+				op: 'upsert',
+				category: body.category || 'preference',
+				key: body.key,
+				content: body.content,
+				...(body.ttl_days !== undefined ? { ttl_days: body.ttl_days } : {}),
+				...(body.pinned !== undefined ? { pinned: Boolean(body.pinned) } : {}),
+				...(body.priority !== undefined ? { priority: Number(body.priority) } : {}),
+				...(Array.isArray(body.entity_ids) ? { entity_ids: body.entity_ids } : {}),
+			}], { source: 'console', now: this.agent.clock() })
+			return sendJson(res, 200, { ok: true, ...r })
+		}
+		if (method === 'POST' && path === '/api/memory/consolidate') {
+			return sendJson(res, 200, this.agent.memoryMgr.consolidate({ now: this.agent.clock() }))
+		}
+		const memRestore = /^\/api\/memory\/restore\/(\d+)$/.exec(path)
+		if (method === 'POST' && memRestore) {
+			const r = this.agent.memoryMgr.restoreVersion(Number(memRestore[1]), { source: 'console', now: this.agent.clock() })
+			return sendJson(res, r.ok ? 200 : 400, r)
+		}
+		const memPin = /^\/api\/memory\/([^/]+)\/pin$/.exec(path)
+		if (method === 'POST' && memPin) {
+			const body = await readJsonBody(req)
+			const key = decodeURIComponent(memPin[1])
+			const item = this.agent.memoryMgr.setPinned(key, Boolean(body.pinned), { source: 'console', now: this.agent.clock() })
+			if (!item) return sendJson(res, 404, { error: `기억을 찾지 못함: ${key}` })
+			const { embedding, ...clean } = item
+			return sendJson(res, 200, { ok: true, item: clean })
+		}
+		const memHist = /^\/api\/memory\/([^/]+)\/history$/.exec(path)
+		if (method === 'GET' && memHist) {
+			return sendJson(res, 200, { history: this.agent.memoryMgr.history(decodeURIComponent(memHist[1]), 30) })
+		}
+		const memDel = /^\/api\/memory\/([^/]+)$/.exec(path)
+		if (method === 'DELETE' && memDel) {
+			const key = decodeURIComponent(memDel[1])
+			const r = this.agent.memoryMgr.applyOps([{ op: 'delete', key }], { source: 'console', force: true, now: this.agent.clock() })
+			return sendJson(res, 200, { ok: r.deleted.length > 0, ...r })
+		}
+
+		if (method === 'GET' && path === '/api/learning') {
+			const now = this.agent.clock()
+			const st = this.agent.store
+			return sendJson(res, 200, {
+				lessons: st ? st.listLessons({ limit: 50 }) : [],
+				experiments: st ? st.listExperiments({ limit: 30 }) : [],
+				implicit_feedback: this.agent.implicitFeedback?.summarize({ sinceMs: now - 14 * DAY }) ?? { total: 0, by_kind: {}, top_entities: [] },
+				rule_scorecard: scoreRules({ rules: this.agent.engine.rules, runtime: this.agent.runtime.rules, store: st, now }),
+				routines: mineRoutines({ store: st, now, isNoise: this.agent.isNoise }),
+				eval_cases: loadEvalCases(),
+				self_proposal_candidates: generateSelfProposals({ store: st, cfg: this.agent.cfg, rules: this.agent.engine.rules, states: this.agent.states, now }),
+				rollups: st ? { daily: st.listDailyRollups(14).length, monthly: st.listMonthlyRollups(12) } : null,
+			})
+		}
+		if (method === 'POST' && path === '/api/lessons') {
+			if (!this.agent.store) return sendJson(res, 400, { error: '저장소 없음' })
+			const body = await readJsonBody(req)
+			if (!body.key || !body.condition_text || !body.rule_text) return sendJson(res, 400, { error: 'key, condition_text, rule_text 필수' })
+			const item = this.agent.store.upsertLesson({ ...body, source: 'console', now: this.agent.clock() })
+			return sendJson(res, 200, { ok: true, lesson: item })
+		}
+		const lesDel = /^\/api\/lessons\/([^/]+)$/.exec(path)
+		if (method === 'DELETE' && lesDel) {
+			if (!this.agent.store) return sendJson(res, 400, { error: '저장소 없음' })
+			const r = this.agent.store.deleteLesson(decodeURIComponent(lesDel[1]), { source: 'console', force: true, now: this.agent.clock() })
+			return sendJson(res, r.ok ? 200 : 404, r)
+		}
+		if (method === 'POST' && path === '/api/learning/propose-self') {
+			const now = this.agent.clock()
+			const cands = generateSelfProposals({ store: this.agent.store, cfg: this.agent.cfg, rules: this.agent.engine.rules, states: this.agent.states, now })
+			const created = [], failed = []
+			for (const c of cands) {
+				const r = await this.agent.createAndNotifyProposal(c)
+				if (r.ok) created.push(r.proposal)
+				else failed.push({ title: c.title, error: r.error })
+			}
+			return sendJson(res, 200, { ok: true, created, failed })
+		}
+		const expEval = /^\/api\/experiments\/([^/]+)\/evaluate$/.exec(path)
+		if (method === 'POST' && expEval) {
+			if (!this.agent.store) return sendJson(res, 400, { error: '저장소 없음' })
+			const eid = decodeURIComponent(expEval[1])
+			const r = eid === 'due'
+				? evaluateDueExperiments(this.agent.store, this.agent.clock())
+				: evaluateExperiment(this.agent.store, eid, this.agent.clock())
+			return sendJson(res, 200, { ok: true, result: r })
 		}
 		if (method === 'GET' && path === '/api/stats') {
 			const { rangeStats } = await import('../records.mjs')
 			const days = Math.max(1, Number(url.searchParams.get('days')) || 7)
-			return sendJson(res, 200, rangeStats(days, this.agent.clock()))
+			return sendJson(res, 200, rangeStats(days, this.agent.clock(), { store: this.agent.store }))
 		}
 		if (method === 'GET' && path === '/api/proposals') {
 			const status = url.searchParams.get('status') || null

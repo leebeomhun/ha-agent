@@ -3,6 +3,7 @@
 import { test, after } from 'node:test'
 import assert from 'node:assert/strict'
 import { EventEmitter } from 'node:events'
+import { spawnSync } from 'node:child_process'
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync, existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -12,7 +13,7 @@ process.env.HAAGENT_DATA_DIR = TMP
 after(() => rmSync(TMP, { recursive: true, force: true }))
 
 const { mergeConfig, saveControl } = await import('../src/config.mjs')
-const { P, writeJson } = await import('../src/util.mjs')
+const { P, ROOT, writeJson } = await import('../src/util.mjs')
 const { PolicyEngine } = await import('../src/core/policy.mjs')
 const { Store } = await import('../src/core/store.mjs')
 const { AnomalyEngine } = await import('../src/engine/anomaly.mjs')
@@ -388,4 +389,145 @@ test('9. 이상탐지: 5분마다 지금 값을 표본으로 쌓고, 지난 기�
 		assert.equal(check(1000), 0, '본 적 있는 값')
 		assert.equal(check(1500), 1, '본 적 없는 값')
 	} finally { store.close() }
+})
+
+test('10. 마지막 판단(lastRun): SQLite 단일 원본, Assist·skipped·deferred 분리 및 즉시 heartbeat 반영', async () => {
+	cleanState()
+	// 1) Store.latestDecision 필터 및 정렬(ts DESC, id DESC)
+	const dir = mkdtempSync(join(TMP, 'dec-'))
+	const store = new Store(join(dir, 'd.db'))
+	try {
+		store.recordDecision({ ts: new Date(T0).toISOString(), reasons: ['hourly'], brain: 'codex', total_ms: 1000, summary: '정각 1' })
+		store.recordDecision({ ts: new Date(T0).toISOString(), reasons: ['manual'], brain: 'codex', total_ms: 1200, summary: '동시각 나중 ID' })
+		store.recordDecision({ ts: new Date(T0 + 1000).toISOString(), reasons: ['hourly'], brain: 'codex', total_ms: 50, summary: '건너뜀', skipped: true })
+		store.recordDecision({ ts: new Date(T0 + 2000).toISOString(), reasons: ['rule:door'], brain: 'codex', total_ms: 50, summary: '미룸', deferred: true })
+		store.recordDecision({ ts: new Date(T0 + 3000).toISOString(), reasons: ['assist'], brain: 'api', total_ms: 300, summary: '어시스트 1' })
+
+		assert.equal(store.latestDecision().summary, '어시스트 1')
+		assert.equal(store.latestDecision({ onlyAssist: true }).summary, '어시스트 1')
+		assert.equal(store.latestDecision({ excludeAssist: true }).summary, '미룸')
+		assert.equal(store.latestDecision({ excludeAssist: true, excludeDeferred: true }).summary, '건너뜀')
+		assert.equal(store.latestDecision({ excludeAssist: true, excludeSkipped: true, excludeDeferred: true }).summary, '동시각 나중 ID')
+		assert.equal(store.latestDecision({ excludeAssist: true, onlyAssist: true }), null)
+	} finally { store.close() }
+
+	// 2~7) Agent cycle, skipped/deferred, Assist fast/llm, 재시작 복구, cli status, 실패 cycle
+	cleanState()
+	let now = T0
+	let failBrain = false
+	const ha = new MockHA([st('light.a', 'off', { friendly_name: '거실 불' }, T0 - 60 * MIN)])
+	ha.beats = []
+	ha.heartbeat = async d => { ha.beats.push(d) }
+	const origCallSvc = ha.callService.bind(ha)
+	let failWeather = false
+	ha.callService = async (domain, service, opts) => {
+		if (domain === 'weather' && failWeather) { ha.connected = false; throw new Error('응답 없음') }
+		return origCallSvc(domain, service, opts)
+	}
+	const cfg = mergeConfig({
+		heartbeat: { enabled: true, interval_seconds: 60 },
+		hourly_skip_unchanged: true,
+		active_hours: { start: 7, end: 23 },
+		llm: { routes: { assist: 'api' } },
+		assist: { fast_path: true, model: 'gpt-6-luna', effort: 'low' },
+		actions: { enabled: true, verify_seconds: 1 },
+		policy: { tier1_auto: ['light.a'] },
+	})
+	const brain = async a => {
+		if (a.customSchema) return { result: { speech: 'LLM 어시스트 응답이에요.', continue_conversation: false }, ms: 5, tokens: 12 }
+		if (failBrain) throw new Error('모델 응답 오류')
+		return { result: answer({ summary: '정각 점검 정상 요약' }), ms: 5, tokens: 10 }
+	}
+	let agent = new Agent({ cfg, ha, clock: () => now, canUse: () => true, brain })
+	agent.attach()
+	ha.emit('ready', [...ha.map.values()])
+	try {
+		// 2) 실제 cycle() -> lastRun 갱신 및 즉시 heartbeat 전송
+		const e1 = await agent.cycle([{ type: 'hourly', hour: 12 }])
+		await flush()
+		assert.equal(e1.summary, '정각 점검 정상 요약')
+		assert.equal(agent.lastRun.summary, '정각 점검 정상 요약')
+		assert.equal(ha.beats.length, 1)
+		assert.equal(ha.beats[0].last_summary, '정각 점검 정상 요약')
+		assert.equal(ha.beats[0].last_run, '2026-11-20 12:00')
+		assert.equal(ha.beats[0].last_ok, true)
+
+		// 3) skipped 및 deferred cycle -> 기록은 되지만 lastRun/heartbeat 덮어쓰지 않음
+		now += 60 * MIN
+		const eSkip = await agent.cycle([{ type: 'hourly', hour: 13 }])
+		await flush()
+		assert.equal(eSkip.skipped, true)
+		assert.equal(agent.lastRun.summary, '정각 점검 정상 요약')
+		assert.equal(ha.beats.length, 1)
+
+		now += 2 * MIN
+		failWeather = true
+		const eDef = await agent.cycle([{ type: 'manual', reason: '연결 끊김 시험' }])
+		await flush()
+		failWeather = false
+		ha.connected = true
+		assert.equal(eDef.deferred, true)
+		assert.equal(agent.lastRun.summary, '정각 점검 정상 요약')
+		assert.equal(ha.beats.length, 1)
+		const stored = agent.store.decisionsInRange(0)
+		assert.ok(stored.some(d => d.skipped), 'skipped도 DB에는 기록됨')
+		assert.ok(stored.some(d => d.deferred), 'deferred도 DB에는 기록됨')
+
+		// 4) Assist 빠른 경로·LLM 경로 -> lastAssist만 갱신, lastRun/heartbeat last_summary 유지
+		now += 2 * MIN
+		const fastRes = await agent.handleAssist({ text: '거실 불 켜줘', conversationId: 'c1' })
+		assert.equal(fastRes.meta.path, 'fast')
+		assert.equal(agent.lastAssist.summary, '거실 불을 켰어요.')
+		assert.equal(agent.lastRun.summary, '정각 점검 정상 요약')
+
+		now += 2 * MIN
+		const llmRes = await agent.handleAssist({ text: '지금 집 상태 알려줘', conversationId: 'c1' })
+		assert.equal(llmRes.meta.path, 'llm')
+		assert.equal(agent.lastAssist.summary, 'LLM 어시스트 응답이에요.')
+		assert.equal(agent.lastRun.summary, '정각 점검 정상 요약')
+
+		agent.notifier.heartbeat(now, { force: true })
+		await flush()
+		assert.equal(ha.beats.at(-1).last_summary, '정각 점검 정상 요약')
+		assert.equal(ha.beats.at(-1).last_run, '2026-11-20 12:00')
+		assert.equal(ha.beats.at(-1).last_assist_summary, 'LLM 어시스트 응답이에요.')
+		assert.equal(ha.beats.at(-1).last_assist_run, '2026-11-20 13:06')
+
+		// 5) JSONL 삭제 후 재시작해도 SQLite에서 lastRun과 lastAssist 복원
+		agent.stop()
+		rmSync(P.decisions, { force: true })
+		agent = new Agent({ cfg, ha: new MockHA([st('light.a', 'on', { friendly_name: '거실 불' })]), clock: () => now, canUse: () => true })
+		assert.equal(agent.lastRun.summary, '정각 점검 정상 요약')
+		assert.equal(agent.lastAssist.summary, 'LLM 어시스트 응답이에요.')
+		assert.equal(agent.statusSummary().last_run.summary, '정각 점검 정상 요약')
+		assert.equal(agent.statusSummary().last_assist.summary, 'LLM 어시스트 응답이에요.')
+		agent.stop()
+		agent = null
+
+		// 7) cli.mjs status도 SQLite 원본에서 마지막 판단과 마지막 Assist를 분리 표시
+		const cli = spawnSync(process.execPath, ['src/cli.mjs', 'status'], {
+			cwd: ROOT, env: { ...process.env, HAAGENT_DATA_DIR: TMP }, encoding: 'utf8',
+		})
+		assert.equal(cli.status, 0, cli.stderr)
+		assert.match(cli.stdout, /마지막 판단 .*정각 점검 정상 요약/)
+		assert.match(cli.stdout, /마지막 Assist .*LLM 어시스트 응답이에요\./)
+
+		// 6) 실패한 cycle() -> lastRun 갱신 및 heartbeat last_ok=false, '실패: ...' 전송
+		const ha2 = new MockHA([st('light.a', 'on', { friendly_name: '거실 불' })])
+		ha2.beats = []
+		ha2.heartbeat = async d => { ha2.beats.push(d) }
+		failBrain = true
+		now += 5 * MIN
+		agent = new Agent({ cfg, ha: ha2, clock: () => now, canUse: () => true, brain })
+		agent.attach()
+		ha2.emit('ready', [...ha2.map.values()])
+		const eFail = await agent.cycle([{ type: 'manual', reason: '실패 시험' }])
+		await flush()
+		assert.match(eFail.error, /모델 응답 오류/)
+		assert.match(agent.lastRun.error, /모델 응답 오류/)
+		assert.equal(ha2.beats.at(-1).last_ok, false)
+		assert.match(ha2.beats.at(-1).last_summary, /^실패: 모델 응답 오류/)
+	} finally {
+		agent?.stop()
+	}
 })

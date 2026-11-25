@@ -9,6 +9,7 @@ import { Store } from './core/store.mjs'
 import { PolicyEngine } from './core/policy.mjs'
 import { matchFastCommand } from './orchestrator/assist-context.mjs'
 import { normalizeMode, selfCheck } from './brain.mjs'
+import { loadEvalCases } from './engine/learning.mjs'
 import { P, expandHome, kst } from './util.mjs'
 
 export const DEFAULT_MODELS = [
@@ -91,7 +92,15 @@ async function connectHa(cfg, policy) {
 	return { ha, list }
 }
 
-export async function benchAssist({ cfg, models = DEFAULT_MODELS, cases = DEFAULT_CASES, repeat = 1, out = console.log } = {}) {
+export function mergedBenchCases({ includeLearned = false, baseCases = DEFAULT_CASES } = {}) {
+	if (!includeLearned) return baseCases
+	const learned = loadEvalCases().map(c => ({ text: c.text, expect: Array.isArray(c.expect) ? c.expect : null, learned: true, source: c.source }))
+	const seen = new Set(baseCases.map(c => c.text.replace(/\s+/g, '').toLowerCase()))
+	return [...baseCases, ...learned.filter(c => !seen.has(c.text.replace(/\s+/g, '').toLowerCase()))]
+}
+
+export async function benchAssist({ cfg, models = DEFAULT_MODELS, cases = DEFAULT_CASES, includeLearned = false, repeat = 1, out = console.log } = {}) {
+	cases = includeLearned ? mergedBenchCases({ includeLearned: true, baseCases: cases }) : cases
 	const specs = models.map(parseModelSpec)
 	const bcfg = structuredClone(cfg)
 	bcfg.assist = { ...bcfg.assist, fast_path: false, deep: null }

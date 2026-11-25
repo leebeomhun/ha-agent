@@ -260,10 +260,16 @@ export function buildPrompt(x) {
 	sec('예약된 깨움', x.schedule.length ? x.schedule.map(w => `- ${fmt(Date.parse(w.at))} ${w.reason}`).join('\n') : '(없음)')
 	if (x.rejected?.length) sec('지난 답에서 거절된 변경 (고쳐서 다시 내도 된다)', x.rejected.map(r => `- ${JSON.stringify(r)}`).join('\n'))
 	sec('메모', x.memory.trim() || '(비어 있음)')
+	if (x.lessons?.trim()) sec('학습된 교훈 (Playbook — 반드시 준수)', x.lessons.trim())
+	if (x.memoryHygiene?.length) sec('기억 정리 힌트 (reflection 참고)', x.memoryHygiene.map(l => `- ${l}`).join('\n'))
 	if (x.assistHistory?.length) {
 		sec('최근 24시간 HA Assist 대화', x.assistHistory.map(m => `- ${fmt(m.ts)} [${m.role === 'user' ? '사용자' : '비서'}] ${String(m.text ?? '').replace(/\s+/g, ' ').slice(0, 160)}`).join('\n'))
 	}
 	if (x.metrics) sec('지난 7일 지표', Object.entries(x.metrics).map(([k, v]) => `${k}=${v}`).join(', '))
+	if (x.learningDigest?.trim()) sec('자가학습 분석 요약 (암묵적 피드백·규칙 정밀도·루틴·실험·자가튜닝 후보)', x.learningDigest.trim())
+	if (x.repairFeedback?.length) {
+		sec('직전 제안 사전 검증 오류 (이번 차례에서 고쳐서 다시 제출할 것)', x.repairFeedback.map(e => `- ${e.title}: ${e.error}`).join('\n'))
+	}
 
 	const recent = changeLines(x.ring.filter(c => x.now - c.t < 2 * 3600000), globs(x.noise))
 	sec('최근 2시간 주요 상태 변화', recent.length ? recent.join('\n') : '(없음)')

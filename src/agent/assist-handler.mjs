@@ -4,8 +4,9 @@ import { join } from 'node:path'
 import { runBrain, brainSettings, normalizeMode } from '../brain.mjs'
 import { loadControl } from '../config.mjs'
 import { buildDirectory, buildAssistInstructions, buildDynamicContext, withDynamicContext, matchFastCommand, controlSpeech, wantsDeep, modelFitsProvider, claimsUnexecutedControl, DEFAULT_DEEP_KEYWORDS } from '../orchestrator/assist-context.mjs'
+import { hasMemorySignal, extractMemoryFromTurn } from '../core/memory-extractor.mjs'
 import { cleanSpeechForTts, isWavBuffer, pcmToWav, parsePcmParams, wavStats, MAX_STT_VOCAB } from '../voice/gemini-voice.mjs'
-import { P, appendJsonl, kst, log } from '../util.mjs'
+import { P, kst, log } from '../util.mjs'
 
 const iso = ms => new Date(ms).toISOString()
 const dbText = v => (v == null ? '?' : Number.isFinite(v) ? `${v}dBFS` : '무음')
@@ -39,6 +40,33 @@ const ASSIST_SCHEMA = {
 export class AssistHandler {
 	constructor(agent) {
 		this.agent = agent
+		this.lastExtractPromise = null
+	}
+
+	#schedulePostTurnExtract({ text, speech, usedMode, usedModel, now }) {
+		const ag = this.agent
+		if (ag.dry || !ag.store || ag.cfg.memory?.post_turn_extract === false) return
+		if (!hasMemorySignal(text)) return
+		const existingKeys = ag.memoryMgr.list(null, { now }).map(m => m.key)
+		const p = extractMemoryFromTurn({
+			text,
+			assistantText: speech,
+			now,
+			cfg: ag.cfg,
+			llmRouter: ag.brain === runBrain ? ag.llmRouter : null,
+			existingKeys,
+			mode: usedMode,
+			model: usedModel,
+		}).then(ops => {
+			if (!ops?.length) return []
+			const res = ag.memoryMgr.applyOps(ops, { source: 'extractor', now })
+			if (res.upserted.length) log(`Post-Turn 기억 자동 저장: ${res.upserted.join(', ')}`)
+			return res.upserted
+		}).catch(e => {
+			log('Post-Turn 기억 추출 실패:', e.message)
+			return []
+		})
+		this.lastExtractPromise = p
 	}
 
 	voiceHints() {
@@ -225,8 +253,8 @@ export class AssistHandler {
 	recordAssistDecision(dec) {
 		const a = this.agent
 		if (a.dry) return
-		appendJsonl(P.decisions, dec)
-		a.store?.recordDecision(dec)
+		a.lastAssist = dec
+		a.journal.decision(dec)
 	}
 
 	async runAssistTurn({ sid, text, language, channel }) {
@@ -237,6 +265,7 @@ export class AssistHandler {
 		if (ag.control.paused) {
 			return { conversation_id: sid, speech: '지금은 집 비서가 일시정지 중이에요. 재개한 뒤 다시 말씀해 주세요.', continue_conversation: false, actions: [], proposals: [], ms: 0 }
 		}
+		const prevUserMsgs = ag.sessions.history(sid, now).filter(m => m.role === 'user')
 		ag.sessions.append(sid, 'user', text, { channel }, now)
 		const exec = ag.assistControl ?? ((req, opts) => ag.actionExecutor.executeControlItem(req, opts))
 		const dir = this.assistDirectory()
@@ -248,6 +277,7 @@ export class AssistHandler {
 			const speech = controlSpeech(fast.label, fast.service, r)
 			const ms = ag.clock() - now
 			ag.sessions.append(sid, 'assistant', speech, { mode: 'local' }, ag.clock())
+			ag.implicitFeedback?.onAssistTurn({ text, speech, prevUserMsgs, actions: [r], now })
 			log(`Assist 빠른 경로 (${ms}ms): "${text.slice(0, 60)}" → ${fast.entity_id} ${fast.service} = ${r.status}${r.error ? ` (${r.error})` : ''}`)
 			this.recordAssistDecision({ ts: iso(now), reasons: ['assist'], brain: 'local', model: null, path: 'fast', total_ms: ms, tokens: 0, usage: null, rounds: 0, tool_calls: 0, summary: speech.slice(0, 200), applied: { actions: [r.status], proposals: [] } })
 			return { conversation_id: sid, speech, continue_conversation: false, actions: [r], proposals: [], ms, meta: { path: 'fast', tier: null, mode: 'local', model: null, rounds: 0, tool_calls: 0, tokens: 0 } }
@@ -277,7 +307,8 @@ export class AssistHandler {
 			policyDesc: ag.policy.describe(),
 			directoryText: dir.staticText,
 			profile: ag.memoryMgr.loadHomeProfile(),
-			memory: ag.memoryMgr.renderForPrompt(2500),
+			memory: await ag.memoryMgr.renderForPromptAsync(2500, { contextText: text, now, touch: !ag.dry }),
+			lessons: ag.memoryMgr.renderLessons('assist', 900, { now, touch: !ag.dry }),
 			earlyFinish,
 		})
 		const dynamic = buildDynamicContext({
@@ -285,11 +316,12 @@ export class AssistHandler {
 		})
 		const promptMsgs = withDynamicContext(ag.sessions.history(sid, now), dynamic)
 		const turnActions = [], turnProposals = []
-		let roundCtl = []
+		let roundCtl = [], turnMemoryMutated = false
 		const toolCtx = {
 			allowDirectRequest: true,
 			adminEnabled: Boolean(ag.cfg.policy?.admin_enabled),
 			source: channel,
+			onMemoryMutated: () => { turnMemoryMutated = true },
 			executeControl: async (req, opts) => {
 				const r = await exec(req, opts)
 				turnActions.push(r)
@@ -319,7 +351,7 @@ export class AssistHandler {
 
 		const started = ag.clock()
 		const budgetSec = a.timeout_seconds ?? 90
-		let r = null, used = null, lastErr = null
+		let r = null, used = null, lastErr = null, hadUnexecutedClaim = false, fellBack = false
 		for (const [i, plan] of plans.entries()) {
 			const left = Math.max(5, budgetSec - Math.round((ag.clock() - started) / 1000))
 			const timeoutSec = i === 0 && plans.length > 1 ? Math.min(a.fast_timeout_seconds ?? 30, left) : left
@@ -340,10 +372,12 @@ export class AssistHandler {
 					includeFileTools: false,
 				})
 				if (claimsUnexecutedControl(text, out.result?.speech, turnActions.length)) {
+					hadUnexecutedClaim = true
 					throw new Error(`도구 호출 없이 제어했다고 답함: "${String(out.result?.speech ?? '').slice(0, 60)}"`)
 				}
 				r = out
 				used = plan
+				if (i > 0) fellBack = true
 				break
 			} catch (e) {
 				lastErr = e
@@ -359,12 +393,17 @@ export class AssistHandler {
 				? '죄송해요, 제어 명령이 실제로 실행되지 않았어요. 한 번만 다시 말씀해 주세요.'
 				: `죄송해요, 요청을 처리하지 못했어요: ${lastErr?.message ?? '알 수 없는 오류'}`
 			ag.sessions.append(sid, 'assistant', speech, { error: lastErr?.message }, ag.clock())
+			ag.implicitFeedback?.onAssistTurn({ text, speech, prevUserMsgs, hadUnexecutedClaim, fellBack: true, actions: turnActions, now })
 			return { conversation_id: sid, speech, continue_conversation: false, actions: turnActions, proposals: turnProposals, ms: elapsedMs, meta: { path: 'error', tier: plans.at(-1).tier, mode: plans.at(-1).mode, model: plans.at(-1).model } }
 		}
 		const speech = String(r.result?.speech ?? '처리했어요.').trim()
 		const cont = Boolean(r.result?.continue_conversation)
 		const path = r.early ? 'early' : 'llm'
 		ag.sessions.append(sid, 'assistant', speech, { mode: used.mode, tokens: r.tokens }, ag.clock())
+		ag.implicitFeedback?.onAssistTurn({ text, speech, prevUserMsgs, hadUnexecutedClaim, fellBack, actions: turnActions, now })
+		if (!turnMemoryMutated) {
+			this.#schedulePostTurnExtract({ text, speech, usedMode: used.mode, usedModel: used.model, now })
+		}
 		this.recordAssistDecision({
 			ts: iso(started), reasons: ['assist'], brain: used.mode, model: used.model, effort: used.effort, tier: used.tier, path,
 			total_ms: elapsedMs, rounds: r.rounds ?? null, tool_calls: r.tool_calls ?? null, tokens: r.tokens ?? null, usage: r.usage ?? null,

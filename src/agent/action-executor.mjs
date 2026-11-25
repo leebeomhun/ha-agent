@@ -98,6 +98,7 @@ export class ActionExecutor {
 		} catch (e) { rec.status = 'error'; rec.error = e.message }
 		rec.done_at = iso(ag.clock())
 		ag.journal.action(rec)
+		if (!undo && rec.status === 'done') ag.implicitFeedback?.trackExecutedControl(rec, ag.clock())
 		log(`행동 ${rec.status}: ${rec.name} ${service} — ${rec.reason}`)
 		const shown = undo && rec.status === 'done' ? { ...rec, status: 'undone' } : rec
 		const undoable = !undo && rec.status !== 'error' && Boolean(ag.policy.buildUndoCall(rec))
@@ -183,12 +184,16 @@ export class ActionExecutor {
 				if (res.status !== 'error') {
 					const updated = { ...rec, status: 'undone', decided_at: iso(now) }
 					ag.journal.action(updated)
+					ag.implicitFeedback?.onActionButtonOutcome(updated, 'undone', now)
 				}
 				return
 			}
 			if (rec.status !== 'pending' || !ag.pendingActs.some(p => p.aid === aid)) return
 			ag.pendingActs = ag.pendingActs.filter(p => p.aid !== aid)
-			if (kind === 'NO') return close('declined')
+			if (kind === 'NO') {
+				ag.implicitFeedback?.onActionButtonOutcome(rec, 'declined', now)
+				return close('declined')
+			}
 			if (now > rec.expires) return close('expired')
 			if (typeof rec.entity_id === 'string' && rec.entity_id.startsWith('script.')) await ag.loadScriptFields?.([rec.entity_id])
 			const v = ag.policy.evaluateControl(rec, {

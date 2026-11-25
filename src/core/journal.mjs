@@ -36,6 +36,10 @@ export class Journal {
 		this.store?.recordEvent({ ...c, isNoise })
 		this.#export(P.events, c)
 	}
+	decision(rec) {
+		this.store?.recordDecision(rec)
+		this.#export(P.decisions, rec)
+	}
 
 	// ── 읽기 ──
 	notifications({ sinceMs = 0, limit = MAX_ROWS } = {}) {
@@ -71,5 +75,19 @@ export class Journal {
 	recentEvents({ limit = MAX_ROWS } = {}) {
 		if (this.store) return this.store.recentEvents({ sinceMs: 0, limit }).map(({ is_noise, ...c }) => c)
 		return readJsonlCached(P.events).slice(-limit)
+	}
+	latestDecision({ excludeAssist = false, onlyAssist = false, excludeSkipped = false, excludeDeferred = false } = {}) {
+		if (this.store) return this.store.latestDecision({ excludeAssist, onlyAssist, excludeSkipped, excludeDeferred })
+		const isAssistOnly = d => Array.isArray(d?.reasons) && d.reasons.length > 0 && d.reasons.every(r => r === 'assist')
+		const rows = readJsonlCached(P.decisions)
+		for (let i = rows.length - 1; i >= 0; i--) {
+			const d = rows[i]
+			if (excludeSkipped && d.skipped) continue
+			if (excludeDeferred && d.deferred) continue
+			if (excludeAssist && isAssistOnly(d)) continue
+			if (onlyAssist && !isAssistOnly(d)) continue
+			return d
+		}
+		return null
 	}
 }

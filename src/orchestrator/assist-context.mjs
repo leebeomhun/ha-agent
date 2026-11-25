@@ -136,13 +136,14 @@ export function buildDirectory({ policy, states, areaOf = null, catOf = null, al
 }
 
 // 시스템 지시(고정 부분). 시각·상태처럼 매번 바뀌는 값은 넣지 않는다.
-export function buildAssistInstructions({ policyDesc, directoryText = '', profile = '', memory = '', earlyFinish = true }) {
+export function buildAssistInstructions({ policyDesc, directoryText = '', profile = '', memory = '', lessons = '', earlyFinish = true }) {
 	return [
 		'너는 이 집의 Home Assistant 개인 자율형 비서다. 사용자는 HA Assist(음성 또는 채팅)로 대화하고 있다.',
 		`권한 요약: Tier1(자율) ${policyDesc.tier1_auto.length}개, Tier2(승인/직접요청) ${policyDesc.tier2_confirm.length}개 | HA관리=${policyDesc.admin_enabled ? '켜짐' : '꺼짐'}`,
 		directoryText,
 		profile ? `집 프로필:\n${profile}` : '',
 		memory ? `기억:\n${memory}` : '',
+		lessons ? `학습된 교훈(Playbook — 반드시 준수):\n${lessons}` : '',
 		'규칙:',
 		'- 마지막 사용자 메시지 앞의 [현재 상황]에 시각·기기 상태·센서 값이 있다. 기기 목록과 [현재 상황]으로 답할 수 있으면 조회 도구를 쓰지 말고 바로 답하거나 제어한다.',
 		'- 목록에 없는 엔티티, 상세 속성, 상태 기록·로그북·통계, 자동화·트레이스·통합·백업이 필요할 때만 조회 도구를 쓴다. 추측하지 않는다.',
@@ -155,9 +156,9 @@ export function buildAssistInstructions({ policyDesc, directoryText = '', profil
 			? '- ha_control_device의 speech_if_success에는 제어가 성공하면 사용자에게 그대로 들려줄 짧은 한 문장을 넣는다(예: "주방 불을 켰어요."). 여러 기기를 한 번에 제어하면 모든 호출에 같은 전체 요약 문장을 넣는다.'
 			: '',
 		'- 날씨 예보는 ha_get_weather, 일정은 ha_get_calendar, 최근 보낸 알림 문의는 ha_get_recent_notifications로 조회한다.',
-		'- 사용자가 일정·부재·선호·영구 지시를 말하면 memory_upsert로 저장하고, 과거 선호·지시 확인은 memory_search, 취소·삭제 요청은 memory_delete를 쓴다.',
+		'- 사용자가 임시 부재·일정(ttl_days 지정, incident), 선호(preference), 영구 지시(standing_order, pinned=true)를 말하면 memory_upsert로 저장하고, 과거 기억 확인은 memory_search(필요 시 include_archived=true), 취소·삭제 요청은 memory_delete를 쓴다.',
 		'- 안전 정책으로 차단된 기기나 목록에 없는 기기의 제어 요청은 도구 없이 이유를 짧게 설명하고 거절한다.',
-		'- 자동화/스크립트 생성·수정·삭제·통합 리로드·백업·규칙 승격은 ha_propose_admin으로 검증 후 Tier 2 승인 제안을 만든다.',
+		'- 자동화/스크립트 생성·수정·삭제·통합 리로드·백업·규칙 승격 및 자가 튜닝(별칭·소음·STT·교훈)은 ha_propose_admin으로 검증 후 Tier 2 승인 제안을 만든다.',
 		'- 사용자가 기존 제안의 승인/거절/롤백을 직접 지시했으면 ha_proposal_action을 호출한다.',
 		'- speech는 마크다운 기호(*, #, `, 불릿), 이모지, 영문 entity_id 없이 TTS로 바로 읽기 자연스럽고 간결한 한국어 존댓말(1~3문장, 단위 포함)로 답한다.',
 	].filter(Boolean).join('\n')

@@ -1,16 +1,20 @@
 // HA DevOps 관리: 자동화/스크립트 검증·Diff·Proposal 승인·자동/수동 롤백·규칙 승격·종합 건강 감사
 import { mkdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { P, newId, fmt } from '../util.mjs'
+import { P, newId, fmt, readJson, writeJson } from '../util.mjs'
 import { ADMIN_SERVICES, NON_ENTITY_TARGET_KEYS, PolicyEngine } from '../core/policy.mjs'
+import { mergeConfig, validateConfig } from '../config.mjs'
 
 const ENTITY_REF_RE = /^[a-z_]+\.[a-z0-9_]+$/
 const JINJA_ENTITY_RE = /(?:states|is_state|state_attr|is_state_attr|has_value)\(\s*['"]([a-z_]+\.[a-z0-9_]+)['"]/g
 const TPL_RE = /\{\{[\s\S]*?\}\}|\{%[\s\S]*?%\}/
 const RUNTIME_TEMPLATE_VARS = new Set(['trigger', 'this', 'context', 'repeat', 'wait'])
 const UNDEF_VAR_RE = /UndefinedError:\s*'([A-Za-z_][A-Za-z0-9_]*)' is undefined/
-export const ROLLBACKABLE_KINDS = new Set(['automation_upsert', 'automation_delete', 'automation_toggle', 'script_upsert', 'script_delete', 'promote_rule'])
+export const SELF_PROPOSAL_KINDS = new Set(['self_alias_proposal', 'self_noise_proposal', 'self_stt_tune', 'self_lesson_proposal'])
+export const ROLLBACKABLE_KINDS = new Set(['automation_upsert', 'automation_delete', 'automation_toggle', 'script_upsert', 'script_delete', 'promote_rule', ...SELF_PROPOSAL_KINDS])
 export const PROMOTABLE_OPS = new Set(['eq', 'ne', 'in', 'not_in', 'gt', 'lt', 'unavailable'])
+// 불변 코어 보호: 자가개선 제안은 보안·정책·네트워크 경계를 절대 건드릴 수 없다.
+const IMMUTABLE_CORE_KEYS = new Set(['policy', 'tier3_blocked', 'admin_enabled', 'allowed_networks', 'oob', 'token_file', 'actions'])
 const splitVals = v => String(v ?? '').split('|').map(s => s.trim()).filter(Boolean)
 const sanitizeConfigId = raw => String(raw ?? '').replace(/\.\./g, '_').replace(/[/?#]/g, '_').replace(/[^A-Za-z0-9_-]/g, '_').replace(/^_+|_+$/g, '').slice(0, 80)
 const jinjaExprFor = (entityId, attr) => (attr ? `state_attr('${entityId}', '${attr}')` : `states('${entityId}')`)
@@ -231,7 +235,7 @@ export function ruleToAutomationConfig(rule, notifyTargets = ['mobile_app_ibeomh
 }
 
 export class HaAdmin {
-	constructor({ cfg, ha, store = null, states = new Map(), meta = {}, memory = null, onRulePromoted = null, policy = null } = {}) {
+	constructor({ cfg, ha, store = null, states = new Map(), meta = {}, memory = null, onRulePromoted = null, policy = null, configPath = P.config, onConfigUpdated = null, onProposalOutcome = null } = {}) {
 		this.cfg = cfg
 		this.policy = policy ?? new PolicyEngine(cfg ?? {})
 		this.ha = ha
@@ -240,9 +244,93 @@ export class HaAdmin {
 		this.meta = meta
 		this.memory = memory
 		this.onRulePromoted = onRulePromoted
+		this.configPath = configPath
+		this.onConfigUpdated = onConfigUpdated
+		this.onProposalOutcome = onProposalOutcome
 		this.memProposals = new Map()
 		this._writeChain = Promise.resolve()
 		this._opChain = Promise.resolve()
+	}
+
+	#readRawConfig() {
+		const raw = readJson(this.configPath, null)
+		return raw && typeof raw === 'object' ? raw : structuredClone(this.cfg ?? {})
+	}
+
+	// 불변 코어 가드: 자가 튜닝 payload에 보안/정책 키가 섞여 있으면 차단한다.
+	#checkSelfProposalImmutable(payload) {
+		const keys = Object.keys(payload ?? {})
+		const bad = keys.find(k => IMMUTABLE_CORE_KEYS.has(k))
+		if (bad) return `불변 코어 보호: 자가 튜닝 제안에서 ${bad} 영역은 수정할 수 없다`
+		return null
+	}
+
+	#buildSelfConfigPatch(kind, targetId, payload, rawCfg) {
+		const next = structuredClone(rawCfg)
+		if (kind === 'self_alias_proposal') {
+			const entityId = String(payload?.entity_id || targetId || '').trim()
+			const alias = String(payload?.alias || '').trim()
+			if (!ENTITY_REF_RE.test(entityId) || alias.length < 2 || alias.length > 30) {
+				return { error: 'self_alias_proposal에는 유효한 entity_id와 2~30자 alias가 필요하다' }
+			}
+			if (this.policy.isTier3Blocked(entityId)) return { error: `안전 정책(Tier 3)으로 차단된 엔티티 별칭은 추가할 수 없다: ${entityId}` }
+			next.assist ??= {}
+			next.assist.aliases ??= {}
+			const cur = Array.isArray(next.assist.aliases[entityId]) ? [...next.assist.aliases[entityId]] : []
+			if (!cur.includes(alias)) cur.push(alias)
+			next.assist.aliases[entityId] = cur
+			if (payload?.add_stt_hint !== false) {
+				next.assist.voice ??= {}
+				const hints = Array.isArray(next.assist.voice.stt_hints) ? [...next.assist.voice.stt_hints] : []
+				if (!hints.includes(alias)) hints.push(alias)
+				next.assist.voice.stt_hints = hints
+			}
+			return {
+				next,
+				beforeSlice: { aliases: rawCfg.assist?.aliases?.[entityId] ?? [], stt_hints: rawCfg.assist?.voice?.stt_hints ?? [] },
+				afterSlice: { aliases: next.assist.aliases[entityId], stt_hints: next.assist.voice?.stt_hints ?? [] },
+				summaryText: `별칭 추가: ${entityId} ← "${alias}"`,
+			}
+		}
+		if (kind === 'self_noise_proposal') {
+			const pat = String(payload?.entity_id || payload?.pattern || targetId || '').trim()
+			if (!pat || !/^[a-z_]+\.[a-z0-9_*]+$/.test(pat)) return { error: `유효하지 않은 noise_entities 패턴: ${pat}` }
+			if (this.policy.isTier3Blocked(pat.replace(/\*/g, 'x')) || pat.startsWith('person.')) {
+				return { error: `보안·재실 핵심 엔티티(${pat})는 소음 목록에 넣을 수 없다` }
+			}
+			const list = Array.isArray(next.noise_entities) ? [...next.noise_entities] : []
+			if (!list.includes(pat)) list.push(pat)
+			next.noise_entities = list
+			return {
+				next,
+				beforeSlice: { noise_entities: rawCfg.noise_entities ?? [] },
+				afterSlice: { noise_entities: next.noise_entities },
+				summaryText: `소음 엔티티 추가: ${pat}`,
+			}
+		}
+		if (kind === 'self_stt_tune') {
+			const ep = payload?.endpoint
+			if (!ep || typeof ep !== 'object' || Array.isArray(ep)) return { error: 'self_stt_tune에는 endpoint 객체가 필요하다' }
+			const allowed = ['enabled', 'silence_ms', 'max_seconds', 'no_speech_seconds', 'start_margin_db', 'bg_margin_db', 'near_field_db', 'end_drop_db', 'preroll_ms']
+			const cleanEp = { ...(rawCfg.assist?.voice?.endpoint ?? {}) }
+			for (const [k, v] of Object.entries(ep)) {
+				if (!allowed.includes(k)) return { error: `허용되지 않은 STT endpoint 키: ${k}` }
+				if (k === 'silence_ms' && !(Number(v) >= 300 && Number(v) <= 2000)) return { error: 'silence_ms는 300~2000ms 범위여야 한다' }
+				if (k === 'max_seconds' && !(Number(v) >= 4 && Number(v) <= 20)) return { error: 'max_seconds는 4~20초 범위여야 한다' }
+				if (k === 'no_speech_seconds' && !(Number(v) >= 2 && Number(v) <= 15)) return { error: 'no_speech_seconds는 2~15초 범위여야 한다' }
+				cleanEp[k] = v
+			}
+			next.assist ??= {}
+			next.assist.voice ??= {}
+			next.assist.voice.endpoint = cleanEp
+			return {
+				next,
+				beforeSlice: { endpoint: rawCfg.assist?.voice?.endpoint ?? {} },
+				afterSlice: { endpoint: cleanEp },
+				summaryText: `STT endpoint 조정: ${JSON.stringify(cleanEp)}`,
+			}
+		}
+		return { error: `지원하지 않는 자가 설정 제안: ${kind}` }
 	}
 
 	#saveSnapFile(pid, label, data) {
@@ -401,6 +489,29 @@ export class HaAdmin {
 			if (!ENTITY_REF_RE.test(String(target_id))) return { ok: false, error: `entity_admin 대상은 entity_id여야 한다: ${target_id}` }
 			if (this.policy.isTier3Blocked(target_id)) return { ok: false, error: `안전 정책(Tier 3)으로 차단된 대상: ${target_id}` }
 			diffText = `${svc} target=${target_id} data=${JSON.stringify(finalPayload.data ?? {})}`
+		} else if (kind === 'self_lesson_proposal') {
+			const guardErr = this.#checkSelfProposalImmutable(finalPayload)
+			if (guardErr) return { ok: false, error: guardErr }
+			const key = String(finalPayload.key || target_id || '').trim().slice(0, 80)
+			const cond = String(finalPayload.condition_text || '').trim().slice(0, 200)
+			const rule = String(finalPayload.rule_text || '').trim().slice(0, 300)
+			const scope = ['all', 'assist', 'cycle', 'weekly', 'proposal'].includes(finalPayload.scope) ? finalPayload.scope : 'all'
+			if (!key || !cond || !rule) return { ok: false, error: 'self_lesson_proposal에는 key, condition_text, rule_text가 필요하다' }
+			finalPayload = { key, scope, condition_text: cond, rule_text: rule, evidence: finalPayload.evidence ?? null, evidence_count: Number(finalPayload.evidence_count) || 1, pinned: Boolean(finalPayload.pinned) }
+			preSnapshot = this.store ? this.store.getLesson(key) : null
+			validation = { valid: true, errors: [], warnings: [], summary_text: `교훈(${scope}): [${cond}] → ${rule}` }
+			diffText = unifiedDiff(preSnapshot ? JSON.stringify(preSnapshot, null, 2) : '', JSON.stringify(finalPayload, null, 2), `lesson:${key}`)
+		} else if (SELF_PROPOSAL_KINDS.has(kind)) {
+			const guardErr = this.#checkSelfProposalImmutable(finalPayload)
+			if (guardErr) return { ok: false, error: guardErr }
+			const rawCfg = this.#readRawConfig()
+			const built = this.#buildSelfConfigPatch(kind, target_id, finalPayload, rawCfg)
+			if (built.error) return { ok: false, error: built.error }
+			const cfgChk = validateConfig(mergeConfig(built.next))
+			if (cfgChk.errors.length) return { ok: false, error: `설정 사전 검증 실패: ${cfgChk.errors.join(', ')}` }
+			preSnapshot = built.beforeSlice
+			validation = { valid: true, errors: [], warnings: cfgChk.warnings, summary_text: built.summaryText }
+			diffText = unifiedDiff(JSON.stringify(built.beforeSlice, null, 2), JSON.stringify(built.afterSlice, null, 2), `config.json (${kind})`)
 		} else {
 			diffText = `${kind} ${target_id} ${JSON.stringify(finalPayload)}`
 		}
@@ -510,6 +621,19 @@ export class HaAdmin {
 				await this.ha.callService('backup', 'create_automatic')
 			} else if (p.kind === 'entity_admin') {
 				await this.ha.callService('homeassistant', p.payload.service, { data: { entity_id: p.target_id, ...(p.payload.data ?? {}) } })
+			} else if (p.kind === 'self_lesson_proposal') {
+				if (!this.store) throw new Error('저장소가 없어 교훈을 등록할 수 없다')
+				this.store.upsertLesson({ ...p.payload, source: 'user_approved', now })
+			} else if (SELF_PROPOSAL_KINDS.has(p.kind)) {
+				const rawCfg = this.#readRawConfig()
+				const built = this.#buildSelfConfigPatch(p.kind, p.target_id, p.payload, rawCfg)
+				if (built.error) throw new Error(built.error)
+				const merged = mergeConfig(built.next)
+				const chk = validateConfig(merged)
+				if (chk.errors.length) throw new Error(`설정 검증 실패: ${chk.errors.join(', ')}`)
+				writeJson(this.configPath, built.next)
+				this.cfg = merged
+				await this.onConfigUpdated?.(merged, p)
 			} else {
 				throw new Error(`알 수 없는 제안 종류: ${p.kind}`)
 			}
@@ -525,12 +649,14 @@ export class HaAdmin {
 			if (p.kind === 'promote_rule' && this.onRulePromoted && p.payload?.rule_id) {
 				await this.onRulePromoted(p.payload.rule_id)
 			}
+			try { this.onProposalOutcome?.(updated, 'applied', now) } catch {}
 			return { ok: true, proposal: updated }
 		} catch (e) {
 			if (mutatedConfig) {
 				try { await this.#restoreSnapshot(p) } catch {}
 				const rolled = { ...p, status: 'rolled_back', decided_at: now, rollback_at: Date.now(), error: `적용 실패로 자동 롤백: ${e.message}` }
 				this.#saveProposal(rolled)
+				try { this.onProposalOutcome?.(rolled, 'rolled_back', now, e.message) } catch {}
 				return { ok: false, error: rolled.error, proposal: rolled }
 			}
 			const failed = { ...p, status: 'error', decided_at: now, error: e.message }
@@ -540,6 +666,38 @@ export class HaAdmin {
 	}
 
 	async #restoreSnapshot(p) {
+		if (p.kind === 'self_lesson_proposal') {
+			if (!this.store) return
+			if (p.pre_snapshot) this.store.upsertLesson({ ...p.pre_snapshot, now: Date.now() })
+			else this.store.deleteLesson(p.payload?.key || p.target_id, { source: 'user', force: true })
+			return
+		}
+		if (SELF_PROPOSAL_KINDS.has(p.kind)) {
+			const rawCfg = this.#readRawConfig()
+			const next = structuredClone(rawCfg)
+			if (p.kind === 'self_alias_proposal') {
+				const eid = p.payload?.entity_id || p.target_id
+				next.assist ??= {}
+				next.assist.aliases ??= {}
+				if (p.pre_snapshot?.aliases?.length) next.assist.aliases[eid] = p.pre_snapshot.aliases
+				else delete next.assist.aliases[eid]
+				if (Array.isArray(p.pre_snapshot?.stt_hints)) {
+					next.assist.voice ??= {}
+					next.assist.voice.stt_hints = p.pre_snapshot.stt_hints
+				}
+			} else if (p.kind === 'self_noise_proposal') {
+				next.noise_entities = Array.isArray(p.pre_snapshot?.noise_entities) ? p.pre_snapshot.noise_entities : []
+			} else if (p.kind === 'self_stt_tune') {
+				next.assist ??= {}
+				next.assist.voice ??= {}
+				next.assist.voice.endpoint = p.pre_snapshot?.endpoint ?? {}
+			}
+			writeJson(this.configPath, next)
+			const merged = mergeConfig(next)
+			this.cfg = merged
+			await this.onConfigUpdated?.(merged, p)
+			return
+		}
 		const domain = (p.kind.startsWith('script')) ? 'script' : 'automation'
 		if (p.kind === 'automation_toggle') {
 			const prev = p.pre_snapshot?.state
@@ -565,9 +723,10 @@ export class HaAdmin {
 		if (p.status !== 'applied') return { ok: false, error: `적용된 제안만 롤백 가능 (${p.status})` }
 		try {
 			await this.#restoreSnapshot(p)
-			if (typeof this.ha.checkConfig === 'function') await this.ha.checkConfig()
+			if (!SELF_PROPOSAL_KINDS.has(p.kind) && typeof this.ha?.checkConfig === 'function') await this.ha.checkConfig()
 			const updated = { ...p, status: 'rolled_back', rollback_at: now }
 			this.#saveProposal(updated)
+			try { this.onProposalOutcome?.(updated, 'rolled_back', now) } catch {}
 			return { ok: true, proposal: updated }
 		} catch (e) {
 			return { ok: false, error: `롤백 실패: ${e.message}` }
@@ -583,6 +742,7 @@ export class HaAdmin {
 		if (this.memory) {
 			this.memory.applyOps([{ op: 'upsert', category: 'rejection', key: `rej_${p.kind}_${p.target_id || pid}`, content: `사용자가 거절한 제안: ${p.title}${reason ? ` (${reason})` : ''}` }], { source: 'user_rejection', now })
 		}
+		try { this.onProposalOutcome?.(updated, 'rejected', now, reason) } catch {}
 		return { ok: true, proposal: updated }
 	}
 

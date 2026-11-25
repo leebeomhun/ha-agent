@@ -12,13 +12,35 @@ const TRACK_DOMAINS = new Set(['sensor'])
 const MIN_STD_FLOOR = { '%': 5, '°C': 1.5, 'V': 4, 'W': 40, 'kW': 0.3, 'dBm': 8 }
 
 export class AnomalyEngine {
-	constructor({ store = null, isNoise = () => false } = {}) {
+	constructor({ store = null, isNoise = () => false, awayOverrideEntity = null, workdayEntity = 'binary_sensor.workday_sensor_kr', leaveEntity = 'input_boolean.yeoncha_next_workday', ownerPersonEntity = null } = {}) {
 		this.store = store
 		this.isNoise = isNoise
+		this.awayOverrideEntity = awayOverrideEntity
+		this.workdayEntity = workdayEntity
+		this.leaveEntity = leaveEntity
+		this.ownerPersonEntity = ownerPersonEntity
 		this.lastSampleAt = new Map()
 		this.pendingSince = new Map()
 		this.lastAlertAt = new Map()
 		this.baselineCache = null
+	}
+
+	// 시간·요일·공휴일·연차·외출 컨텍스트를 분류한다('weekday' | 'weekend' | 'away').
+	// 기존 DB의 weekday/weekend 버킷과 호환되며 공휴일·연차는 weekend로, 부재는 away로 분리한다.
+	contextOf(states, now = Date.now()) {
+		const k = kst(new Date(now))
+		const baseDay = (k.wd === '토' || k.wd === '일') ? 'weekend' : 'weekday'
+		if (!states?.get) return baseDay
+		const ownerId = this.ownerPersonEntity
+			?? (states.has('person.ibeomhun') ? 'person.ibeomhun' : null)
+		const awayOverrideOn = Boolean(this.awayOverrideEntity && states.get(this.awayOverrideEntity)?.state === 'on')
+		if (ownerId && !awayOverrideOn) {
+			const ps = states.get(ownerId)?.state
+			if (ps && ps !== 'home' && ps !== 'unknown' && ps !== 'unavailable') return 'away'
+		}
+		if (this.workdayEntity && states.get(this.workdayEntity)?.state === 'off') return 'weekend'
+		if (this.leaveEntity && states.get(this.leaveEntity)?.state === 'on') return 'weekend'
+		return baseDay
 	}
 
 	isTrackable(entityId, st = null) {
@@ -49,6 +71,7 @@ export class AnomalyEngine {
 	// 기준값이 "바뀌는 순간"의 값으로 치우친다(예: 꺼져 있는 시간이 긴 전력 센서). 시간 기준으로 고르게 쌓는다.
 	sampleAll(states, now = Date.now()) {
 		if (!this.store || !states) return 0
+		const context = this.contextOf(states, now)
 		const rows = []
 		for (const [id, st] of states) {
 			if (!this.isTrackable(id, st)) continue
@@ -56,16 +79,16 @@ export class AnomalyEngine {
 			if (!Number.isFinite(val)) continue
 			if (now - (this.lastSampleAt.get(id) ?? 0) < MIN_SAMPLE_INTERVAL_MS) continue
 			this.lastSampleAt.set(id, now)
-			rows.push({ entity_id: id, value: val, ts: now })
+			rows.push({ entity_id: id, value: val, ts: now, context })
 		}
 		if (!rows.length) return 0
 		if (typeof this.store.recordSensorSamples === 'function') this.store.recordSensorSamples(rows)
-		else for (const r of rows) this.store.recordSensorSample(r.entity_id, r.value, r.ts)
+		else for (const r of rows) this.store.recordSensorSample(r.entity_id, r.value, r.ts, r.context)
 		return rows.length
 	}
 
 	// 상태 변화 하나를 표본으로(예전 방식, 시험·도구용). 데몬은 sampleAll을 쓴다.
-	onNumericState(entityId, st, now = Date.now()) {
+	onNumericState(entityId, st, now = Date.now(), context = null) {
 		if (!this.store || !st) return false
 		if (!this.isTrackable(entityId, st)) return false
 		const val = Number(st.state)
@@ -73,7 +96,7 @@ export class AnomalyEngine {
 		const prev = this.lastSampleAt.get(entityId) ?? 0
 		if (now - prev < MIN_SAMPLE_INTERVAL_MS) return false
 		this.lastSampleAt.set(entityId, now)
-		this.store.recordSensorSample(entityId, val, now)
+		this.store.recordSensorSample(entityId, val, now, context)
 		return true
 	}
 
@@ -86,7 +109,7 @@ export class AnomalyEngine {
 			const st = states?.get?.(r.entity_id) ?? null
 			if (!this.isTrackable(r.entity_id, st)) continue
 			const k = kst(new Date(r.ts))
-			const wtype = (k.wd === '토' || k.wd === '일') ? 'weekend' : 'weekday'
+			const wtype = r.context || ((k.wd === '토' || k.wd === '일') ? 'weekend' : 'weekday')
 			const key = `${r.entity_id}|${wtype}|${k.h}`
 			let b = buckets.get(key)
 			if (!b) { b = { entity_id: r.entity_id, weekday_type: wtype, hour: k.h, vals: [] }; buckets.set(key, b) }
@@ -127,14 +150,18 @@ export class AnomalyEngine {
 	checkAnomalies(states, now = Date.now()) {
 		if (!this.store || !states) return []
 		const k = kst(new Date(now))
-		const wtype = (k.wd === '토' || k.wd === '일') ? 'weekend' : 'weekday'
+		const ctxType = this.contextOf(states, now)
+		const fallbackType = (k.wd === '토' || k.wd === '일') ? 'weekend' : 'weekday'
 		const cache = this.#ensureCache()
 		const hits = []
 		for (const [id, st] of states) {
 			if (!this.isTrackable(id, st)) continue
 			const v = Number(st.state)
 			if (!Number.isFinite(v)) { this.pendingSince.delete(id); continue }
-			const base = cache.get(`${id}|${wtype}|${k.h}`) ?? null
+			let base = cache.get(`${id}|${ctxType}|${k.h}`) ?? null
+			if ((!base || base.sample_count < 6) && ctxType !== fallbackType) {
+				base = cache.get(`${id}|${fallbackType}|${k.h}`) ?? null
+			}
 			if (!base || base.sample_count < 6) continue
 			const unit = st.attributes?.unit_of_measurement ?? ''
 			const floor = MIN_STD_FLOOR[unit] ?? Math.max(Math.abs(base.avg) * 0.1, 1)
@@ -156,6 +183,7 @@ export class AnomalyEngine {
 						value: v,
 						avg: base.avg,
 						z: Math.round(z * 10) / 10,
+						context: base.weekday_type,
 						at: now,
 					})
 				}

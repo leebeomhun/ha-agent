@@ -2,12 +2,40 @@
 import { mkdirSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
-import { P, readJsonlAll } from '../util.mjs'
+import { P, DAY, kst, readJsonlAll } from '../util.mjs'
+import {
+	localEmbed, cosineSimilarity, lexicalSimilarity, tokenize,
+	packEmbedding, unpackEmbedding, DEFAULT_SEMANTIC_THRESHOLD,
+} from './embeddings.mjs'
 
 const jsonOrNull = v => (v == null ? null : typeof v === 'string' ? v : JSON.stringify(v))
 const parseJson = (s, fallback = null) => {
 	if (s == null || s === '') return fallback
 	try { return JSON.parse(s) } catch { return fallback }
+}
+
+export const MEMORY_CAT_RANK_SQL = `CASE category
+	WHEN 'standing_order' THEN 1
+	WHEN 'preference' THEN 2
+	WHEN 'rejection' THEN 3
+	WHEN 'pattern' THEN 4
+	WHEN 'incident' THEN 5
+	ELSE 6
+END`
+
+export const MEMORY_DEFAULT_PRIORITY = {
+	standing_order: 5,
+	preference: 4,
+	rejection: 4,
+	pattern: 3,
+	incident: 2,
+}
+
+const USER_SOURCES = new Set(['user', 'cli', 'console'])
+const normalizeEntityIds = v => {
+	if (!v) return []
+	const arr = Array.isArray(v) ? v : typeof v === 'string' ? parseJson(v, v.split(',')) : []
+	return [...new Set((Array.isArray(arr) ? arr : []).map(s => String(s ?? '').trim()).filter(Boolean))].slice(0, 16)
 }
 
 export class Store {
@@ -172,8 +200,135 @@ export class Store {
 			CREATE INDEX IF NOT EXISTS idx_feedback_nid_kind ON feedback(nid, kind);
 			CREATE INDEX IF NOT EXISTS idx_notifications_tag_ts ON notifications(tag, ts);
 			CREATE INDEX IF NOT EXISTS idx_actions_status ON actions(status);
+
+			CREATE TABLE IF NOT EXISTS memory_history (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				memory_key TEXT NOT NULL,
+				op TEXT NOT NULL,
+				prev_category TEXT,
+				prev_content TEXT,
+				prev_meta TEXT,
+				new_category TEXT,
+				new_content TEXT,
+				new_meta TEXT,
+				source TEXT,
+				ts INTEGER NOT NULL
+			);
+			CREATE INDEX IF NOT EXISTS idx_mem_hist_key_ts ON memory_history(memory_key, ts);
+
+			CREATE TABLE IF NOT EXISTS implicit_feedback (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				ts INTEGER NOT NULL,
+				kind TEXT NOT NULL,
+				entity_id TEXT,
+				ref_id TEXT,
+				score REAL DEFAULT 0,
+				detail TEXT
+			);
+			CREATE INDEX IF NOT EXISTS idx_impl_fb_ts ON implicit_feedback(ts);
+			CREATE INDEX IF NOT EXISTS idx_impl_fb_kind_ts ON implicit_feedback(kind, ts);
+
+			CREATE TABLE IF NOT EXISTS lessons (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				key TEXT NOT NULL UNIQUE,
+				scope TEXT NOT NULL DEFAULT 'all',
+				condition_text TEXT NOT NULL,
+				rule_text TEXT NOT NULL,
+				evidence TEXT,
+				evidence_count INTEGER DEFAULT 1,
+				confidence REAL DEFAULT 0.7,
+				active INTEGER DEFAULT 1,
+				pinned INTEGER DEFAULT 0,
+				source TEXT,
+				created_at INTEGER NOT NULL,
+				updated_at INTEGER NOT NULL,
+				last_used_at INTEGER,
+				use_count INTEGER DEFAULT 0
+			);
+			CREATE INDEX IF NOT EXISTS idx_lessons_scope_active ON lessons(scope, active);
+
+			CREATE TABLE IF NOT EXISTS experiments (
+				eid TEXT PRIMARY KEY,
+				ts INTEGER NOT NULL,
+				kind TEXT NOT NULL,
+				ref_id TEXT,
+				title TEXT NOT NULL,
+				baseline_metrics TEXT,
+				eval_after_ts INTEGER NOT NULL,
+				evaluated_at INTEGER,
+				after_metrics TEXT,
+				verdict TEXT,
+				notes TEXT,
+				status TEXT NOT NULL DEFAULT 'active'
+			);
+			CREATE INDEX IF NOT EXISTS idx_experiments_status_eval ON experiments(status, eval_after_ts);
+
+			CREATE TABLE IF NOT EXISTS daily_rollups (
+				date TEXT PRIMARY KEY,
+				weekday TEXT,
+				runs INTEGER DEFAULT 0,
+				failed INTEGER DEFAULT 0,
+				skipped INTEGER DEFAULT 0,
+				noop INTEGER DEFAULT 0,
+				tokens INTEGER DEFAULT 0,
+				alerts INTEGER DEFAULT 0,
+				infos INTEGER DEFAULT 0,
+				summaries INTEGER DEFAULT 0,
+				feedback_json TEXT,
+				actions_json TEXT,
+				entities_json TEXT,
+				sensor_stats_json TEXT,
+				created_at INTEGER NOT NULL
+			);
+
+			CREATE TABLE IF NOT EXISTS monthly_rollups (
+				month TEXT PRIMARY KEY,
+				days INTEGER DEFAULT 0,
+				runs INTEGER DEFAULT 0,
+				failed INTEGER DEFAULT 0,
+				noop INTEGER DEFAULT 0,
+				tokens INTEGER DEFAULT 0,
+				alerts INTEGER DEFAULT 0,
+				summaries INTEGER DEFAULT 0,
+				sensor_stats_json TEXT,
+				top_entities_json TEXT,
+				updated_at INTEGER NOT NULL
+			);
 		`)
 		this.#addColumn('actions', 'name', 'TEXT')
+		this.#addColumn('sensor_samples', 'context', 'TEXT')
+		this.#addColumn('memory_items', 'priority', 'INTEGER DEFAULT 3')
+		this.#addColumn('memory_items', 'pinned', 'INTEGER DEFAULT 0')
+		this.#addColumn('memory_items', 'entity_ids', 'TEXT')
+		this.#addColumn('memory_items', 'last_accessed_at', 'INTEGER')
+		this.#addColumn('memory_items', 'hit_count', 'INTEGER DEFAULT 0')
+		this.#addColumn('memory_items', 'embedding', 'TEXT')
+		this.#addColumn('memory_items', 'evidence_count', 'INTEGER DEFAULT 1')
+		this.hasFts5 = false
+		try {
+			this.db.exec("CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(key, content, entity_ids, tokenize='unicode61');")
+			this.hasFts5 = true
+			this.#syncFtsIfEmpty()
+		} catch {
+			this.hasFts5 = false
+		}
+	}
+
+	#syncFtsIfEmpty() {
+		if (!this.hasFts5) return
+		const ftsCount = Number(this.db.prepare('SELECT COUNT(*) AS n FROM memory_fts').get().n)
+		const memCount = Number(this.db.prepare('SELECT COUNT(*) AS n FROM memory_items WHERE active = 1').get().n)
+		if (memCount > 0 && ftsCount === 0) this.rebuildMemoryFts()
+	}
+
+	rebuildMemoryFts() {
+		if (!this.hasFts5) return
+		this.db.exec('DELETE FROM memory_fts')
+		const ins = this.db.prepare('INSERT INTO memory_fts (key, content, entity_ids) VALUES (?, ?, ?)')
+		for (const r of this.db.prepare('SELECT key, content, entity_ids FROM memory_items WHERE active = 1').all()) {
+			const eids = normalizeEntityIds(r.entity_ids).join(' ')
+			ins.run(r.key, r.content, eids)
+		}
 	}
 
 	// 예전 판 DB에 없는 칼럼을 더한다(이미 있으면 그대로).
@@ -272,17 +427,17 @@ export class Store {
 			.all(sinceMs, limit).reverse()
 	}
 
-	recordSensorSample(entityId, value, ts) {
-		this.db.prepare('INSERT INTO sensor_samples (ts, entity_id, value) VALUES (?, ?, ?)').run(ts, entityId, value)
+	recordSensorSample(entityId, value, ts, context = null) {
+		this.db.prepare('INSERT INTO sensor_samples (ts, entity_id, value, context) VALUES (?, ?, ?, ?)').run(ts, entityId, value, context)
 	}
 
-	// 여러 표본을 한 트랜잭션으로. rows: [{ entity_id, value, ts }]
+	// 여러 표본을 한 트랜잭션으로. rows: [{ entity_id, value, ts, context? }]
 	recordSensorSamples(rows = []) {
 		if (!rows.length) return 0
-		const ins = this.db.prepare('INSERT INTO sensor_samples (ts, entity_id, value) VALUES (?, ?, ?)')
+		const ins = this.db.prepare('INSERT INTO sensor_samples (ts, entity_id, value, context) VALUES (?, ?, ?, ?)')
 		this.db.exec('BEGIN')
 		try {
-			for (const r of rows) ins.run(r.ts, r.entity_id, r.value)
+			for (const r of rows) ins.run(r.ts, r.entity_id, r.value, r.context ?? null)
 			this.db.exec('COMMIT')
 		} catch (e) { this.db.exec('ROLLBACK'); throw e }
 		return rows.length
@@ -290,9 +445,9 @@ export class Store {
 
 	getRecentSensorSamples(sinceMs, entityId = null) {
 		if (entityId) {
-			return this.db.prepare('SELECT ts, entity_id, value FROM sensor_samples WHERE ts >= ? AND entity_id = ? ORDER BY ts ASC').all(sinceMs, entityId)
+			return this.db.prepare('SELECT ts, entity_id, value, context FROM sensor_samples WHERE ts >= ? AND entity_id = ? ORDER BY ts ASC').all(sinceMs, entityId)
 		}
-		return this.db.prepare('SELECT ts, entity_id, value FROM sensor_samples WHERE ts >= ? ORDER BY ts ASC').all(sinceMs)
+		return this.db.prepare('SELECT ts, entity_id, value, context FROM sensor_samples WHERE ts >= ? ORDER BY ts ASC').all(sinceMs)
 	}
 
 	pruneSensorSamples(beforeMs) {
@@ -448,26 +603,193 @@ export class Store {
 		}
 	}
 
-	upsertMemory({ category, key, content, source = 'agent', confidence = 1.0, expiresAt = null, now = Date.now() }) {
+	#mapMemory(r) {
+		if (!r) return null
+		const emb = unpackEmbedding(parseJson(r.embedding, null))
+		return {
+			...r,
+			priority: r.priority ?? MEMORY_DEFAULT_PRIORITY[r.category] ?? 3,
+			pinned: Boolean(r.pinned),
+			entity_ids: normalizeEntityIds(r.entity_ids),
+			hit_count: r.hit_count ?? 0,
+			evidence_count: r.evidence_count ?? 1,
+			embedding: emb,
+			embedding_model: emb?.model ?? null,
+		}
+	}
+
+	#syncFtsRow(key, content, entityIds, active = true) {
+		if (!this.hasFts5) return
+		try {
+			this.db.prepare('DELETE FROM memory_fts WHERE key = ?').run(key)
+			if (active && content) {
+				this.db.prepare('INSERT INTO memory_fts (key, content, entity_ids) VALUES (?, ?, ?)').run(key, content, normalizeEntityIds(entityIds).join(' '))
+			}
+		} catch {}
+	}
+
+	#logMemoryHistory({ key, op, prev, next, source, now }) {
+		const metaOf = m => (m ? JSON.stringify({
+			priority: m.priority ?? 3,
+			pinned: Boolean(m.pinned),
+			confidence: m.confidence ?? 1.0,
+			expires_at: m.expires_at ?? null,
+			entity_ids: normalizeEntityIds(m.entity_ids),
+			evidence_count: m.evidence_count ?? 1,
+			active: m.active ?? 1,
+		}) : null)
 		this.db.prepare(`
-			INSERT INTO memory_items (category, key, content, source, confidence, created_at, updated_at, expires_at, active)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
+			INSERT INTO memory_history (memory_key, op, prev_category, prev_content, prev_meta, new_category, new_content, new_meta, source, ts)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`).run(
+			key, op,
+			prev?.category ?? null, prev?.content ?? null, metaOf(prev),
+			next?.category ?? null, next?.content ?? null, metaOf(next),
+			source ?? 'agent', now,
+		)
+	}
+
+	getMemory(key) {
+		const r = this.db.prepare('SELECT * FROM memory_items WHERE key = ?').get(key)
+		return r ? this.#mapMemory(r) : null
+	}
+
+	upsertMemory({
+		category, key, content, source = 'agent', confidence = 1.0, expiresAt = null,
+		priority = null, pinned = null, entityIds = null, evidenceCount = null, embedding = null, now = Date.now(),
+	}) {
+		const prev = this.db.prepare('SELECT * FROM memory_items WHERE key = ?').get(key)
+		const resolvedPriority = Number.isInteger(priority) ? Math.min(Math.max(priority, 1), 5)
+			: (prev?.priority ?? MEMORY_DEFAULT_PRIORITY[category] ?? 3)
+		const isUserSrc = USER_SOURCES.has(source)
+		// 고정(pinned) 상태는 사용자가 명시적으로 해제하지 않는 한 자동 갱신에서 유지된다.
+		const resolvedPinned = pinned === null || pinned === undefined
+			? (prev ? (prev.pinned ? 1 : 0) : (category === 'standing_order' && isUserSrc ? 1 : 0))
+			: (pinned ? 1 : (prev?.pinned && !isUserSrc ? 1 : 0))
+		const resolvedEntities = entityIds != null
+			? normalizeEntityIds(entityIds)
+			: (prev ? normalizeEntityIds(prev.entity_ids) : [])
+		const resolvedEvidence = Number.isInteger(evidenceCount) && evidenceCount > 0
+			? evidenceCount
+			: (prev ? (prev.evidence_count ?? 1) + 1 : 1)
+		const resolvedConf = Number.isFinite(Number(confidence)) ? Math.min(Math.max(Number(confidence), 0), 1) : (prev?.confidence ?? 1.0)
+		const resolvedEmbed = unpackEmbedding(embedding)
+			?? packEmbedding(localEmbed(`${key} ${content} ${resolvedEntities.join(' ')}`), 'local')
+		const nextRow = {
+			category, key, content, source, confidence: resolvedConf,
+			expires_at: expiresAt, priority: resolvedPriority, pinned: resolvedPinned,
+			entity_ids: resolvedEntities, evidence_count: resolvedEvidence, active: 1,
+		}
+		this.db.prepare(`
+			INSERT INTO memory_items (category, key, content, source, confidence, created_at, updated_at, expires_at, active, priority, pinned, entity_ids, last_accessed_at, hit_count, embedding, evidence_count)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, NULL, 0, ?, ?)
 			ON CONFLICT(key) DO UPDATE SET
 				category = excluded.category, content = excluded.content, source = excluded.source,
 				confidence = excluded.confidence, updated_at = excluded.updated_at,
-				expires_at = excluded.expires_at, active = 1
-		`).run(category, key, content, source, confidence, now, now, expiresAt)
+				expires_at = excluded.expires_at, active = 1,
+				priority = excluded.priority, pinned = excluded.pinned,
+				entity_ids = excluded.entity_ids, embedding = excluded.embedding,
+				evidence_count = excluded.evidence_count
+		`).run(
+			category, key, content, source, resolvedConf, now, now, expiresAt,
+			resolvedPriority, resolvedPinned, jsonOrNull(resolvedEntities), jsonOrNull(resolvedEmbed), resolvedEvidence,
+		)
+		this.#syncFtsRow(key, content, resolvedEntities, true)
+		this.#logMemoryHistory({ key, op: prev ? 'update' : 'create', prev, next: nextRow, source, now })
+		return this.getMemory(key)
 	}
 
-	deleteMemory(key) {
-		const r = this.db.prepare('UPDATE memory_items SET active = 0, updated_at = ? WHERE key = ? AND active = 1').run(Date.now(), key)
-		return (r?.changes ?? 0) > 0
+	setMemoryPinned(key, pinned, { source = 'user', now = Date.now() } = {}) {
+		const prev = this.db.prepare('SELECT * FROM memory_items WHERE key = ? AND active = 1').get(key)
+		if (!prev) return null
+		const pinVal = pinned ? 1 : 0
+		this.db.prepare('UPDATE memory_items SET pinned = ?, updated_at = ? WHERE key = ?').run(pinVal, now, key)
+		const next = { ...prev, pinned: pinVal }
+		this.#logMemoryHistory({ key, op: pinVal ? 'pin' : 'unpin', prev, next, source, now })
+		return this.getMemory(key)
 	}
 
-	listMemory({ category = null, includeExpired = false, now = Date.now() } = {}) {
-		const clauses = ['active = 1']
+	deleteMemoryDetailed(key, { source = 'agent', force = false, now = Date.now() } = {}) {
+		const prev = this.db.prepare('SELECT * FROM memory_items WHERE key = ? AND active = 1').get(key)
+		if (!prev) return { ok: false, notFound: true, error: `기억을 찾지 못함: ${key}` }
+		const protectedByPin = Boolean(prev.pinned)
+		const protectedByUser = USER_SOURCES.has(prev.source) && !USER_SOURCES.has(source)
+		if (!force && !USER_SOURCES.has(source) && (protectedByPin || protectedByUser)) {
+			return {
+				ok: false,
+				protected: true,
+				error: protectedByPin
+					? `고정(pinned)된 기억(${key})은 자동으로 삭제할 수 없다. 사용자 확인이 필요하다.`
+					: `사용자가 직접 등록한 기억(${key})은 자동으로 삭제할 수 없다.`,
+			}
+		}
+		const r = this.db.prepare('UPDATE memory_items SET active = 0, updated_at = ? WHERE key = ? AND active = 1').run(now, key)
+		if ((r?.changes ?? 0) > 0) {
+			this.#syncFtsRow(key, null, null, false)
+			this.#logMemoryHistory({ key, op: 'delete', prev, next: { ...prev, active: 0 }, source, now })
+			return { ok: true }
+		}
+		return { ok: false, notFound: true }
+	}
+
+	deleteMemory(key, opts = {}) {
+		return this.deleteMemoryDetailed(key, opts).ok
+	}
+
+	archiveExpiredMemory(now = Date.now()) {
+		const expired = this.db.prepare('SELECT * FROM memory_items WHERE active = 1 AND expires_at IS NOT NULL AND expires_at <= ?').all(now)
+		if (!expired.length) return []
+		const upd = this.db.prepare('UPDATE memory_items SET active = 0, updated_at = ? WHERE key = ?')
+		for (const prev of expired) {
+			upd.run(now, prev.key)
+			this.#syncFtsRow(prev.key, null, null, false)
+			this.#logMemoryHistory({ key: prev.key, op: 'expire', prev, next: { ...prev, active: 0 }, source: 'system', now })
+		}
+		return expired.map(r => r.key)
+	}
+
+	touchMemory(keys = [], now = Date.now()) {
+		if (!Array.isArray(keys) || !keys.length) return
+		const stmt = this.db.prepare('UPDATE memory_items SET last_accessed_at = ?, hit_count = COALESCE(hit_count, 0) + 1 WHERE key = ? AND active = 1')
+		for (const k of [...new Set(keys)]) stmt.run(now, k)
+	}
+
+	memoryHistory(key = null, limit = 30) {
+		const rows = key
+			? this.db.prepare('SELECT * FROM memory_history WHERE memory_key = ? ORDER BY id DESC LIMIT ?').all(key, limit)
+			: this.db.prepare('SELECT * FROM memory_history ORDER BY id DESC LIMIT ?').all(limit)
+		return rows.map(r => ({
+			...r,
+			prev_meta: parseJson(r.prev_meta, null),
+			new_meta: parseJson(r.new_meta, null),
+		}))
+	}
+
+	restoreMemoryVersion(historyId, { source = 'user', now = Date.now() } = {}) {
+		const h = this.db.prepare('SELECT * FROM memory_history WHERE id = ?').get(historyId)
+		if (!h || !h.prev_content) return { ok: false, error: `복원할 이전 버전 이력을 찾지 못함: #${historyId}` }
+		const meta = parseJson(h.prev_meta, {})
+		const restored = this.upsertMemory({
+			category: h.prev_category || 'pattern',
+			key: h.memory_key,
+			content: h.prev_content,
+			source,
+			confidence: meta?.confidence ?? 1.0,
+			expiresAt: meta?.expires_at ?? null,
+			priority: meta?.priority ?? null,
+			pinned: meta?.pinned ?? false,
+			entityIds: meta?.entity_ids ?? [],
+			evidenceCount: meta?.evidence_count ?? 1,
+			now,
+		})
+		return { ok: true, item: restored }
+	}
+
+	listMemory({ category = null, includeExpired = false, includeArchived = false, entityId = null, now = Date.now() } = {}) {
+		const clauses = []
 		const params = []
-		if (!includeExpired) {
+		if (!includeArchived) clauses.push('active = 1')
+		if (!includeExpired && !includeArchived) {
 			clauses.push('(expires_at IS NULL OR expires_at > ?)')
 			params.push(now)
 		}
@@ -475,19 +797,462 @@ export class Store {
 			clauses.push('category = ?')
 			params.push(category)
 		}
-		return this.db.prepare(`SELECT * FROM memory_items WHERE ${clauses.join(' AND ')} ORDER BY category ASC, updated_at DESC`).all(...params)
+		const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : ''
+		const rows = this.db.prepare(`
+			SELECT * FROM memory_items ${where}
+			ORDER BY pinned DESC, ${MEMORY_CAT_RANK_SQL} ASC, COALESCE(priority, 3) DESC, updated_at DESC
+		`).all(...params).map(r => this.#mapMemory(r))
+		if (entityId) return rows.filter(r => r.entity_ids.includes(entityId))
+		return rows
 	}
 
-	searchMemory(query, { category = null, limit = 20, now = Date.now() } = {}) {
-		const q = `%${String(query ?? '').trim()}%`
-		const clauses = ['active = 1', '(expires_at IS NULL OR expires_at > ?)', '(key LIKE ? OR content LIKE ?)']
-		const params = [now, q, q]
-		if (category) {
-			clauses.push('category = ?')
-			params.push(category)
+	updateMemoryEmbedding(key, embedding) {
+		const packed = unpackEmbedding(embedding)
+		if (!packed) return false
+		const r = this.db.prepare('UPDATE memory_items SET embedding = ? WHERE key = ?').run(JSON.stringify(packed), key)
+		return (r?.changes ?? 0) > 0
+	}
+
+	memoriesNeedingEmbedding(targetModel, targetDims = 768, { includeArchived = true } = {}) {
+		const rows = this.listMemory({ includeExpired: includeArchived, includeArchived })
+		return rows.filter(it => {
+			const e = it.embedding
+			return !e || e.model !== targetModel || e.dims !== targetDims
+		})
+	}
+
+	embeddingStats(targetModel = null, targetDims = null) {
+		const rows = this.listMemory({ includeExpired: true, includeArchived: true })
+		const byModel = {}
+		let embedded = 0, matchingTarget = 0, activeTotal = 0, activeMatching = 0
+		for (const it of rows) {
+			const e = it.embedding
+			if (it.active) activeTotal++
+			if (e?.vec?.length) {
+				embedded++
+				const k = `${e.model}(${e.dims})`
+				byModel[k] = (byModel[k] ?? 0) + 1
+				if (targetModel && e.model === targetModel && (!targetDims || e.dims === targetDims)) {
+					matchingTarget++
+					if (it.active) activeMatching++
+				}
+			}
+		}
+		return {
+			total: rows.length,
+			active_total: activeTotal,
+			embedded,
+			by_model: byModel,
+			target_model: targetModel,
+			target_dims: targetDims,
+			matching_target: matchingTarget,
+			active_matching: activeMatching,
+		}
+	}
+
+	searchMemory(query, { category = null, limit = 20, includeArchived = false, entityIds = [], queryEmbedding = null, semanticThreshold = DEFAULT_SEMANTIC_THRESHOLD, now = Date.now() } = {}) {
+		const rawQ = String(query ?? '').trim()
+		const entSet = new Set(normalizeEntityIds(entityIds))
+		const all = this.listMemory({ category, includeExpired: includeArchived, includeArchived, now })
+		if (!rawQ && !entSet.size) return all.slice(0, limit)
+
+		// 1) FTS5 점수 (가능할 때)
+		const ftsScores = new Map()
+		if (this.hasFts5 && rawQ) {
+			const toks = tokenize(rawQ)
+			if (toks.length) {
+				const ftsExpr = toks.slice(0, 8).map(t => `"${t.replace(/"/g, '')}"*`).join(' OR ')
+				try {
+					const hits = this.db.prepare('SELECT key, bm25(memory_fts) AS rank FROM memory_fts WHERE memory_fts MATCH ? LIMIT 60').all(ftsExpr)
+					for (const h of hits) ftsScores.set(h.key, 1 / (1 + Math.max(0, Math.abs(Number(h.rank) || 0))))
+				} catch {}
+			}
+		}
+
+		// 2) 하이브리드 점수: FTS5 + 한국어 토큰/2-gram 유사도 + 임베딩(Gemini Embedding 2 또는 로컬 폴백) 코사인 + 엔티티 겹침 + 중요도 보정
+		const qEmb = queryEmbedding ? unpackEmbedding(queryEmbedding) : (rawQ ? packEmbedding(localEmbed(rawQ), 'local') : null)
+		const isNeural = Boolean(qEmb && qEmb.model !== 'local')
+		const semCut = Number.isFinite(Number(semanticThreshold)) ? Number(semanticThreshold) : DEFAULT_SEMANTIC_THRESHOLD
+		const qLower = rawQ.toLowerCase()
+		const scored = []
+		for (const item of all) {
+			const hay = `${item.key} ${item.content} ${item.entity_ids.join(' ')}`
+			const substr = rawQ && hay.toLowerCase().includes(qLower) ? 1.0 : 0
+			const lex = rawQ ? lexicalSimilarity(rawQ, hay) : 0
+			const fts = ftsScores.get(item.key) ?? 0
+			const itemEmb = unpackEmbedding(item.embedding)
+			let vec = 0
+			let neuralCompared = false
+			if (qEmb) {
+				if (itemEmb && itemEmb.model === qEmb.model && itemEmb.vec.length === qEmb.vec.length) {
+					vec = Math.max(0, cosineSimilarity(qEmb.vec, itemEmb.vec))
+					neuralCompared = isNeural
+				} else if (!isNeural) {
+					// 오프라인/동기 폴백 시 DB에 신경망 임베딩이 들어 있더라도 로컬 벡터로 즉석 비교해 품질을 유지한다.
+					const tmpLocal = localEmbed(hay, qEmb.vec.length)
+					if (tmpLocal) vec = Math.max(0, cosineSimilarity(qEmb.vec, tmpLocal))
+				}
+			}
+			const entHits = entSet.size ? item.entity_ids.filter(id => entSet.has(id)).length : 0
+			const entScore = entHits > 0 ? Math.min(1.5, 0.8 + entHits * 0.35) : 0
+
+			let relevance, matched
+			if (neuralCompared) {
+				const semPass = vec >= semCut
+				const semScore = semPass ? (1.4 + (vec - semCut) * 6.0) : Math.max(0, vec - 0.5) * 1.0
+				relevance = substr * 1.2 + lex * 0.8 + fts * 0.6 + semScore + entScore
+				matched = substr > 0 || entHits > 0 || semPass || ((fts > 0 || lex >= 0.55) && vec >= semCut - 0.14)
+			} else {
+				relevance = substr * 1.2 + lex + fts * 0.8 + vec * 0.9 + entScore
+				matched = substr > 0 || fts > 0 || entHits > 0 || lex >= 0.50 || vec >= 0.52
+			}
+			if (!matched) continue
+			const priorityBoost = (item.pinned ? 0.25 : 0) + ((item.priority ?? 3) - 3) * 0.05
+			scored.push({ item, score: relevance + priorityBoost })
+		}
+		scored.sort((a, b) => b.score - a.score || b.item.updated_at - a.item.updated_at)
+		return scored.slice(0, limit).map(s => s.item)
+	}
+
+	// ── 암묵적 피드백(Implicit Feedback) ──
+	recordImplicitFeedback({ ts = Date.now(), kind, entity_id = null, ref_id = null, score = 0, detail = null }) {
+		const t = typeof ts === 'number' ? ts : (Date.parse(ts) || Date.now())
+		this.db.prepare(`
+			INSERT INTO implicit_feedback (ts, kind, entity_id, ref_id, score, detail)
+			VALUES (?, ?, ?, ?, ?, ?)
+		`).run(t, kind, entity_id, ref_id, Number(score) || 0, jsonOrNull(detail))
+	}
+
+	recentImplicitFeedback({ sinceMs = 0, kind = null, limit = 200 } = {}) {
+		const rows = kind
+			? this.db.prepare('SELECT * FROM implicit_feedback WHERE ts >= ? AND kind = ? ORDER BY ts DESC, id DESC LIMIT ?').all(sinceMs, kind, limit)
+			: this.db.prepare('SELECT * FROM implicit_feedback WHERE ts >= ? ORDER BY ts DESC, id DESC LIMIT ?').all(sinceMs, limit)
+		return rows.reverse().map(r => ({ ...r, detail: parseJson(r.detail, r.detail) }))
+	}
+
+	// ── 절차적 기억(Procedural Memory: Lessons / Playbook) ──
+	upsertLesson({
+		key, scope = 'all', condition_text, rule_text, evidence = null, evidence_count = null,
+		confidence = 0.7, pinned = null, source = 'agent', now = Date.now(),
+	}) {
+		const prev = this.db.prepare('SELECT * FROM lessons WHERE key = ?').get(key)
+		const evCount = Number.isInteger(evidence_count) && evidence_count > 0
+			? evidence_count
+			: (prev ? (prev.evidence_count ?? 1) + 1 : 1)
+		const pinVal = pinned == null ? (prev?.pinned ? 1 : 0) : (pinned ? 1 : 0)
+		const conf = Math.min(Math.max(Number(confidence) || prev?.confidence || 0.7, 0), 1)
+		this.db.prepare(`
+			INSERT INTO lessons (key, scope, condition_text, rule_text, evidence, evidence_count, confidence, active, pinned, source, created_at, updated_at, last_used_at, use_count)
+			VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, NULL, 0)
+			ON CONFLICT(key) DO UPDATE SET
+				scope = excluded.scope, condition_text = excluded.condition_text, rule_text = excluded.rule_text,
+				evidence = COALESCE(excluded.evidence, lessons.evidence), evidence_count = excluded.evidence_count,
+				confidence = excluded.confidence, active = 1, pinned = excluded.pinned,
+				source = excluded.source, updated_at = excluded.updated_at
+		`).run(key, scope, condition_text, rule_text, evidence, evCount, conf, pinVal, source, now, now)
+		return this.getLesson(key)
+	}
+
+	getLesson(key) {
+		const r = this.db.prepare('SELECT * FROM lessons WHERE key = ?').get(key)
+		return r ? { ...r, pinned: Boolean(r.pinned), active: Boolean(r.active) } : null
+	}
+
+	listLessons({ scope = null, includeInactive = false, limit = 50 } = {}) {
+		const clauses = []
+		const params = []
+		if (!includeInactive) clauses.push('active = 1')
+		if (scope && scope !== 'all') {
+			clauses.push("(scope = 'all' OR scope = ?)")
+			params.push(scope)
 		}
 		params.push(limit)
-		return this.db.prepare(`SELECT * FROM memory_items WHERE ${clauses.join(' AND ')} ORDER BY updated_at DESC LIMIT ?`).all(...params)
+		const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : ''
+		return this.db.prepare(`
+			SELECT * FROM lessons ${where}
+			ORDER BY pinned DESC, confidence DESC, evidence_count DESC, updated_at DESC LIMIT ?
+		`).all(...params).map(r => ({ ...r, pinned: Boolean(r.pinned), active: Boolean(r.active) }))
+	}
+
+	deleteLesson(key, { source = 'agent', force = false, now = Date.now() } = {}) {
+		const prev = this.db.prepare('SELECT * FROM lessons WHERE key = ? AND active = 1').get(key)
+		if (!prev) return { ok: false, notFound: true }
+		if (!force && !USER_SOURCES.has(source) && prev.pinned) {
+			return { ok: false, protected: true, error: `고정된 교훈(${key})은 자동 삭제할 수 없다.` }
+		}
+		this.db.prepare('UPDATE lessons SET active = 0, updated_at = ? WHERE key = ?').run(now, key)
+		return { ok: true }
+	}
+
+	touchLessons(keys = [], now = Date.now()) {
+		if (!keys.length) return
+		const stmt = this.db.prepare('UPDATE lessons SET last_used_at = ?, use_count = COALESCE(use_count, 0) + 1 WHERE key = ? AND active = 1')
+		for (const k of [...new Set(keys)]) stmt.run(now, k)
+	}
+
+	// ── 변경 실험 원장(Change Experiment Ledger) ──
+	upsertExperiment(exp) {
+		this.db.prepare(`
+			INSERT INTO experiments (eid, ts, kind, ref_id, title, baseline_metrics, eval_after_ts, evaluated_at, after_metrics, verdict, notes, status)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT(eid) DO UPDATE SET
+				evaluated_at = COALESCE(excluded.evaluated_at, experiments.evaluated_at),
+				after_metrics = COALESCE(excluded.after_metrics, experiments.after_metrics),
+				verdict = COALESCE(excluded.verdict, experiments.verdict),
+				notes = COALESCE(excluded.notes, experiments.notes),
+				status = excluded.status
+		`).run(
+			exp.eid, exp.ts, exp.kind, exp.ref_id ?? null, exp.title,
+			jsonOrNull(exp.baseline_metrics), exp.eval_after_ts,
+			exp.evaluated_at ?? null, jsonOrNull(exp.after_metrics),
+			exp.verdict ?? null, exp.notes ?? null, exp.status ?? 'active',
+		)
+		return this.getExperiment(exp.eid)
+	}
+
+	#mapExperiment(r) {
+		if (!r) return null
+		return {
+			...r,
+			baseline_metrics: parseJson(r.baseline_metrics, null),
+			after_metrics: parseJson(r.after_metrics, null),
+		}
+	}
+
+	getExperiment(eid) {
+		return this.#mapExperiment(this.db.prepare('SELECT * FROM experiments WHERE eid = ?').get(eid))
+	}
+
+	listExperiments({ status = null, dueBefore = null, limit = 50 } = {}) {
+		const clauses = []
+		const params = []
+		if (status) { clauses.push('status = ?'); params.push(status) }
+		if (dueBefore != null) { clauses.push('eval_after_ts <= ?'); params.push(dueBefore) }
+		params.push(limit)
+		const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : ''
+		return this.db.prepare(`SELECT * FROM experiments ${where} ORDER BY ts DESC LIMIT ?`).all(...params).map(r => this.#mapExperiment(r))
+	}
+
+	// ── 기간 조회 헬퍼(records.mjs / learning.mjs SQLite 단일 원본) ──
+	#mapDecision(r) {
+		return {
+			...r,
+			ts: new Date(r.ts).toISOString(),
+			reasons: parseJson(r.reasons, []),
+			usage: parseJson(r.usage, null),
+			applied: parseJson(r.applied, null),
+			skipped: Boolean(r.skipped),
+			deferred: Boolean(r.deferred),
+		}
+	}
+
+	decisionsInRange(sinceMs = 0, untilMs = Infinity) {
+		const rows = Number.isFinite(untilMs)
+			? this.db.prepare('SELECT * FROM decisions WHERE ts >= ? AND ts < ? ORDER BY ts ASC').all(sinceMs, untilMs)
+			: this.db.prepare('SELECT * FROM decisions WHERE ts >= ? ORDER BY ts ASC').all(sinceMs)
+		return rows.map(r => this.#mapDecision(r))
+	}
+
+	latestDecision({ excludeAssist = false, onlyAssist = false, excludeSkipped = false, excludeDeferred = false } = {}) {
+		const isAssistOnly = d => Array.isArray(d?.reasons) && d.reasons.length > 0 && d.reasons.every(r => r === 'assist')
+		const clauses = []
+		if (excludeSkipped) clauses.push('skipped = 0')
+		if (excludeDeferred) clauses.push('deferred = 0')
+		if (excludeAssist) clauses.push(`reasons != '["assist"]'`)
+		if (onlyAssist) clauses.push(`reasons = '["assist"]'`)
+		const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : ''
+		const rows = this.db.prepare(`SELECT * FROM decisions ${where} ORDER BY ts DESC, id DESC LIMIT 20`).all()
+		for (const r of rows) {
+			const d = this.#mapDecision(r)
+			if (excludeSkipped && d.skipped) continue
+			if (excludeDeferred && d.deferred) continue
+			if (excludeAssist && isAssistOnly(d)) continue
+			if (onlyAssist && !isAssistOnly(d)) continue
+			return d
+		}
+		return null
+	}
+
+	notificationsInRange(sinceMs = 0, untilMs = Infinity) {
+		const rows = Number.isFinite(untilMs)
+			? this.db.prepare('SELECT * FROM notifications WHERE ts >= ? AND ts < ? ORDER BY ts ASC').all(sinceMs, untilMs)
+			: this.db.prepare('SELECT * FROM notifications WHERE ts >= ? ORDER BY ts ASC').all(sinceMs)
+		return rows.map(r => this.#mapNotification(r))
+	}
+
+	feedbackInRange(sinceMs = 0, untilMs = Infinity) {
+		const rows = Number.isFinite(untilMs)
+			? this.db.prepare('SELECT * FROM feedback WHERE ts >= ? AND ts < ? ORDER BY ts ASC').all(sinceMs, untilMs)
+			: this.db.prepare('SELECT * FROM feedback WHERE ts >= ? ORDER BY ts ASC').all(sinceMs)
+		return rows.map(r => ({
+			...r,
+			ts: new Date(r.ts).toISOString(),
+			rules: parseJson(r.rules, []),
+			muted: parseJson(r.muted, []),
+		}))
+	}
+
+	actionsInRange(sinceMs = 0, untilMs = Infinity) {
+		const rows = Number.isFinite(untilMs)
+			? this.db.prepare('SELECT * FROM actions WHERE ts >= ? AND ts < ? ORDER BY ts ASC').all(sinceMs, untilMs)
+			: this.db.prepare('SELECT * FROM actions WHERE ts >= ? ORDER BY ts ASC').all(sinceMs)
+		return rows.map(r => this.#mapAction(r))
+	}
+
+	eventsInRange(sinceMs = 0, untilMs = Infinity) {
+		const rows = Number.isFinite(untilMs)
+			? this.db.prepare('SELECT ts AS t, entity_id AS id, name, old_state AS "from", new_state AS "to", is_noise FROM events WHERE ts >= ? AND ts < ? ORDER BY ts ASC').all(sinceMs, untilMs)
+			: this.db.prepare('SELECT ts AS t, entity_id AS id, name, old_state AS "from", new_state AS "to", is_noise FROM events WHERE ts >= ? ORDER BY ts ASC').all(sinceMs)
+		return rows
+	}
+
+	messagesInRange(sinceMs = 0, untilMs = Infinity) {
+		const rows = Number.isFinite(untilMs)
+			? this.db.prepare('SELECT session_id, ts, role, text, meta FROM messages WHERE ts >= ? AND ts < ? ORDER BY ts ASC, id ASC').all(sinceMs, untilMs)
+			: this.db.prepare('SELECT session_id, ts, role, text, meta FROM messages WHERE ts >= ? ORDER BY ts ASC, id ASC').all(sinceMs)
+		return rows.map(r => ({ ...r, meta: parseJson(r.meta, null) }))
+	}
+
+	// ── 일/월 장기 Rollup (원시 데이터 삭제 전 영구 요약 보존) ──
+	upsertDailyRollup(doc, now = Date.now()) {
+		if (!doc?.date) return
+		const n = doc.notifications ?? {}
+		const sumKind = pfx => Object.entries(n).filter(([k]) => k.startsWith(`${pfx}/sent`)).reduce((s, [, v]) => s + (Number(v) || 0), 0)
+		this.db.prepare(`
+			INSERT INTO daily_rollups (date, weekday, runs, failed, skipped, noop, tokens, alerts, infos, summaries, feedback_json, actions_json, entities_json, sensor_stats_json, created_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT(date) DO UPDATE SET
+				runs = excluded.runs, failed = excluded.failed, skipped = excluded.skipped, noop = excluded.noop,
+				tokens = excluded.tokens, alerts = excluded.alerts, infos = excluded.infos, summaries = excluded.summaries,
+				feedback_json = excluded.feedback_json, actions_json = excluded.actions_json,
+				entities_json = excluded.entities_json, sensor_stats_json = COALESCE(excluded.sensor_stats_json, daily_rollups.sensor_stats_json),
+				created_at = excluded.created_at
+		`).run(
+			doc.date, doc.weekday ?? kst(new Date(`${doc.date}T12:00:00+09:00`)).wd,
+			doc.runs ?? 0, doc.failed ?? 0, doc.skipped ?? 0, doc.noop ?? 0, doc.tokens ?? 0,
+			doc.alerts ?? sumKind('alert'), doc.infos ?? sumKind('info'), doc.summaries ?? sumKind('hourly_summary'),
+			jsonOrNull(doc.feedback ?? {}), jsonOrNull(doc.actions ?? {}),
+			jsonOrNull(doc.entities ?? {}), jsonOrNull(doc.sensor_stats ?? null), now,
+		)
+	}
+
+	listDailyRollups(limit = 90) {
+		return this.db.prepare('SELECT * FROM daily_rollups ORDER BY date DESC LIMIT ?').all(limit).reverse().map(r => ({
+			...r,
+			feedback: parseJson(r.feedback_json, {}),
+			actions: parseJson(r.actions_json, {}),
+			entities: parseJson(r.entities_json, {}),
+			sensor_stats: parseJson(r.sensor_stats_json, null),
+		}))
+	}
+
+	recomputeMonthlyRollups(now = Date.now()) {
+		const dailies = this.db.prepare('SELECT * FROM daily_rollups ORDER BY date ASC').all()
+		const byMonth = new Map()
+		for (const d of dailies) {
+			const m = String(d.date).slice(0, 7)
+			if (!/^\d{4}-\d{2}$/.test(m)) continue
+			let acc = byMonth.get(m)
+			if (!acc) { acc = { month: m, days: 0, runs: 0, failed: 0, noop: 0, tokens: 0, alerts: 0, summaries: 0, entities: {}, sensors: {} }; byMonth.set(m, acc) }
+			acc.days++
+			acc.runs += d.runs ?? 0
+			acc.failed += d.failed ?? 0
+			acc.noop += d.noop ?? 0
+			acc.tokens += d.tokens ?? 0
+			acc.alerts += d.alerts ?? 0
+			acc.summaries += d.summaries ?? 0
+			for (const [id, info] of Object.entries(parseJson(d.entities_json, {}) ?? {})) {
+				acc.entities[id] = (acc.entities[id] ?? 0) + (info?.changes ?? 0)
+			}
+			for (const [id, st] of Object.entries(parseJson(d.sensor_stats_json, {}) ?? {})) {
+				const cur = (acc.sensors[id] ??= { sum: 0, n: 0, min: Infinity, max: -Infinity })
+				if (Number.isFinite(st?.avg) && st?.n > 0) {
+					cur.sum += st.avg * st.n
+					cur.n += st.n
+					if (Number.isFinite(st.min)) cur.min = Math.min(cur.min, st.min)
+					if (Number.isFinite(st.max)) cur.max = Math.max(cur.max, st.max)
+				}
+			}
+		}
+		const ins = this.db.prepare(`
+			INSERT INTO monthly_rollups (month, days, runs, failed, noop, tokens, alerts, summaries, sensor_stats_json, top_entities_json, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT(month) DO UPDATE SET
+				days = excluded.days, runs = excluded.runs, failed = excluded.failed, noop = excluded.noop,
+				tokens = excluded.tokens, alerts = excluded.alerts, summaries = excluded.summaries,
+				sensor_stats_json = excluded.sensor_stats_json, top_entities_json = excluded.top_entities_json, updated_at = excluded.updated_at
+		`)
+		for (const acc of byMonth.values()) {
+			const topEnt = Object.fromEntries(Object.entries(acc.entities).sort((a, b) => b[1] - a[1]).slice(0, 30))
+			const sStats = Object.fromEntries(Object.entries(acc.sensors).filter(([, v]) => v.n > 0).map(([id, v]) => [id, {
+				avg: Math.round((v.sum / v.n) * 100) / 100,
+				min: v.min,
+				max: v.max,
+				n: v.n,
+			}]))
+			ins.run(acc.month, acc.days, acc.runs, acc.failed, acc.noop, acc.tokens, acc.alerts, acc.summaries, jsonOrNull(sStats), jsonOrNull(topEnt), now)
+		}
+		return byMonth.size
+	}
+
+	listMonthlyRollups(limit = 24) {
+		return this.db.prepare('SELECT * FROM monthly_rollups ORDER BY month DESC LIMIT ?').all(limit).reverse().map(r => ({
+			...r,
+			sensor_stats: parseJson(r.sensor_stats_json, {}),
+			top_entities: parseJson(r.top_entities_json, {}),
+		}))
+	}
+
+	rollupBeforePrune(now, cutoffs) {
+		const earliestCutoff = Math.max(cutoffs.events, cutoffs.samples, cutoffs.decisions)
+		const dates = new Set()
+		for (const r of this.db.prepare('SELECT ts FROM events WHERE ts < ?').all(cutoffs.events)) dates.add(kst(new Date(r.ts)).date)
+		for (const r of this.db.prepare('SELECT ts FROM sensor_samples WHERE ts < ?').all(cutoffs.samples)) dates.add(kst(new Date(r.ts)).date)
+		for (const r of this.db.prepare('SELECT ts FROM decisions WHERE ts < ?').all(cutoffs.decisions)) dates.add(kst(new Date(r.ts)).date)
+		let rolledDays = 0
+		for (const date of [...dates].sort()) {
+			const existing = this.db.prepare('SELECT date FROM daily_rollups WHERE date = ?').get(date)
+			if (existing) continue
+			const start = Date.parse(`${date}T00:00:00+09:00`), end = start + DAY
+			if (end > earliestCutoff + DAY) continue
+			const decs = this.decisionsInRange(start, end)
+			const notes = this.notificationsInRange(start, end)
+			const fbs = this.feedbackInRange(start, end)
+			const acts = this.actionsInRange(start, end)
+			const evs = this.eventsInRange(start, end)
+			const samps = this.db.prepare('SELECT entity_id, value FROM sensor_samples WHERE ts >= ? AND ts < ?').all(start, end)
+			const count = (arr, fn) => arr.reduce((m, x) => { const k = fn(x); m[k] = (m[k] ?? 0) + 1; return m }, {})
+			const entSummary = {}
+			for (const e of evs) {
+				const cur = (entSummary[e.id] ??= { name: e.name ?? e.id, changes: 0 })
+				cur.changes++
+			}
+			const sensorAcc = {}
+			for (const s of samps) {
+				const cur = (sensorAcc[s.entity_id] ??= { sum: 0, n: 0, min: Infinity, max: -Infinity })
+				cur.sum += s.value; cur.n++; cur.min = Math.min(cur.min, s.value); cur.max = Math.max(cur.max, s.value)
+			}
+			const sensorStats = Object.fromEntries(Object.entries(sensorAcc).map(([id, v]) => [id, { avg: Math.round((v.sum / v.n) * 100) / 100, min: v.min, max: v.max, n: v.n }]))
+			const okDecs = decs.filter(d => !d.skipped && !d.deferred && !d.error)
+			const noop = okDecs.filter(d => !(d.applied?.notifications?.length || d.applied?.actions?.length || d.applied?.added?.length || d.applied?.changed?.length || d.applied?.deleted?.length || d.applied?.report)).length
+			this.upsertDailyRollup({
+				date,
+				weekday: kst(new Date(`${date}T12:00:00+09:00`)).wd,
+				runs: decs.filter(d => !d.skipped && !d.deferred).length,
+				failed: decs.filter(d => d.error).length,
+				skipped: decs.filter(d => d.skipped).length,
+				noop,
+				tokens: decs.reduce((s, d) => s + (d.tokens ?? 0), 0),
+				notifications: count(notes, n => `${n.kind}/${n.status}`),
+				feedback: count(fbs, f => f.kind),
+				actions: count(acts, a => a.status),
+				entities: entSummary,
+				sensor_stats: Object.keys(sensorStats).length ? sensorStats : null,
+			}, now)
+			rolledDays++
+		}
+		const rolledMonths = rolledDays > 0 ? this.recomputeMonthlyRollups(now) : 0
+		return { rolledDays, rolledMonths }
 	}
 
 	ensureConversation(sessionId, channel = 'ha_assist', metadata = null, now = Date.now()) {
@@ -572,21 +1337,35 @@ export class Store {
 			}))
 	}
 
-	maintain(now = Date.now(), { eventDays = 60, sampleDays = 30, decisionDays = 90, messageDays = 90, notificationDays = 90, feedbackDays = 180 } = {}) {
-		const DAY = 86400000
+	maintain(now = Date.now(), { eventDays = 60, sampleDays = 30, decisionDays = 90, messageDays = 90, notificationDays = 90, feedbackDays = 180, implicitFeedbackDays = 180 } = {}) {
+		const cutoffs = {
+			events: now - eventDays * DAY,
+			samples: now - sampleDays * DAY,
+			decisions: now - decisionDays * DAY,
+			messages: now - messageDays * DAY,
+			notifications: now - notificationDays * DAY,
+			feedback: now - feedbackDays * DAY,
+			implicit: now - implicitFeedbackDays * DAY,
+		}
+		// 원시 기록을 지우기 전에 일/월 단위 요약(Rollup)을 영구 테이블에 보존한다.
+		const rollup = this.rollupBeforePrune(now, cutoffs)
+		this.archiveExpiredMemory(now)
 		const del = (sql, cutoff) => Number(this.db.prepare(sql).run(cutoff)?.changes ?? 0)
 		const deleted = {
-			events: del('DELETE FROM events WHERE ts < ?', now - eventDays * DAY),
-			sensor_samples: del('DELETE FROM sensor_samples WHERE ts < ?', now - sampleDays * DAY),
-			decisions: del('DELETE FROM decisions WHERE ts < ?', now - decisionDays * DAY),
-			messages: del('DELETE FROM messages WHERE ts < ?', now - messageDays * DAY),
-			notifications: del('DELETE FROM notifications WHERE ts < ?', now - notificationDays * DAY),
-			feedback: del('DELETE FROM feedback WHERE ts < ?', now - feedbackDays * DAY),
+			events: del('DELETE FROM events WHERE ts < ?', cutoffs.events),
+			sensor_samples: del('DELETE FROM sensor_samples WHERE ts < ?', cutoffs.samples),
+			decisions: del('DELETE FROM decisions WHERE ts < ?', cutoffs.decisions),
+			messages: del('DELETE FROM messages WHERE ts < ?', cutoffs.messages),
+			notifications: del('DELETE FROM notifications WHERE ts < ?', cutoffs.notifications),
+			feedback: del('DELETE FROM feedback WHERE ts < ?', cutoffs.feedback),
+			implicit_feedback: del('DELETE FROM implicit_feedback WHERE ts < ?', cutoffs.implicit),
 		}
 		deleted.conversations = Number(
 			this.db.prepare('DELETE FROM conversations WHERE updated_at < ? AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.session_id = conversations.session_id)')
-				.run(now - messageDays * DAY)?.changes ?? 0,
+				.run(cutoffs.messages)?.changes ?? 0,
 		)
+		deleted.rolled_up_days = rollup.rolledDays
+		deleted.rolled_up_months = rollup.rolledMonths
 		this.db.exec('PRAGMA wal_checkpoint(TRUNCATE);')
 		return deleted
 	}
@@ -601,6 +1380,12 @@ export class Store {
 			proposals: c('proposals'),
 			proposals_pending: Number(this.db.prepare("SELECT COUNT(*) AS n FROM proposals WHERE status = 'pending'").get().n),
 			memory_items: Number(this.db.prepare('SELECT COUNT(*) AS n FROM memory_items WHERE active = 1').get().n),
+			memory_pinned: Number(this.db.prepare('SELECT COUNT(*) AS n FROM memory_items WHERE active = 1 AND pinned = 1').get().n),
+			lessons: Number(this.db.prepare('SELECT COUNT(*) AS n FROM lessons WHERE active = 1').get().n),
+			experiments_active: Number(this.db.prepare("SELECT COUNT(*) AS n FROM experiments WHERE status = 'active'").get().n),
+			implicit_feedback: c('implicit_feedback'),
+			daily_rollups: c('daily_rollups'),
+			monthly_rollups: c('monthly_rollups'),
 			conversations: c('conversations'),
 			notifications: c('notifications'),
 			feedback: c('feedback'),

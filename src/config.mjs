@@ -40,6 +40,22 @@ export const DEFAULTS = {
 		keep_runs: 100, // logs/runs/에 남길 판단 원문 개수
 		keep_snapshots: 30, // state/history/에 남길 규칙·메모 이전 판 개수(종류별)
 		keep_weekly: 26, // state/weekly/에 남길 주간 분석 보고서 개수
+		backtest_max_fires: 25, // 사전 백테스트 7일 발동 한도(초과 시 규칙 적용 보류)
+		proposal_self_repair: true, // HA 관리 제안 사전 검증 실패 시 1회 자가 수정 라운드 허용
+	},
+	// 계층형 메모리 및 대화 직후 비동기 기억 추출·임베딩 설정
+	memory: {
+		post_turn_extract: true,
+		post_turn_llm: true,
+		embedding_model: 'local', // 'local' 또는 Gemini 임베딩 모델명(권장: 'gemini-embedding-2')
+		embedding_dims: 768,
+		semantic_threshold: 0.66,
+	},
+	// 자가학습·실험 원장 설정
+	learning: {
+		enabled: true,
+		experiment_eval_days: 7,
+		auto_consolidate_on_reflection: true,
 	},
 	// 판단 방식: 'codex'(Codex CLI를 격리해 실행) 또는 'api'(OpenAI API 직접 호출). 실행 중에는 `cli.mjs brain`으로 바꾼다.
 	brain: 'codex',
@@ -168,7 +184,7 @@ export const DEFAULTS = {
 	},
 }
 
-const NESTED = ['active_hours', 'limits', 'codex', 'api', 'agy', 'gemini', 'llm', 'weekly', 'failover', 'escalation', 'heartbeat', 'oob', 'actions', 'policy', 'assist']
+const NESTED = ['active_hours', 'limits', 'memory', 'learning', 'codex', 'api', 'agy', 'gemini', 'llm', 'weekly', 'failover', 'escalation', 'heartbeat', 'oob', 'actions', 'policy', 'assist']
 const BRAIN_ALIAS = { openai: 'api', antigravity: 'agy', 'gemini-api': 'gemini' }
 const dropNull = obj => Object.fromEntries(Object.entries(obj ?? {}).filter(([, v]) => v !== undefined && v !== null))
 

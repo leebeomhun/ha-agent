@@ -8,6 +8,7 @@
     "next_wakes",
     "memory",
     "memory_ops",
+    "lesson_ops",
     "info_requests",
     "actions",
     "proposals",
@@ -262,7 +263,11 @@
           "op",
           "category",
           "key",
-          "content"
+          "content",
+          "ttl_days",
+          "confidence",
+          "pinned",
+          "entity_ids"
         ],
         "properties": {
           "op": {
@@ -287,6 +292,97 @@
           },
           "content": {
             "type": "string"
+          },
+          "ttl_days": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "만료 일수(양수). 0 또는 null이면 카테고리 기본 정책(standing_order/preference 무기한, incident 21일)"
+          },
+          "confidence": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "description": "확신도 0~1. null이면 1.0"
+          },
+          "pinned": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "영구 고정 여부(true면 자동 삭제·만료 차단, 프롬프트 최우선 배치). null이면 기존 유지"
+          },
+          "entity_ids": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "연관 엔티티 ID 목록(맥락 기반 회상용). 없으면 null"
+          }
+        }
+      }
+    },
+    "lesson_ops": {
+      "type": "array",
+      "description": "절차적 교훈(Playbook: 반복 실패에서 얻은 행동 원칙) 추가·수정·삭제. 없으면 빈 배열",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "op",
+          "key",
+          "scope",
+          "condition_text",
+          "rule_text",
+          "evidence",
+          "pinned"
+        ],
+        "properties": {
+          "op": {
+            "type": "string",
+            "enum": [
+              "upsert",
+              "delete"
+            ]
+          },
+          "key": {
+            "type": "string"
+          },
+          "scope": {
+            "type": "string",
+            "enum": [
+              "all",
+              "assist",
+              "cycle",
+              "weekly",
+              "proposal"
+            ]
+          },
+          "condition_text": {
+            "type": "string",
+            "description": "적용 상황(When)"
+          },
+          "rule_text": {
+            "type": "string",
+            "description": "지켜야 할 행동 원칙(Rule)"
+          },
+          "evidence": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "근거 사례 요약. 없으면 null"
+          },
+          "pinned": {
+            "type": [
+              "boolean",
+              "null"
+            ]
           }
         }
       }
@@ -413,7 +509,11 @@
               "reload_config_entry",
               "backup_create",
               "entity_admin",
-              "promote_rule"
+              "promote_rule",
+              "self_alias_proposal",
+              "self_noise_proposal",
+              "self_stt_tune",
+              "self_lesson_proposal"
             ]
           },
           "target_id": {

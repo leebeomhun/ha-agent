@@ -11,6 +11,7 @@ import { Store } from './core/store.mjs'
 import { Journal } from './core/journal.mjs'
 import { MemoryManager } from './core/memory.mjs'
 import { AnomalyEngine } from './engine/anomaly.mjs'
+import { ImplicitFeedbackTracker, buildLearningDigest, registerExperiment, evaluateDueExperiments } from './engine/learning.mjs'
 import { HaAdmin } from './admin/ha-admin.mjs'
 import { ToolBroker } from './tools/registry.mjs'
 import { digestHaData } from './tools/read.mjs'
@@ -25,7 +26,7 @@ import { backtestRule, backtestable } from './backtest.mjs'
 import { Notifier } from './agent/notifier.mjs'
 import { ActionExecutor } from './agent/action-executor.mjs'
 import { AssistHandler } from './agent/assist-handler.mjs'
-import { P, DAY, readJson, writeJson, appendJsonl, readJsonlAll, kst, fmt, log, expandHome, globs } from './util.mjs'
+import { P, DAY, readJson, writeJson, kst, fmt, log, expandHome, globs } from './util.mjs'
 import { loadConfig, loadControl } from './config.mjs'
 
 const MIN = 60000
@@ -93,7 +94,8 @@ export class Agent {
 		this.failures = 0
 		this.failover = null
 		this.lastFailedMode = null
-		this.lastRun = dry ? null : readJsonlAll(P.decisions).at(-1) ?? null
+		this.lastRun = dry ? null : this.journal.latestDecision({ excludeAssist: true, excludeSkipped: true, excludeDeferred: true })
+		this.lastAssist = dry ? null : this.journal.latestDecision({ onlyAssist: true })
 		this.preAt = new Map()
 		this.meta = { at: 0, areaOf: null, catOf: null, autoCfg: null }
 		this.lastBeat = 0
@@ -104,13 +106,33 @@ export class Agent {
 		this.sessionLocks = new Map()
 		this.cycleChain = Promise.resolve()
 
-		this.memoryMgr = new MemoryManager({ store: this.store })
-		this.anomaly = new AnomalyEngine({ store: this.store, isNoise: this.isNoise })
+		this.memoryMgr = new MemoryManager({ store: this.store, cfg: this.cfg })
+		this.anomaly = new AnomalyEngine({ store: this.store, isNoise: this.isNoise, awayOverrideEntity: this.cfg.away_override_entity })
+		this.implicitFeedback = new ImplicitFeedbackTracker({ store: this.store })
 		this.sessions = new SessionManager({ store: this.store })
 		this.llmRouter = new LlmRouter({ cfg: this.cfg, brainFn: this.brain, canUse: this.canUse })
 		this.haAdmin = new HaAdmin({
 			cfg: this.cfg, ha: this.ha, store: this.store, states: this.states, meta: this.meta, memory: this.memoryMgr, policy: this.policy,
 			onRulePromoted: async ruleId => this.#removePromotedRule(ruleId),
+			onConfigUpdated: async merged => {
+				this.cfg = merged
+				this.isNoise = globs(this.cfg.noise_entities)
+				this.anomaly.isNoise = this.isNoise
+				this.llmRouter.cfg = merged
+				this.memoryMgr.cfg = merged
+			},
+			onProposalOutcome: (prop, status, at, err) => {
+				this.implicitFeedback.onProposalOutcome(prop, status, at, err)
+				if (status === 'applied' && this.store && this.cfg.learning?.enabled !== false) {
+					registerExperiment(this.store, {
+						kind: `proposal:${prop.kind}`,
+						ref_id: prop.pid,
+						title: prop.title,
+						evalDays: this.cfg.learning?.experiment_eval_days ?? 7,
+						now: at,
+					})
+				}
+			},
 		})
 		this.notifier = new Notifier(this)
 		this.actionExecutor = new ActionExecutor(this)
@@ -142,6 +164,11 @@ export class Agent {
 		this.attach()
 		this.ha.start()
 		if (this.assistServer) this.assistServer.start().catch(e => log('Assist 서버 시작 실패:', e.message))
+		if (!this.dry && this.memoryMgr?.embeddingConfig().enabled) {
+			this.memoryMgr.backfillEmbeddings()
+				.then(r => { if (r.updated) log(`기억 임베딩 백필 완료 (${r.model}/${r.dims}d): ${r.updated}건 갱신`) })
+				.catch(e => log('기억 임베딩 백필 실패:', e.message))
+		}
 		if (!this.dry) this.timer = setInterval(() => this.tick().catch(e => log('tick 오류:', e.stack)), 15000)
 	}
 	stop() {
@@ -176,7 +203,8 @@ export class Agent {
 			pending_actions: this.pendingActs.length,
 			pending_proposals: this.haAdmin.listProposals({ status: 'pending' }).length,
 			today: c,
-			last_run: this.lastRun ? { ts: this.lastRun.ts, summary: this.lastRun.summary, error: this.lastRun.error } : null,
+			last_run: this.lastRun ? { ts: this.lastRun.ts, summary: this.lastRun.summary, error: this.lastRun.error ?? null } : null,
+			last_assist: this.lastAssist ? { ts: this.lastAssist.ts, summary: this.lastAssist.summary, error: this.lastAssist.error ?? null } : null,
 			db: this.store ? this.store.stats() : null,
 		}
 	}
@@ -214,6 +242,7 @@ export class Agent {
 			if (bucket.length > 300) bucket.shift()
 			// 기록이 실패해도(디스크·DB) 규칙 판정은 이어 간다.
 			try { this.journal.event(c, isNoise) } catch (e) { this.#warnOnce('event', '상태 변화 기록 실패:', e) }
+			try { this.implicitFeedback.onStateEvent(c, { now }) } catch {}
 		}
 		const fired = this.engine.onState(id, n, now, this.states)
 		if (fired.length) { this.saveRuntime(); this.#handleFired(fired) }
@@ -437,7 +466,7 @@ export class Agent {
 				writeJson(P.counters, this.counters)
 				if (prev) {
 					try {
-						writeDaily(prev)
+						writeDaily(prev, 60, { store: this.store })
 						rotateLogs()
 						this.store?.maintain(this.clock())
 					} catch (e) { log('하루 정리 실패:', e.message) }
@@ -534,10 +563,23 @@ export class Agent {
 				const aoSt = aoId ? this.states.get(aoId) : null
 				const awayOverride = aoSt ? { id: aoId, name: aoSt.attributes?.friendly_name, state: aoSt.state } : null
 				const assistHistory = (!this.dry && deep && this.store) ? this.store.recentConversationMessages({ sinceMs: started - DAY, limit: 30 }) : []
+				// 하루 돌아보기(reflection) 시 만료 기억 아카이브·중복 병합·기한 도래 실험 평가를 먼저 수행해 최신 상태를 프롬프트에 반영한다.
+				const isReflection = reasons.some(r => r.type === 'reflection')
+				if (!this.dry && isReflection && this.store && this.cfg.learning?.enabled !== false) {
+					if (this.cfg.learning?.auto_consolidate_on_reflection !== false) {
+						try { this.memoryMgr.consolidate({ now: started }) } catch (e) { log('기억 통합 실패:', e.message) }
+					}
+					try { evaluateDueExperiments(this.store, started) } catch (e) { log('실험 사후 평가 실패:', e.message) }
+				}
+				const reasonText = reasons.map(r => r.text ?? r.reason ?? r.description ?? r.rule_id ?? r.type).filter(Boolean).join(' ')
+				const reasonEntities = [...new Set(reasons.map(r => r.entity_id).filter(Boolean))]
+				const lessonScope = weekly ? 'weekly' : 'cycle'
 				const base = {
 					now: started, quiet: this.isQuiet(started), reasons,
 					rules: this.engine.rules, runtime: this.runtime.rules, schedule: this.schedule,
-					memory: this.memoryMgr.renderForPrompt(this.cfg.limits.memory_chars),
+					memory: await this.memoryMgr.renderForPromptAsync(this.cfg.limits.memory_chars, { contextText: reasonText, entityIds: reasonEntities, now: started, touch: !this.dry }),
+					lessons: this.memoryMgr.renderLessons(lessonScope, 1200, { now: started, touch: !this.dry }),
+					memoryHygiene: deep ? this.memoryMgr.hygieneHints(started) : null,
 					homeProfile: this.memoryMgr.loadHomeProfile(),
 					recentNotes: this.journal.notifications({ sinceMs: started - DAY + 1 }),
 					feedback: this.journal.feedbackRows({ sinceMs: started - 7 * DAY + 1 }),
@@ -545,7 +587,10 @@ export class Agent {
 					pendingProposals: this.haAdmin.listProposals({ status: 'pending', limit: 10 }),
 					ring: [...this.ring, ...this.noiseRing].sort((a, b) => a.t - b.t),
 					weather: ctx.weather, calendar: ctx.calendar,
-					actions: this.actionExecutor.actionContext(), metrics: deep ? weekMetrics(started) : null, lastReport,
+					actions: this.actionExecutor.actionContext(), metrics: deep ? weekMetrics(started, { store: this.store }) : null, lastReport,
+					learningDigest: (deep && this.store && this.cfg.learning?.enabled !== false)
+						? buildLearningDigest({ store: this.store, rules: this.engine.rules, runtime: this.runtime.rules, cfg: this.cfg, states: this.states, now: started, isNoise: this.isNoise })
+						: null,
 					assistHistory,
 					awayOverride, sysDelta,
 					hours: {
@@ -568,7 +613,7 @@ export class Agent {
 				const timeoutSec = weekly ? this.cfg.weekly.timeout_seconds : deep ? bs.timeout_deep_seconds : bs.timeout_seconds
 				const model = mode === primary && this.failures >= this.cfg.failover.after_failures && bs.fallback_model ? bs.fallback_model : bs.model
 				if (model !== bs.model) entry.model = model
-				let infoFiles = [], res
+				let infoFiles = [], res, repairFeedback = null, repairedProposals = false
 				entry.codex_ms = 0
 				this.runAbort = new AbortController()
 				const perCycle = this.cfg.actions.per_cycle
@@ -599,7 +644,7 @@ export class Agent {
 				try {
 					for (let round = 1; ; round++) {
 						const lastRound = round >= this.cfg.limits.max_rounds
-						const prompt = buildPrompt({ ...base, guide, infoFiles, lastRound })
+						const prompt = buildPrompt({ ...base, guide, infoFiles, repairFeedback, lastRound })
 						const r = await this.llmRouter.run({
 							cfg: this.cfg, mode, prompt, effort, timeoutSec, model, signal: this.runAbort.signal,
 							...((mode === 'api' || mode === 'gemini') && this.brain === runBrain ? { toolBroker: this.toolBroker, toolContext } : {}),
@@ -616,10 +661,24 @@ export class Agent {
 							entry.usage.output += r.usage.output ?? 0
 							entry.usage.reasoning += r.usage.reasoning ?? 0
 						}
-						if (!res.info_requests.length || lastRound) break
-						const more = await this.#fetchInfo(res.info_requests, infoFiles.length)
-						if (!more.length) break
-						infoFiles = [...infoFiles, ...more]
+						if (res.info_requests.length && !lastRound) {
+							const more = await this.#fetchInfo(res.info_requests, infoFiles.length)
+							if (more.length) {
+								infoFiles = [...infoFiles, ...more]
+								continue
+							}
+						}
+						// HA 관리 제안 사전 검증 실패 시 1회 자가 수정(Self-Repair) 라운드
+						if (!lastRound && !repairedProposals && this.cfg.limits.proposal_self_repair !== false && this.cfg.policy?.admin_enabled && res.proposals?.length) {
+							const preErrors = await this.#precheckProposals(res.proposals)
+							if (preErrors.length) {
+								repairedProposals = true
+								repairFeedback = preErrors
+								entry.proposal_repaired = true
+								continue
+							}
+						}
+						break
 					}
 				} finally { this.runAbort = null }
 				if (infoFiles.length) entry.info = infoFiles.map(h => `${h.kind}:${h.entity_ids.join(',')}`)
@@ -643,10 +702,10 @@ export class Agent {
 			if (!this.dry) await this.#onFailure(reasons, e, mode)
 		}
 		entry.total_ms = this.clock() - started
-		this.lastRun = entry
+		if (!entry.skipped && !entry.deferred) this.lastRun = entry
 		if (!this.dry) {
-			appendJsonl(P.decisions, entry)
-			this.store?.recordDecision(entry)
+			this.journal.decision(entry)
+			if (!entry.skipped && !entry.deferred) this.notifier.heartbeat(this.clock(), { force: true })
 			if (rounds.length) try { archiveRun({ started, reasons, input, rounds, keep: this.cfg.limits.keep_runs }) } catch (e) { log('판단 원문 보관 실패:', e.message) }
 		}
 		log(`판단 끝 (${Math.round(entry.total_ms / 1000)}초, 토큰 ${entry.tokens ?? '?'}): ${entry.error ? `실패 ${entry.error}` : entry.summary}`)
@@ -974,6 +1033,18 @@ export class Agent {
 		return files
 	}
 
+	async #precheckProposals(proposals = []) {
+		const errs = []
+		for (const p of proposals) {
+			if (p.kind === 'automation_upsert' || p.kind === 'script_upsert') {
+				const cfg = p.payload?.config ?? p.payload
+				const v = await this.haAdmin.validateHaConfig(p.kind, cfg)
+				if (!v.valid) errs.push({ title: p.title, error: v.errors.join(', ') })
+			}
+		}
+		return errs
+	}
+
 	async #apply(res, reasons, toolLog = null) {
 		const now = this.clock(), keep = this.cfg.limits.keep_snapshots
 		const out = { added: [], changed: [], deleted: [], rejected: [...(toolLog?.rejected ?? [])], wakes: [], memory: res.memory.mode, actions: [], proposals: [...(toolLog?.proposals ?? [])], notifications: [] }
@@ -981,13 +1052,14 @@ export class Agent {
 		for (const id of res.rule_changes.delete) {
 			if (rules.some(r => r.id === id)) { rules = rules.filter(r => r.id !== id); out.deleted.push(id) }
 		}
+		const candidateChanged = []
 		for (const raw of res.rule_changes.upsert) {
 			const v = validateRule(raw, this.states)
 			if (!v.ok) { out.rejected.push({ rule: raw?.id ?? null, error: v.error }); continue }
 			const i = rules.findIndex(r => r.id === v.rule.id)
-			if (i >= 0) { rules[i] = v.rule; out.changed.push(v.rule.id) }
+			if (i >= 0) { rules[i] = v.rule; out.changed.push(v.rule.id); candidateChanged.push(v.rule) }
 			else if (rules.length >= this.cfg.limits.max_rules) out.rejected.push({ rule: v.rule.id, error: `규칙은 ${this.cfg.limits.max_rules}개까지` })
-			else { rules.push(v.rule); out.added.push(v.rule.id) }
+			else { rules.push(v.rule); out.added.push(v.rule.id); candidateChanged.push(v.rule) }
 		}
 		const wakes = []
 		for (const w of res.next_wakes) {
@@ -996,21 +1068,87 @@ export class Agent {
 			wakes.push({ at: iso(at), reason: w.reason })
 		}
 		if (this.dry) {
-			out.preview = { rules: rules.filter(r => out.added.includes(r.id) || out.changed.includes(r.id)), wakes, memory: res.memory, memory_ops: res.memory_ops, actions: res.actions, proposals: res.proposals, notifications: res.notifications, report: res.report || undefined }
+			out.preview = { rules: rules.filter(r => out.added.includes(r.id) || out.changed.includes(r.id)), wakes, memory: res.memory, memory_ops: res.memory_ops, lesson_ops: res.lesson_ops, actions: res.actions, proposals: res.proposals, notifications: res.notifications, report: res.report || undefined }
 			return out
+		}
+		// 사전 백테스트 게이트(Pre-Apply Gate): 새로 만들거나 고친 규칙이 지난 7일 기록에서 과다 발동하면 적용하지 않고 거절한다.
+		const backtestResults = new Map()
+		const tested = []
+		const maxFires = this.cfg.limits.backtest_max_fires ?? 25
+		if (this.cfg.rule_backtest && candidateChanged.length && typeof this.ha?.history === 'function') {
+			const btRules = candidateChanged.filter(backtestable)
+			if (btRules.length) {
+				try {
+					const hours = 168
+					const hist = await this.ha.history([...new Set(btRules.flatMap(r => [r.entity_id, ...(r.also ?? []).map(c => c.entity_id)]))], hours)
+					for (const r of btRules) {
+						try {
+							const b = backtestRule(r, hist, now - hours * 3600000, now)
+							if (!b) continue
+							if (b.fires > maxFires) {
+								out.rejected.push({ rule: r.id, error: `사전 백테스트 과다 발동 차단: 지난 ${b.days}일간 ${b.fires}회(상한 ${maxFires}회). 조건·for_minutes·cooldown을 조정할 것` })
+								const prevRule = this.engine.rules.find(x => x.id === r.id)
+								if (prevRule) rules = rules.map(x => (x.id === r.id ? prevRule : x))
+								else rules = rules.filter(x => x.id !== r.id)
+								out.added = out.added.filter(id => id !== r.id)
+								out.changed = out.changed.filter(id => id !== r.id)
+							} else {
+								backtestResults.set(r.id, b)
+								tested.push(`${r.id}: 지난 ${b.days}일 기록으로 ${b.fires}회`)
+							}
+						} catch (e) { log(`규칙 백테스트 실패(${r.id}):`, e.message) }
+					}
+				} catch (e) { log('규칙 백테스트용 기록을 받지 못함:', e.message) }
+			}
 		}
 		if (out.added.length || out.changed.length || out.deleted.length || !this.rulesDoc) {
 			snapshot('rules', this.rulesDoc, now, keep)
 			this.engine.setRules(rules, this.states, now, [...out.added, ...out.changed])
+			for (const [rid, b] of backtestResults) {
+				if (this.runtime.rules[rid]) this.runtime.rules[rid].backtest = b
+			}
 			this.rulesDoc = { updated: iso(now), rules }
 			writeJson(P.rules, this.rulesDoc)
 			this.saveRuntime()
+			if (this.store && this.cfg.learning?.enabled !== false) {
+				for (const rid of [...out.added, ...out.changed]) {
+					registerExperiment(this.store, {
+						kind: 'rule',
+						ref_id: rid,
+						title: `감시 규칙 ${out.added.includes(rid) ? '추가' : '수정'}: ${rid}`,
+						evalDays: this.cfg.learning?.experiment_eval_days ?? 7,
+						now,
+					})
+				}
+			}
+		}
+		if (tested.length) {
+			out.backtest = tested
+			log('규칙 백테스트:', tested.join(' · '))
 		}
 		this.schedule = [...this.schedule, ...wakes].sort((a, b) => Date.parse(a.at) - Date.parse(b.at)).slice(0, this.cfg.limits.max_pending_wakes)
 		writeJson(P.schedule, this.schedule)
 		out.wakes = wakes.map(w => fmt(Date.parse(w.at)))
 		this.memoryMgr.applyLegacy(res.memory, out, now, { dry: this.dry, max: this.cfg.limits.memory_chars, keepSnapshots: keep })
-		if (res.memory_ops?.length) this.memoryMgr.applyOps(res.memory_ops, { source: 'cycle', now })
+		if (res.memory_ops?.length) {
+			const mSrc = reasons.some(r => r.type === 'user') ? 'user' : 'cycle'
+			const mRes = this.memoryMgr.applyOps(res.memory_ops, { source: mSrc, now })
+			for (const b of mRes.blocked ?? []) out.rejected.push({ memory_delete: b.key, error: b.error })
+		}
+		if (res.lesson_ops?.length && this.store) {
+			const lSrc = reasons.some(r => r.type === 'user') ? 'user' : 'cycle'
+			for (const l of res.lesson_ops) {
+				if (l.op === 'delete') {
+					const dr = this.store.deleteLesson(l.key, { source: lSrc, now })
+					if (dr.protected) out.rejected.push({ lesson_delete: l.key, error: dr.error })
+				} else {
+					this.store.upsertLesson({ ...l, source: lSrc, now })
+					if (this.cfg.learning?.enabled !== false) {
+						registerExperiment(this.store, { kind: 'lesson', ref_id: l.key, title: `교훈 등록: ${l.key}`, evalDays: this.cfg.learning?.experiment_eval_days ?? 7, now })
+					}
+				}
+			}
+		}
 		const notes = [...res.notifications]
 		out.actions = [...(toolLog?.actions ?? []), ...await this.actionExecutor.applyActions(res.actions, out, reasons, { used: toolLog?.calls ?? 0 })]
 		const rejectedProposals = []
@@ -1020,6 +1158,7 @@ export class Agent {
 			else {
 				out.rejected.push({ proposal: p.title, error: pr.error })
 				rejectedProposals.push({ title: p.title, error: pr.error })
+				this.implicitFeedback.onProposalOutcome(p, 'validation_failed', now, pr.error)
 			}
 		}
 		if (res.report) {
@@ -1034,28 +1173,6 @@ export class Agent {
 		}
 		for (const n of notes) out.notifications.push(await this.notifier.deliver(n, reasons))
 		writeJson(P.rejected, out.rejected)
-		const tested = await this.#backtest([...out.added, ...out.changed], now)
-		if (tested.length) out.backtest = tested
-		return out
-	}
-
-	async #backtest(ids, now) {
-		if (!this.cfg.rule_backtest || !ids.length) return []
-		const rules = this.engine.rules.filter(r => ids.includes(r.id) && backtestable(r))
-		if (!rules.length) return []
-		const hours = 168
-		let hist
-		try { hist = await this.ha.history([...new Set(rules.flatMap(r => [r.entity_id, ...(r.also ?? []).map(c => c.entity_id)]))], hours) } catch (e) { log('규칙 백테스트용 기록을 받지 못함:', e.message); return [] }
-		const out = []
-		for (const r of rules) {
-			try {
-				const b = backtestRule(r, hist, now - hours * 3600000, now)
-				if (!b || !this.runtime.rules[r.id]) continue
-				this.runtime.rules[r.id].backtest = b
-				out.push(`${r.id}: 지난 ${b.days}일 기록으로 ${b.fires}회`)
-			} catch (e) { log(`규칙 백테스트 실패(${r.id}):`, e.message) }
-		}
-		if (out.length) { this.saveRuntime(); log('규칙 백테스트:', out.join(' · ')) }
 		return out
 	}
 
