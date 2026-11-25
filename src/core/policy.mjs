@@ -192,6 +192,97 @@ export function isAlreadyReached(domain, service, data, st) {
 	return false
 }
 
+const num = v => (v === null || v === undefined || v === '' ? NaN : Number(v))
+const near = (a, b, tol) => Number.isFinite(num(a)) && Number.isFinite(num(b)) && Math.abs(num(a) - num(b)) <= tol
+const clampTo = (v, lo, hi) => Math.min(Number.isFinite(hi) ? hi : v, Math.max(Number.isFinite(lo) ? lo : v, v))
+// 팬 속도는 단계로 맞춰진다(예: 3단 팬은 33.3% 단위). 한 단계 안이면 요청이 먹은 것으로 본다.
+const fanPctOk = (a, want) => (want === 0 ? null : near(a.percentage, want, Math.max(1, Number(a.percentage_step) || 1)))
+
+// 요청한 값이 지금 상태에 반영됐는가. true: 확인됨, false: 아직 아님, null: 이 서비스는 상태로 확인할 방법이 없음.
+// 켜기만 보고 성공으로 치지 않는다: 이미 켜진 조명의 밝기를 바꾸면 밝기까지, 선택값·숫자값은 그 값까지 맞아야 한다.
+export function controlReached(domain, service, data = {}, st) {
+	if (!st || DEAD.has(st.state)) return false
+	const a = st.attributes ?? {}, s = st.state, d = data ?? {}
+	if (domain === 'script' || domain === 'scene') return null
+	switch (`${domain}.${service}`) {
+		case 'climate.turn_on': return s !== 'off'
+		case 'climate.turn_off': return s === 'off'
+		case 'climate.set_hvac_mode': return s === String(d.hvac_mode)
+		case 'climate.set_temperature': return near(a.temperature, d.temperature, 0.25) && (d.hvac_mode == null || s === String(d.hvac_mode))
+		case 'fan.set_percentage': return d.percentage === 0 ? s === 'off' : s === 'on' && fanPctOk(a, d.percentage) === true
+		case 'fan.set_preset_mode': return a.preset_mode === d.preset_mode
+		case 'humidifier.set_humidity': return near(a.humidity, d.humidity, 1)
+		case 'humidifier.set_mode': return a.mode === d.mode
+		case 'cover.open_cover': return s === 'open' || s === 'opening'
+		case 'cover.close_cover': return s === 'closed' || s === 'closing'
+		case 'cover.set_cover_position': return near(a.current_position, d.position, 2) || s === 'opening' || s === 'closing'
+		case 'cover.stop_cover': return null
+		case 'media_player.media_play': return s === 'playing'
+		case 'media_player.media_pause': return s === 'paused'
+		case 'media_player.media_stop': return !['playing', 'paused', 'buffering'].includes(s)
+		case 'media_player.volume_set': return near(a.volume_level, d.volume_level, 0.02)
+		case 'media_player.volume_mute': return a.is_volume_muted === d.is_volume_muted
+		case 'media_player.select_source': return a.source === d.source
+		case 'select.select_option':
+		case 'input_select.select_option': return s === String(d.option)
+		case 'number.set_value':
+		case 'input_number.set_value': return near(s, d.value, Math.max(1e-6, (Number(a.step) || 0) / 2))
+		case 'input_datetime.set_datetime': {
+			const t = v => (/^\d{2}:\d{2}$/.test(v) ? `${v}:00` : v)
+			if (d.datetime) return s === t(String(d.datetime).replace('T', ' '))
+			return (!d.date || s.startsWith(d.date)) && (!d.time || s.endsWith(t(d.time)))
+		}
+		case 'vacuum.start': return s === 'cleaning'
+		case 'vacuum.pause': return s === 'paused'
+		case 'vacuum.return_to_base': return s === 'returning' || s === 'docked'
+	}
+	if (service === 'turn_off') return ['off', 'standby'].includes(s)
+	if (service !== 'turn_on') return null
+	if (s !== 'on') return false
+	if (domain === 'light') {
+		// 켜져 있어도 밝기·색온도를 요청했으면 그 값까지 맞아야 한다. 값을 보고하지 않는 조명이면 확인하지 못한 것으로 둔다.
+		if (d.brightness != null && !near(a.brightness, d.brightness, 3)) return false
+		if (d.brightness_pct != null && !near(a.brightness, Math.round(d.brightness_pct * 255 / 100), 3)) return false
+		if (d.color_temp_kelvin != null) {
+			const want = clampTo(d.color_temp_kelvin, num(a.min_color_temp_kelvin), num(a.max_color_temp_kelvin))
+			if (!near(a.color_temp_kelvin, want, Math.max(50, want * 0.02))) return false
+		}
+	}
+	if (domain === 'fan') {
+		if (d.percentage != null && d.percentage > 0 && fanPctOk(a, d.percentage) !== true) return false
+		if (d.preset_mode != null && a.preset_mode !== d.preset_mode) return false
+	}
+	return true
+}
+
+// 서비스 이름이 허용 목록(정확한 이름 또는 'switch.turn_*' 같은 끝 별표)에 드는가.
+// 이름이 템플릿이면 고정된 앞부분이 별표 범위에 통째로 들어갈 때만 true. true: 허용, false: 허용 밖, null: 대조할 수 없음
+export function serviceAllowed(svc, allowed) {
+	const pats = [...allowed]
+	const tpl = hasTemplate(svc)
+	const head = tpl ? String(svc).split(/\{\{|\{%/)[0] : String(svc)
+	for (const pat of pats) {
+		if (pat.endsWith('*')) { if (head.startsWith(pat.slice(0, -1))) return true }
+		else if (!tpl && pat === head) return true
+	}
+	if (!tpl) return false
+	// 템플릿: 고정된 앞부분이 어떤 허용 항목과도 맞을 수 없으면 허용 밖, 맞을 수도 있으면 대조 불가
+	return pats.some(pat => pat.startsWith(head) || head.startsWith(pat.replace(/\*$/, ''))) ? null : false
+}
+
+// 스크립트가 HA 안에서 움직이는 기기와 그 범위 검사.
+// scope: src/core/script-scope.mjs의 analyzeScriptScope 결과({ devices, dynamic, candidates }).
+// declared: config.json policy.script_targets[스크립트] = { entities: [...], services: [...] } (사용자가 허용한 최종 기기·동작)
+const ENTITY_TOKEN_RE = /\b([a-z_]+)\.([a-z0-9_]+)\b/g
+const DEVICE_DOMAINS = new Set(['light', 'switch', 'fan', 'cover', 'climate', 'humidifier', 'media_player', 'input_boolean', 'lock', 'alarm_control_panel', 'vacuum', 'scene', 'script', 'automation', 'select', 'input_select', 'number', 'input_number', 'siren', 'valve', 'water_heater', 'button', 'input_button', 'remote', 'camera', 'update', 'lawn_mower'])
+export function entityTokens(value, out = new Set()) {
+	if (typeof value === 'string') {
+		for (const m of value.matchAll(ENTITY_TOKEN_RE)) if (DEVICE_DOMAINS.has(m[1])) out.add(`${m[1]}.${m[2]}`)
+	} else if (Array.isArray(value)) for (const v of value) entityTokens(v, out)
+	else if (value && typeof value === 'object') for (const v of Object.values(value)) entityTokens(v, out)
+	return out
+}
+
 const toIdList = v => (v == null ? [] : Array.isArray(v) ? v : [v])
 
 export class PolicyEngine {
@@ -209,6 +300,15 @@ export class PolicyEngine {
 			if (dom && !dom.includes('*')) this.tier3Domains.add(dom)
 		}
 		this.awayOverrideExempt = new Set(p.away_override_exempt ?? ['light.hwanpunggi', 'switch.geosil_gonggiceongjeonggi_power'])
+		// 스크립트별로 사용자가 허용한 최종 기기·동작. Tier 3 기기는 적어 두어도 허용하지 않는다.
+		this.scriptTargets = new Map()
+		for (const [id, t] of Object.entries(p.script_targets ?? {})) {
+			if (!id.startsWith('script.') || !t || typeof t !== 'object') continue
+			this.scriptTargets.set(id, {
+				entities: new Set((t.entities ?? []).filter(e => typeof e === 'string' && !this.isTier3Blocked(e))),
+				services: Array.isArray(t.services) && t.services.length ? new Set(t.services.map(String)) : null,
+			})
+		}
 
 		this.tiers = new Map()
 		this.blockedInConfig = new Set()
@@ -253,9 +353,13 @@ export class PolicyEngine {
 		const dataCheck = validateServiceData(domain, service, req.service_data ?? {}, st)
 		if (typeof dataCheck === 'string') return { ok: false, error: dataCheck }
 		const serviceData = dataCheck.data
+		let approvalReason = null
 		if (domain === 'script') {
 			const bad = checkScriptVariables(id, serviceData.variables ?? {}, scriptFields)
 			if (bad) return { ok: false, error: bad }
+			const sc = this.checkScriptScope(id, serviceData.variables ?? {}, scriptFields?.get?.(id))
+			if (sc.error) return { ok: false, error: sc.error }
+			approvalReason = sc.approval ?? null
 		}
 		if (isAlreadyReached(domain, service, serviceData, st)) return { ok: true, noop: true }
 		if (usedToday >= perDay) return { ok: false, error: `오늘 행동 한도(${perDay}회)에 닿았다` }
@@ -263,10 +367,59 @@ export class PolicyEngine {
 		if (awayOverrideOn && !requested && OFF_LIKE.has(service) && !this.awayOverrideExempt.has(id)) {
 			return { ok: false, error: '가족·손님 재실 도우미가 켜져 있어 자율 소등을 차단했다' }
 		}
-		if (quiet && !requested && (tier === 'confirm' || !QUIET_SAFE_SERVICES.has(service))) {
+		// 움직일 기기를 미리 알 수 없는 스크립트는 Tier 1이어도, 직접 요청이어도 승인을 거친다.
+		const effTier = approvalReason ? 'confirm' : tier
+		if (quiet && !requested && (effTier === 'confirm' || !QUIET_SAFE_SERVICES.has(service))) {
 			return { ok: false, error: '조용한 시간에는 스스로 끄는 것만 된다. 필요하면 아침으로 예약할 것' }
 		}
-		return { ok: true, tier, domain, service, service_data: serviceData }
+		return { ok: true, tier: effTier, domain, service, service_data: serviceData, ...(approvalReason ? { needs_approval: true, approval_reason: approvalReason } : {}) }
+	}
+
+	// 스크립트가 HA 안에서 실제로 움직이는 기기가 허용 범위 안인지 본다.
+	// 돌려주는 값: { error } (실행 안 함) | { approval } (승인을 받아야 함) | {} (그대로 실행)
+	checkScriptScope(id, vars = {}, info = null) {
+		const scope = info?.scope
+		const declared = this.scriptTargets.get(id) ?? null
+		if (!scope) return { approval: `${id}가 움직이는 기기를 아직 확인하지 못했어요` }
+		const staleApproval = info.stale ? `${id} 설정을 다시 읽지 못해(${info.stale_error ?? '오류'}) 지금 움직이는 기기를 확인할 수 없어요` : null
+		const outside = [], unverifiable = []
+		for (const d of scope.devices ?? []) {
+			if (this.isTier3Blocked(d.entity_id)) return { error: `${id}가 안전 정책(Tier 3) 기기를 움직여 실행하지 않는다: ${d.entity_id}` }
+			const inRange = declared ? declared.entities.has(d.entity_id) : this.tiers.has(d.entity_id)
+			if (!inRange) outside.push(d.entity_id)
+			if (declared?.services) {
+				const m = serviceAllowed(d.service, declared.services)
+				if (m === false) return { error: `${id}가 허용하지 않은 동작(${d.service})을 해서 실행하지 않는다. 스크립트가 바뀌었으면 policy.script_targets를 고칠 것` }
+				if (m === null) unverifiable.push(d.service)
+			}
+		}
+		for (const e of scope.candidates ?? []) {
+			if (this.isTier3Blocked(e)) return { error: `${id}가 안전 정책(Tier 3) 기기를 움직일 수 있어 실행하지 않는다: ${e}` }
+		}
+		const passed = [...entityTokens(vars)]
+		const t3 = passed.find(e => this.isTier3Blocked(e))
+		if (t3) return { error: `${id}에 안전 정책(Tier 3) 기기를 넘길 수 없다: ${t3}` }
+		if (declared) {
+			if (outside.length) return { error: `${id}가 허용 범위 밖 기기를 움직여 실행하지 않는다: ${outside.join(', ')} (스크립트가 바뀌었으면 policy.script_targets를 고칠 것)` }
+			const badCand = (scope.candidates ?? []).filter(e => !declared.entities.has(e))
+			if (badCand.length) return { error: `${id}가 허용 범위 밖 기기를 움직일 수 있어 실행하지 않는다: ${badCand.join(', ')}` }
+			const badVar = passed.filter(e => !declared.entities.has(e))
+			if (badVar.length) return { error: `${id}에 허용 범위 밖 기기를 넘길 수 없다: ${badVar.join(', ')}` }
+			if (declared.services) {
+				const dyn = (scope.dynamic ?? []).map(x => x.service).filter(Boolean)
+				const badSvc = dyn.filter(s => serviceAllowed(s, declared.services) === false)
+				if (badSvc.length) return { error: `${id}가 허용하지 않은 동작(${[...new Set(badSvc)].join(', ')})을 해서 실행하지 않는다` }
+				unverifiable.push(...dyn.filter(s => serviceAllowed(s, declared.services) === null))
+			}
+			if (staleApproval) return { approval: staleApproval }
+			// 동작 이름이 템플릿이면 허용 동작과 끝까지 대조할 수 없다. 'switch.turn_*'처럼 적어 두면 그 범위 안으로 본다.
+			if (unverifiable.length) return { approval: `${id}의 동작 이름이 실행 때 정해져(${[...new Set(unverifiable)].join(', ').slice(0, 80)}) 허용 동작과 대조할 수 없어요. policy.script_targets.services에 'switch.turn_*'처럼 범위로 적으면 바로 실행할 수 있어요` }
+			return {}
+		}
+		if (staleApproval) return { approval: staleApproval }
+		if (outside.length) return { approval: `${id}가 허용 목록 밖 기기(${outside.slice(0, 4).join(', ')})를 움직여요` }
+		if ((scope.dynamic ?? []).length) return { approval: `${id}는 움직일 기기가 실행할 때 정해져요(템플릿·다른 자동화 호출). policy.script_targets에 허용 기기를 적으면 바로 실행할 수 있어요` }
+		return {}
 	}
 
 	checkHaServiceCall(msg) {
@@ -358,21 +511,25 @@ export class PolicyEngine {
 		const action = rec.service ?? rec.action
 		const attrs = snap?.attrs ?? {}
 
+		// 이전 상태(스냅샷)를 먼저 본다. 이미 켜진 조명의 밝기만 바꿨으면 끄는 게 아니라 이전 밝기로 켠다.
+		const prevOn = snap?.state === 'on' ? true : snap?.state === 'off' ? false : null
 		if (domain === 'light') {
-			if (snap?.state === 'off' || action === 'turn_on') return { domain, service: 'turn_off', data: {} }
-			if (snap?.state === 'on' || action === 'turn_off') {
+			const wasOn = prevOn ?? (action === 'turn_off' ? true : action === 'turn_on' ? false : null)
+			if (wasOn === false) return { domain, service: 'turn_off', data: {} }
+			if (wasOn === true) {
 				const data = {}
-				if (typeof attrs.brightness === 'number') data.brightness = attrs.brightness
-				if (typeof attrs.color_temp_kelvin === 'number') data.color_temp_kelvin = attrs.color_temp_kelvin
+				if (typeof attrs.brightness === 'number' && attrs.brightness >= 1) data.brightness = attrs.brightness
+				if (typeof attrs.color_temp_kelvin === 'number' && attrs.color_temp_kelvin >= 2000 && attrs.color_temp_kelvin <= 6500) data.color_temp_kelvin = attrs.color_temp_kelvin
 				return { domain, service: 'turn_on', data }
 			}
 		}
 		if (domain === 'switch' || domain === 'input_boolean') {
-			if (snap?.state === 'off' || action === 'turn_on') return { domain, service: 'turn_off', data: {} }
-			if (snap?.state === 'on' || action === 'turn_off') return { domain, service: 'turn_on', data: {} }
+			const wasOn = prevOn ?? (action === 'turn_off' ? true : action === 'turn_on' ? false : null)
+			if (wasOn === false) return { domain, service: 'turn_off', data: {} }
+			if (wasOn === true) return { domain, service: 'turn_on', data: {} }
 		}
 		if (domain === 'fan') {
-			if (snap?.state === 'off') return { domain, service: 'turn_off', data: {} }
+			if (snap?.state === 'off' || (!snap && action === 'turn_on')) return { domain, service: 'turn_off', data: {} }
 			const data = {}
 			if (typeof attrs.percentage === 'number') data.percentage = attrs.percentage
 			if (typeof attrs.preset_mode === 'string') data.preset_mode = attrs.preset_mode
@@ -421,6 +578,7 @@ export class PolicyEngine {
 			tier2_confirm: tier2,
 			tier3_blocked: [...DEFAULT_TIER3_PATTERNS, ...(this.cfg.policy?.tier3_blocked ?? [])],
 			away_override_exempt: [...this.awayOverrideExempt],
+			script_targets: Object.fromEntries([...this.scriptTargets].map(([id, t]) => [id, { entities: [...t.entities], services: t.services ? [...t.services] : null }])),
 		}
 	}
 }

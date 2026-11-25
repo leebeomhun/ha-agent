@@ -6,7 +6,7 @@
 // 5) 기준(맞은 날 수·정확도·재현율)을 넘으면 근거를 붙여 Tier 2 승인 제안(automation_upsert)으로 올린다.
 import { DAY, kst } from '../util.mjs'
 import { mineRoutines } from './learning.mjs'
-import { HUMAN_ORIGINS, logbookOrigin } from './origin.mjs'
+import { logbookOrigin } from './origin.mjs'
 
 const MIN = 60000
 // 제안할 수 있는 도메인과 방향. TV를 자동으로 켜는 것처럼 놀랄 만한 동작은 제안하지 않는다(미디어는 끄기만).
@@ -15,13 +15,17 @@ const ON_STATES = new Set(['on', 'playing', 'paused', 'idle', 'open', 'buffering
 const DEAD = new Set(['unavailable', 'unknown'])
 export const SUGGEST_DEFAULTS = {
 	lookback_days: 28, // 볼 기간
-	min_days: 4, // 사람이 그 조작을 한 날이 이만큼은 있어야 한다
+	min_days: 4, // 사람이 그 조작을 한 것으로 확인된 날(조작 주체 기록·logbook)이 이만큼은 있어야 한다. 주체를 모르는 날은 세지 않는다
 	min_consistency: 60, // 그 요일 유형 날 중 이 비율(%) 이상
 	min_human_share: 0.6, // 주체를 아는 조작 중 사람이 한 비율
 	min_agree: 3, // 백테스트에서 자동화가 사람과 같은 일을 했을 날
 	min_precision: 0.6, // 자동화가 실행된 날 중 사람이 원했던 날의 비율
 	min_recall: 0.5, // 사람이 원했던 날 중 자동화가 실행됐을 날의 비율
 	max_new: 2, // 한 번에 새로 올릴 제안 수
+	// 조작자 기록이 없는 변화(HA 사용자도 자동화도 아님)를 물리 조작(벽 스위치·리모컨)으로 추정할 통합.
+	// 기기가 HA에만 붙는 로컬 무선 통합만 넣는다. 클라우드·Wi-Fi 기기(tplink·lg_thinq 등)는 제조사 앱·예약·자동화로도
+	// 같은 모양의 변화가 생겨 사람이 했는지 알 수 없으므로 주체 불명으로 둔다. matter는 다른 생태계(애플·구글) 자동화가 섞일 수 있다.
+	physical_platforms: ['zha', 'zwave_js', 'deconz', 'matter'],
 }
 
 const isOn = s => ON_STATES.has(String(s))
@@ -70,7 +74,10 @@ export function automationsTouching(autoCfg, entityId) {
 }
 
 // 날짜별 첫 조작(그 요일 유형, 시간대 ±30분)과 그 조작 주체
-function occurrencesOf({ tl, entityId, direction, dayType, dayTypeOf, winStart, winEnd, logbook, agentActs }) {
+// who: human(HA 사용자 조작 확인) | physical(조작자 기록 없음 + 로컬 무선 기기 → 물리 조작 추정) | automation | agent | unknown
+function occurrencesOf({ tl, entityId, direction, dayType, dayTypeOf, winStart, winEnd, logbook, agentActs, physical }) {
+	// 조작자 기록이 없는 변화('device')는 로컬 무선 기기일 때만 물리 조작으로 본다.
+	const fromOrigin = o => (o === 'user' ? 'human' : o === 'device' ? (physical ? 'physical' : 'unknown') : o)
 	const out = new Map()
 	for (const e of tl.get(entityId) ?? []) {
 		if (directionOf(e) !== direction) continue
@@ -79,11 +86,11 @@ function occurrencesOf({ tl, entityId, direction, dayType, dayTypeOf, winStart, 
 		const m = minOfDay(e.t)
 		if (m < winStart - 30 || m > winEnd + 30) continue
 		let who = 'unknown'
-		if (e.origin) who = HUMAN_ORIGINS.has(e.origin) ? 'human' : e.origin
+		if (e.origin) who = fromOrigin(e.origin)
 		else if (agentActs.some(a => a.entity_id === entityId && Math.abs(toMs(a.done_at ?? a.ts) - e.t) <= 20000)) who = 'agent'
 		else {
 			const row = logbook.find(r => r.entity_id === entityId && Math.abs(Number(r.when) * 1000 - e.t) <= 5000 && String(r.state) === String(e.to))
-			if (row) { const o = logbookOrigin(row); who = o === 'user' || o === 'device' ? 'human' : o }
+			if (row) who = fromOrigin(logbookOrigin(row))
 		}
 		out.set(date, { t: e.t, min: m, who })
 	}
@@ -92,12 +99,14 @@ function occurrencesOf({ tl, entityId, direction, dayType, dayTypeOf, winStart, 
 
 // 자동화가 있었다고 치고 날마다 따져 본다.
 // agree: 자동화가 실행됐을 날 = 사람이 실제로 그 일을 한 날, unwanted: 실행됐는데 사람은 안 했고 기기를 실제로 바꿨을 날, missed: 사람은 했는데 실행 안 됐을 날
+// 조작은 있었지만 누가 했는지 확인되지 않은 날은 사람이 원했는지 알 수 없어 백테스트에서 뺀다(unknown_days로 따로 센다).
 function backtest({ trigger, dates, occ, tl, entityId, direction, timeMin, winStart, winEnd, arrivals, persons, states }) {
-	let agree = 0, unwanted = 0, missed = 0
+	let agree = 0, unwanted = 0, missed = 0, unknownDays = 0
 	const someoneHome = t => !persons.length || persons.some(p => stateAt(tl, p, t, states.get(p)?.state) === 'home')
 	for (const date of dates) {
 		const o = occ.get(date)
-		const wanted = Boolean(o && (o.who === 'human' || o.who === 'unknown'))
+		if (o?.who === 'unknown') { unknownDays++; continue }
+		const wanted = Boolean(o && (o.who === 'human' || o.who === 'physical'))
 		let fireAt = null
 		if (trigger === 'time') {
 			const t = kstMidnight(date) + timeMin * MIN
@@ -116,7 +125,7 @@ function backtest({ trigger, dates, occ, tl, entityId, direction, timeMin, winSt
 	const precision = fired ? agree / fired : 0
 	const recall = agree + missed ? agree / (agree + missed) : 0
 	const f1 = precision + recall ? (2 * precision * recall) / (precision + recall) : 0
-	return { trigger, agree, unwanted, missed, precision: Math.round(precision * 100) / 100, recall: Math.round(recall * 100) / 100, f1 }
+	return { trigger, agree, unwanted, missed, unknown_days: unknownDays, precision: Math.round(precision * 100) / 100, recall: Math.round(recall * 100) / 100, f1 }
 }
 
 export function buildRoutineAutomation({ configId, entityId, name, direction, dayType, trigger, timeMin, winStart, winEnd, persons, states, evidenceText }) {
@@ -195,20 +204,25 @@ export async function suggestAutomations({
 		const existing = automationsTouching(meta.autoCfg, entityId)
 		if (existing.length) { skip('existing_automation', { automations: existing.slice(0, 3) }); continue }
 
-		const occ = occurrencesOf({ tl, entityId, direction: r.direction, dayType: r.day_type, dayTypeOf, winStart, winEnd, logbook, agentActs })
-		const who = { human: 0, automation: 0, agent: 0, unknown: 0 }
+		const platform = meta.platformOf?.get?.(entityId) ?? null
+		const physical = Boolean(platform && (o.physical_platforms ?? []).includes(platform))
+		const occ = occurrencesOf({ tl, entityId, direction: r.direction, dayType: r.day_type, dayTypeOf, winStart, winEnd, logbook, agentActs, physical })
+		const who = { human: 0, physical: 0, automation: 0, agent: 0, unknown: 0 }
 		for (const v of occ.values()) who[v.who] = (who[v.who] ?? 0) + 1
-		const known = who.human + who.automation + who.agent
+		const people = who.human + who.physical
+		const known = people + who.automation + who.agent
 		cand.attribution = who
-		if (known >= 2 && who.human / known < o.min_human_share) { skip('automation_driven'); continue }
-		if (who.human + who.unknown < o.min_days) { skip('too_few_human_days'); continue }
+		cand.platform = platform
+		if (known >= 2 && people / known < o.min_human_share) { skip('automation_driven'); continue }
+		// 사람 조작 확인 + (로컬 무선 기기의) 물리 조작 추정 날만 센다. 주체를 모르는 날은 사람이 한 날로 세지 않는다.
+		if (people < o.min_days) { skip('too_few_human_days', { human_days: who.human, physical_days: who.physical, unknown_days: who.unknown }); continue }
 
 		const dates = []
 		for (let d = kstMidnight(firstDate); d <= kstMidnight(today) - DAY; d += DAY) {
 			const date = kst(new Date(d + 12 * 3600000)).date
 			if (dayTypeOf(date) === r.day_type) dates.push(date)
 		}
-		const humanMins = [...occ.values()].filter(v => v.who === 'human' || v.who === 'unknown').map(v => v.min).sort((a, b) => a - b)
+		const humanMins = [...occ.values()].filter(v => v.who === 'human' || v.who === 'physical').map(v => v.min).sort((a, b) => a - b)
 		const timeMin = humanMins.length ? humanMins[Math.floor((humanMins.length - 1) / 2)] : parseHm(r.median_time)
 		const common = { dates, occ, tl, entityId, direction: r.direction, timeMin, winStart, winEnd, arrivals, persons, states }
 		const tests = [backtest({ ...common, trigger: 'time' })]
@@ -230,8 +244,11 @@ export async function suggestAutomations({
 		const dayLabel = r.day_type === 'workday' ? '평일' : '주말·휴일'
 		const verbPast = r.direction === 'on' ? '켰어요' : '껐어요'
 		const total = dates.length
-		const evidenceText = `지난 ${total}일(${dayLabel}) 중 ${occ.size}일, ${r.window} 무렵 ${r.name}${josaObj(r.name)} 직접 ${verbPast}`
-			+ ` (사람 조작 확인 ${who.human}회${who.unknown ? `, 주체 기록 없음 ${who.unknown}회` : ''}${who.automation + who.agent ? `, 자동화·집 비서 ${who.automation + who.agent}회` : ''}).`
+		// 사용자 조작이 하루도 확인되지 않았으면(물리 조작 추정뿐) 단정하지 않는다.
+		const didIt = who.human ? `사람이 ${verbPast}` : `사람이 ${r.direction === 'on' ? '켠' : '끈'} 것으로 보여요`
+		const evidenceText = `지난 ${total}일(${dayLabel}) 중 ${people}일, ${r.window} 무렵 ${r.name}${josaObj(r.name)} ${didIt}`
+			+ ` (HA에서 사용자 조작 확인 ${who.human}일${who.physical ? `, 조작자 기록 없이 기기에서 바뀐 ${who.physical}일은 벽 스위치·리모컨 조작으로 추정(${platform})` : ''}`
+			+ `${who.unknown ? `, 누가 했는지 확인 안 된 ${who.unknown}일은 근거·백테스트에서 뺌` : ''}${who.automation + who.agent ? `, 자동화·집 비서 ${who.automation + who.agent}일` : ''}).`
 			+ ` 이 자동화가 있었다면 ${best.agree + best.unwanted}일 실행됐고 그중 ${best.agree}일은 실제로 ${verbPast.replace('어요', '던')} 날과 맞았어요(정확도 ${Math.round(best.precision * 100)}%, 놓쳤을 날 ${best.missed}일).`
 			+ ` 방식: ${best.trigger === 'arrival' ? '귀가하면 실행' : `${hm(timeMin)}에 집에 누가 있으면 실행`}, 이미 그 상태면 아무것도 하지 않음.`
 		const config = buildRoutineAutomation({ configId, entityId, name: r.name, direction: r.direction, dayType: r.day_type, trigger: best.trigger, timeMin, winStart, winEnd, persons, states, evidenceText })

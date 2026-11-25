@@ -52,7 +52,12 @@ async function assistIpc(cfg, method, path, body = null) {
 		signal: AbortSignal.timeout((a.timeout_seconds ?? 90) * 1000),
 	})
 	const json = await res.json().catch(() => ({}))
-	if (!res.ok) throw new Error(json.error || `HTTP ${res.status}`)
+	if (!res.ok) {
+		const err = new Error(json.error || `HTTP ${res.status}`)
+		err.status = res.status
+		err.body = json
+		throw err
+	}
 	return json
 }
 
@@ -279,7 +284,10 @@ const cmds = {
 					for (const id of [...states.keys()].filter(i => i.startsWith('automation.'))) {
 						try { autoCfg[id] = (await ha.call({ type: 'automation/config', entity_id: id }))?.config } catch {}
 					}
-					return suggestAutomations({ store: st, ha, states, meta: { autoCfg }, policy: new PolicyEngine(cfg), cfg, isNoise: globs(cfg.noise_entities), proposals: st.listProposals({ limit: 500 }), dry: true })
+					// 데몬과 같은 기준으로 물리 조작을 추정하도록 통합 이름도 읽는다.
+					const platformOf = new Map()
+					try { for (const e of await ha.call({ type: 'config/entity_registry/list' })) if (e.platform) platformOf.set(e.entity_id, e.platform) } catch {}
+					return suggestAutomations({ store: st, ha, states, meta: { autoCfg, platformOf }, policy: new PolicyEngine(cfg), cfg, isNoise: globs(cfg.noise_entities), proposals: st.listProposals({ limit: 500 }), dry: true })
 				})
 			} finally { st.close() }
 		}
@@ -346,7 +354,8 @@ const cmds = {
 			return
 		}
 		if (['approve', 'reject', 'rollback'].includes(sub) && pid) {
-			const ipc = await assistIpc(cfg, 'POST', `/api/proposals/${encodeURIComponent(pid)}/${sub}`).catch(() => null)
+			// 데몬이 답했으면(거절·충돌·운영 모드 차단 포함) 그 답을 그대로 보여 준다. 데몬에 닿지 못했을 때만 직접 처리한다.
+			const ipc = await assistIpc(cfg, 'POST', `/api/proposals/${encodeURIComponent(pid)}/${sub}`).catch(e => (e.body ? { ...e.body, http_status: e.status } : null))
 			if (ipc) return console.log(JSON.stringify(ipc, null, 2))
 			const st = new Store()
 			try {
@@ -354,9 +363,11 @@ const cmds = {
 					const adm = new HaAdmin({ cfg, store: st, memory: new MemoryManager({ store: st }) })
 					return console.log(JSON.stringify(adm.rejectProposal(pid), null, 2))
 				}
+				// 데몬 없이 직접 처리할 때도 운영 모드를 따른다. CLI에서 직접 실행한 롤백만 일시정지·시험 모드에서 허용한다.
+				// 감시 규칙 승격의 롤백은 규칙을 되살릴 데몬이 있어야 해서 여기서는 거절된다.
 				const res = await withLiveHa(cfg, async (ha, states) => {
-					const adm = new HaAdmin({ cfg, ha, store: st, states, memory: new MemoryManager({ store: st }) })
-					return sub === 'approve' ? adm.approveProposal(pid) : adm.rollbackProposal(pid)
+					const adm = new HaAdmin({ cfg, ha, store: st, states, memory: new MemoryManager({ store: st }), readControl: loadControl })
+					return sub === 'approve' ? adm.approveProposal(pid) : adm.rollbackProposal(pid, Date.now(), { explicit: true })
 				})
 				console.log(JSON.stringify(res, null, 2))
 			} finally { st.close() }

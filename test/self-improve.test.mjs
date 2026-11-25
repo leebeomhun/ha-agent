@@ -55,6 +55,8 @@ class FakeHA extends EventEmitter {
 		this.rest = new Map() // HA 설정 파일(automation/script/scene)
 		this.helpers = { input_boolean: [] }
 		this.logRows = []
+		// 엔티티 레지스트리의 통합 이름. 서재 스위치는 HA에만 붙는 Zigbee(zha) 벽 스위치라 조작자 기록 없는 변화를 물리 조작으로 본다.
+		this.registry = [{ entity_id: 'switch.study', platform: 'zha' }, { entity_id: 'light.auto', platform: 'zha' }, { entity_id: 'switch.covered', platform: 'zha' }]
 		this.ctxN = 0
 	}
 	start() {}
@@ -72,6 +74,7 @@ class FakeHA extends EventEmitter {
 		const t = msg.type
 		if (t === 'get_states') return [...this.map.values()]
 		if (t === 'repairs/list_issues') return { issues: [] }
+		if (t === 'config/entity_registry/list') return structuredClone(this.registry)
 		if (/registry\/list$/.test(t) || t === 'system_log/list') return []
 		if (t === 'automation/config') { const c = this.autoCfg[msg.entity_id]; if (!c) throw new Error('not found'); return { config: structuredClone(c) } }
 		if (t === 'script/config') return { config: { fields: {} } }
@@ -292,7 +295,9 @@ test('2-1. 루틴 → 자동화 제안: 사람 조작만, 기존 자동화 제�
 		assert.equal(on.config.triggers[0].entity_id, 'person.me')
 		assert.deepEqual(on.config.conditions.at(-1), { condition: 'state', entity_id: 'switch.study', state: 'off' })
 		assert.deepEqual(on.config.actions, [{ action: 'switch.turn_on', target: { entity_id: 'switch.study' } }])
-		assert.match(on.evidence, /직접 켰어요/)
+		assert.match(on.evidence, /사람이 켠 것으로 보여요/, '사용자 조작 확인이 없으면 단정하지 않음')
+		assert.match(on.evidence, /벽 스위치·리모컨 조작으로 추정\(zha\)/, '사용자 조작 확인과 물리 조작 추정을 나눠 적는다')
+		assert.equal(on.attribution.physical, on.attribution.human + on.attribution.physical, '조작자 기록 없는 날은 물리 조작 추정으로만 셈')
 		const off = by('switch.study', 'off')
 		assert.equal(off.status, 'eligible')
 		assert.equal(off.trigger, 'time')
@@ -336,7 +341,8 @@ test('2-2. 루틴 제안 기준: 들쭉날쭉한 조작은 백테스트에서 �
 			if (i % 2) store.recordEvent({ t: at(date, '23:00'), id: 'switch.study', name: '서재', from: 'on', to: 'off', origin: 'device' })
 		}
 		const states = new Map(['person.me', 'switch.study'].map(id => [id, st(id, 'off')]))
-		const r = await suggestAutomations({ store, states, now, dry: true, options: { min_consistency: 40, min_days: 4 } })
+		const zha = { platformOf: new Map([['switch.study', 'zha']]) }
+		const r = await suggestAutomations({ store, states, meta: zha, now, dry: true, options: { min_consistency: 40, min_days: 4 } })
 		const on = r.candidates.find(c => c.entity_id === 'switch.study' && c.direction === 'on')
 		// 켠 날은 모두 집에 있던 날이라 정확도는 높지만, 시각 트리거는 집에 있는 날마다 맞고 귀가 트리거도 맞는다 → 통과해야 정상
 		assert.equal(on?.status, 'eligible')
@@ -354,7 +360,7 @@ test('2-2. 루틴 제안 기준: 들쭉날쭉한 조작은 백테스트에서 �
 					store2.recordEvent({ t: at(date, '23:00'), id: 'switch.study', name: '서재', from: 'on', to: 'off', origin: 'device' })
 				}
 			}
-			const r2 = await suggestAutomations({ store: store2, states: new Map([['switch.study', st('switch.study', 'off')]]), now, dry: true, options: { min_consistency: 40 } })
+			const r2 = await suggestAutomations({ store: store2, states: new Map([['switch.study', st('switch.study', 'off')]]), meta: zha, now, dry: true, options: { min_consistency: 40 } })
 			const c2 = r2.candidates.find(c => c.entity_id === 'switch.study' && c.direction === 'on')
 			assert.equal(c2.status, 'skipped')
 			assert.equal(c2.reason, 'backtest_failed', '켜지 않은 날에도 실행됐을 것이라 정확도 미달')
@@ -443,11 +449,15 @@ test('4. 자기 성능 지표: 주 단위 알림 조치율·제안 수락률·As
 		const w1 = now - 3 * DAY, w2 = now - 10 * DAY
 		// 지난주: 판단 4회(빈 판단 1), 알림 2건 중 1건 조치, 제안 2건(수락 1·거절 1), Assist 4턴 중 부정 1
 		for (const [i, applied] of [[0, { notifications: ['x'] }], [1, { actions: ['a'] }], [2, {}], [3, { notifications: ['y'] }]]) s.recordDecision({ ts: w1 + i * 1000, reasons: ['hourly'], tokens: 1000, applied })
-		for (let i = 0; i < 4; i++) s.recordDecision({ ts: w1 + 10000 + i, reasons: ['assist'], tokens: 10, applied: {} })
+		// Assist: 요청마다 최종 결과(outcome)가 하나 남는다. 4건 중 1건은 사용자가 바로 다시 말해 실패(재요청과 정정이 한 말에서 함께 잡혀도 한 번만), 1건은 모델 전환
+		for (let i = 0; i < 4; i++) s.recordDecision({ ts: w1 + 10000 + i, reasons: ['assist'], tokens: 10, applied: { outcome: 'ok', fell_back: i === 3 } })
+		s.recordImplicitFeedback({ ts: w1 + 10002, kind: 'assist_retry', score: -0.5 })
+		s.recordImplicitFeedback({ ts: w1 + 10002, kind: 'assist_correction', score: -1 })
+		// 최종 결과가 없는 예전 기록은 세지 않는다
+		s.recordDecision({ ts: w1 + 20000, reasons: ['assist'], tokens: 10, applied: {} })
 		s.upsertNotification({ nid: 'n1', ts: w1, kind: 'alert', level: 'normal', title: 'a', message: 'm', status: 'sent', related_rule_ids: [] })
 		s.upsertNotification({ nid: 'n2', ts: w1 + 1, kind: 'alert', level: 'normal', title: 'b', message: 'm', status: 'sent', related_rule_ids: [] })
 		s.recordImplicitFeedback({ ts: w1 + 100, kind: 'notification_acted', score: 1 })
-		s.recordImplicitFeedback({ ts: w1 + 200, kind: 'assist_retry', score: -0.5 })
 		s.upsertProposal({ pid: 'pa', ts: w1, kind: 'backup_create', title: 't', summary: 's', status: 'applied' })
 		s.upsertProposal({ pid: 'pr', ts: w1, kind: 'backup_create', title: 't', summary: 's', status: 'rejected' })
 		// 그 전 주: 판단 2회 모두 빈 판단, 토큰 더 많음, 자동화 뒤집힘 2회
@@ -463,6 +473,10 @@ test('4. 자기 성능 지표: 주 단위 알림 조치율·제안 수락률·As
 		assert.equal(w.alert_useful_pct, 50)
 		assert.equal(w.proposal_accept_pct, 50)
 		assert.equal(w.assist_success_pct, 75)
+		assert.equal(w.assist_retry_pct, 25, '같은 말에서 잡힌 재요청·정정은 앞 요청 하나에만 매김')
+		assert.equal(w.assist_fallback_pct, 25)
+		assert.equal(w.assist_requests, 4)
+		assert.equal(w.assist_legacy_turns, 1)
 		const trend = Object.fromEntries(sc.trends.map(t => [t.key, t.better]))
 		assert.equal(trend.noop_pct, true, '100% → 25%')
 		assert.equal(trend.avg_tokens, true)
@@ -472,6 +486,7 @@ test('4. 자기 성능 지표: 주 단위 알림 조치율·제안 수락률·As
 		assert.match(text, /\| 알림 뒤 조치 비율\(%\) \| 50 \| – \| – \|/)
 		assert.match(text, /빈 판단 비율\(%\) \| 25 \| 100 \| ▲ 좋아짐/)
 		assert.match(text, /회귀 평가: 12\/12 통과/)
+		assert.match(text, /Assist 지표는 요청마다 최종 결과를 남기기 시작한 뒤의 기록만/)
 	} finally { s.close() }
 })
 

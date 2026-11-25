@@ -642,7 +642,9 @@ export class AssistServer {
 		this.authFailures.delete(clientIp)
 
 		if (method === 'GET' && path === '/api/assist/voice-config') {
-			return sendJson(res, 200, { endpoint: this.cfg.assist?.voice?.endpoint ?? {} })
+			// 승인한 음성 설정(self_stt_tune)이 재시작 없이 바로 보이게 에이전트의 지금 설정을 읽는다.
+			const live = this.agent?.cfg ?? this.cfg
+			return sendJson(res, 200, { endpoint: live.assist?.voice?.endpoint ?? {} })
 		}
 
 		if (method === 'POST' && path === '/api/assist/stt') {
@@ -895,8 +897,9 @@ export class AssistServer {
 		const pm = /^\/api\/proposals\/([a-z0-9]+)\/(approve|reject|rollback)$/.exec(path)
 		if (method === 'POST' && pm) {
 			const [, pid, act] = pm
-			const r = await this.agent.handleProposalAction(pid, act)
-			return sendJson(res, r.ok ? 200 : 400, r)
+			// 콘솔·CLI에서 사람이 직접 누른 것(일시정지·시험 모드에서도 이 경로의 롤백만 허용)
+			const r = await this.agent.handleProposalAction(pid, act, { explicit: true })
+			return sendJson(res, r.ok ? 200 : r.blocked ? 423 : r.conflict ? 409 : 400, r)
 		}
 
 		if (method === 'POST' && path === '/api/audit') {

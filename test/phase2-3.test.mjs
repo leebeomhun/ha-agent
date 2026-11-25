@@ -68,6 +68,7 @@ test('HaAdmin: 검증·Diff·승인·check_config 실패 자동 롤백·수동 �
 	try {
 		const saved = new Map([['automation:old_1', { id: 'old_1', alias: '기존', triggers: [{ trigger: 'state', entity_id: 'light.a' }], actions: [{ action: 'light.turn_off', target: { entity_id: 'light.a' } }] }]])
 		let checkResult = { result: 'valid', errors: null }
+		let checkCalls = 0
 		let promotedRemoved = null
 		const calls = []
 		const ha = {
@@ -77,7 +78,7 @@ test('HaAdmin: 검증·Diff·승인·check_config 실패 자동 롤백·수동 �
 			async saveConfigRest(dom, id, cfg) { assert.equal(this.guard.allowConfigWrite, true); saved.set(`${dom}:${id}`, cfg) },
 			async deleteConfigRest(dom, id) { assert.equal(this.guard.allowConfigWrite, true); saved.delete(`${dom}:${id}`) },
 			async callService(d, s, opts) { calls.push(`${d}.${s}`); if (d === 'homeassistant' && s === 'list_orphaned_database_entities') return { response: { entities: ['sensor.orphan_1'] } } },
-			async checkConfig() { return checkResult },
+			async checkConfig() { checkCalls++; return typeof checkResult === 'function' ? checkResult() : checkResult },
 			async renderTemplate(tpl) { if (tpl.includes('bad_syntax')) throw new Error('TemplateSyntaxError'); return 'ok' },
 			async configEntries() { return [{ entry_id: 'e1', domain: 'hue', title: 'Hue', state: 'setup_retry', reason: 'timeout' }] },
 			async traces() { return [{ item_id: 'old_1', run_id: 'r1', last_step: 'action/0', script_execution: 'error', error: 'boom', timestamp: { start: '2026-11-20T01:00:00Z' } }] },
@@ -111,17 +112,19 @@ test('HaAdmin: 검증·Diff·승인·check_config 실패 자동 롤백·수동 �
 		assert.equal(badApprove.ok, false)
 		store.db.prepare('DELETE FROM proposals WHERE pid = ?').run('pbad1')
 
-		// 2) check_config 실패 시 pre_snapshot으로 자동 롤백
-		checkResult = { result: 'invalid', errors: 'bad yaml' }
+		// 2) check_config 실패 시 pre_snapshot으로 자동 롤백. 깨진 설정이 들어가 있는 동안만 invalid(되돌리면 다시 valid)
+		checkResult = () => (saved.get('automation:old_1')?.alias === '수정됨' ? { result: 'invalid', errors: 'bad yaml' } : { result: 'valid', errors: null })
 		const failProp = await adm.createProposal({
 			kind: 'automation_upsert', target_id: 'automation.old_1', title: '수정 후 실패', summary: '테스트',
 			payload: { config: { alias: '수정됨', triggers: [{ trigger: 'state', entity_id: 'light.a' }], actions: [{ action: 'light.turn_off', target: { entity_id: 'light.a' } }] } },
 		}, T0)
 		assert.match(unifiedDiff('a\nb', 'a\nc'), /\+ c/)
 		assert.match(failProp.proposal.diff_text, /\+.*"alias": "수정됨"/)
+		const checksBefore = checkCalls
 		const failApprove = await adm.approveProposal(failProp.proposal.pid, T0)
 		assert.equal(failApprove.ok, false)
 		assert.equal(failApprove.proposal.status, 'rolled_back')
+		assert.equal(checkCalls - checksBefore, 2, '적용 직후 + 되돌린 뒤 다시 check_config')
 		assert.equal(saved.get('automation:old_1').alias, '기존', 'pre_snapshot으로 자동 롤백됨')
 		assert.equal(ha.guard.allowConfigWrite, false, '작업 종료 후 쓰기 플래그 해제')
 

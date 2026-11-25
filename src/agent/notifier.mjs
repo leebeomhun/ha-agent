@@ -19,6 +19,7 @@ export class Notifier {
 
 	async deliver(n, reasons = []) {
 		const a = this.agent
+		a.liveControl?.()
 		const now = a.clock(), nid = newId()
 		const c = a.todayCounters()
 		const summary = n.kind === 'hourly_summary'
@@ -32,9 +33,11 @@ export class Notifier {
 		} else if (summary && c.summaries >= a.cfg.limits.summaries_per_day) rec.status = 'over_limit'
 		else if (!summary && n.level !== 'urgent' && c.alerts >= a.cfg.limits.alerts_per_day) rec.status = 'over_limit'
 		else if (!a.control.send) rec.status = 'test_mode'
+		// 일시정지 중에는 긴급(urgent) 규칙 알림만 보낸다. 집 안전 알림은 판단을 멈춰도 막지 않는다.
+		else if (a.control.paused && n.level !== 'urgent') rec.status = 'paused'
 		else {
 			try {
-				await this.send(buildPayload(n, nid, { reply: a.cfg.reply_button }))
+				await this.send(buildPayload(n, nid, { reply: a.cfg.reply_button }), { allowPaused: n.level === 'urgent' })
 				rec.status = 'sent'
 				a.bump(summary ? 'summaries' : 'alerts')
 				if (summary) this.dropQueuedSummaries('replaced')
@@ -72,7 +75,7 @@ export class Notifier {
 
 	async flushOutbox(now) {
 		const a = this.agent
-		if (a.flushing || !a.outbox.length || !a.ha.connected || !a.control.send) return
+		if (a.flushing || !a.outbox.length || !a.ha.connected || !(a.liveControl?.() ?? a.control).send) return
 		a.flushing = true
 		try {
 			for (const item of [...a.outbox]) {
@@ -80,8 +83,9 @@ export class Notifier {
 				const summary = item.n.kind === 'hourly_summary'
 				let status = null
 				if (now - item.ts > (item.n.level === 'urgent' ? 6 * 3600000 : summary ? SUMMARY_RETRY_MS : 2 * 3600000)) status = 'expired'
+				else if (a.control.paused && item.n.level !== 'urgent') continue
 				else if (item.next <= now) {
-					try { await this.send(buildPayload(item.n, item.nid, { reply: a.cfg.reply_button })); status = 'sent' } catch { item.next = now + MIN }
+					try { await this.send(buildPayload(item.n, item.nid, { reply: a.cfg.reply_button }), { allowPaused: item.n.level === 'urgent' }); status = 'sent' } catch { item.next = now + MIN }
 				}
 				if (!status) continue
 				a.outbox = a.outbox.filter(x => x !== item)
@@ -107,7 +111,12 @@ export class Notifier {
 		writeJson(P.outbox, a.outbox)
 	}
 
-	async send(payload) {
+	// 휴대폰 알림의 마지막 관문. 운영 모드를 지금 파일에서 다시 읽고, 시험 모드면 보내지 않고, 일시정지면 긴급 알림만 보낸다.
+	// reply: 사용자가 누른 버튼·답장에 대한 확인 문구(일시정지 안내 포함)라 운영 모드와 상관없이 보낸다.
+	async send(payload, { allowPaused = false, reply = false } = {}) {
+		const c = this.agent.liveControl?.() ?? this.agent.control
+		if (!reply && !c.send) throw new Error('시험 모드라 알림을 보내지 않음')
+		if (!reply && c.paused && !allowPaused) throw new Error('일시정지 중이라 알림을 보내지 않음')
 		let ok = 0, last = null
 		for (const t of this.agent.cfg.notify_targets) {
 			try { await this.agent.ha.callService('notify', t, { data: payload }); ok++ } catch (e) { last = e; log(`알림 발송 실패(${t}):`, e.message) }
@@ -173,7 +182,7 @@ export class Notifier {
 		a.runtime.last_beat_ok = now
 		a.saveRuntime()
 		const gap = a.cfg.heartbeat.alert_minutes * MIN
-		if (!prev || now - prev < gap || !a.control.send) return
+		if (!prev || now - prev < gap || !a.control.send || a.control.paused) return
 		try {
 			await this.send(recoveredPayload(prev, now, fmt))
 			const rec = { nid: newId(), ts: iso(now), kind: 'system', level: 'quiet', title: '✅ 집 비서가 다시 연결됐어요', message: `${fmt(prev)}부터 ${Math.round((now - prev) / MIN)}분 동안 HA와 신호가 끊겼었어요.`, related_rule_ids: [], tag: 'haagent-heartbeat', status: 'sent' }
@@ -203,7 +212,8 @@ export class Notifier {
 				`${Math.round((now - rt.open) / MIN)}분째 그대로예요(다시 알림 ${m.n}/${e.max_reminders}). 확인하셨으면 [도움됐어요]를 눌러 주세요.`)
 			log(`urgent 다시 알림 ${m.n}/${e.max_reminders}: ${r.id}`)
 			const res = await this.deliver(alert).catch(err => { log('다시 알림 실패:', err.message); return '' })
-			if (m.n >= e.oob_from && !String(res).startsWith('queued:')) this.oobSend(alert.title, alert.message)
+			// 시험 모드에서는 비상 길로도 보내지 않는다(기록만).
+			if (m.n >= e.oob_from && !/^(queued|test_mode|paused):/.test(String(res))) this.oobSend(alert.title, alert.message)
 		}
 		if (touched) a.saveRuntime()
 	}

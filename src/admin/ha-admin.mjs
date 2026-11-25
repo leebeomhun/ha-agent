@@ -136,6 +136,7 @@ export function collectConfigCalls(kind, config) {
 				kind: 'service', service: svc.trim(),
 				entity_ids: [...toIds(t.entity_id), ...toIds(node.entity_id), ...toIds(data && typeof data === 'object' ? data.entity_id : null)],
 				non_entity_targets: NON_ENTITY_TARGET_KEYS.filter(k => t[k] != null),
+				data: data && typeof data === 'object' ? data : null,
 			})
 		} else if (typeof node.scene === 'string') {
 			out.push({ kind: 'service', service: 'scene.turn_on', entity_ids: [node.scene], non_entity_targets: [] })
@@ -168,6 +169,12 @@ export function canonicalJson(v) {
 	if (v && typeof v === 'object') return `{${Object.keys(v).sort().map(k => `${JSON.stringify(k)}:${canonicalJson(v[k])}`).join(',')}}`
 	return JSON.stringify(v ?? null)
 }
+
+// HA에 저장된 설정이 같은지(키 순서·HA가 붙이는 id 무시)
+const withoutId = v => (v && typeof v === 'object' && !Array.isArray(v) ? Object.fromEntries(Object.entries(v).filter(([k]) => k !== 'id')) : v)
+// 저장(JSON)을 거친 값과 비교하므로 undefined 키를 없앤 뒤 비교한다.
+const sameJson = (a, b) => canonicalJson(JSON.parse(JSON.stringify(a ?? null))) === canonicalJson(JSON.parse(JSON.stringify(b ?? null)))
+export const sameHaConfig = (a, b) => canonicalJson(withoutId(a ?? null)) === canonicalJson(withoutId(b ?? null))
 
 export function ruleToAutomationConfig(rule, notifyTargets = ['mobile_app_ibeomhun']) {
 	if (!PROMOTABLE_OPS.has(rule?.op)) {
@@ -255,7 +262,10 @@ export function ruleToAutomationConfig(rule, notifyTargets = ['mobile_app_ibeomh
 }
 
 export class HaAdmin {
-	constructor({ cfg, ha, store = null, states = new Map(), meta = {}, memory = null, onRulePromoted = null, policy = null, configPath = P.config, onConfigUpdated = null, onProposalOutcome = null, onRollbackFailed = null } = {}) {
+	// readControl: 지금 운영 모드({ paused, send })를 읽는 함수. 주면 승인·롤백 직전에 일시정지·시험 모드를 검사한다(데몬·CLI가 넘긴다).
+	// onRuleRestore(rule)·ruleActive(id): 규칙 승격을 롤백할 때 지웠던 감시 규칙을 되살리고 다시 감시 중인지 확인한다.
+	// currentRule(id): 지금 감시 중인 규칙 정의(없으면 null). 승격 제안을 만들 때 규칙을 여기서 가져오고, 승인 직전에 그사이 바뀌었는지 본다.
+	constructor({ cfg, ha, store = null, states = new Map(), meta = {}, memory = null, onRulePromoted = null, onRuleRestore = null, ruleActive = null, currentRule = null, readControl = null, policy = null, configPath = P.config, onConfigUpdated = null, onProposalOutcome = null, onRollbackFailed = null } = {}) {
 		this.cfg = cfg
 		this.policy = policy ?? new PolicyEngine(cfg ?? {})
 		this.ha = ha
@@ -264,6 +274,10 @@ export class HaAdmin {
 		this.meta = meta
 		this.memory = memory
 		this.onRulePromoted = onRulePromoted
+		this.onRuleRestore = onRuleRestore
+		this.ruleActive = ruleActive
+		this.currentRule = currentRule
+		this.readControl = readControl
 		this.configPath = configPath
 		this.onConfigUpdated = onConfigUpdated
 		this.onProposalOutcome = onProposalOutcome
@@ -277,6 +291,16 @@ export class HaAdmin {
 	#readRawConfig() {
 		const raw = readJson(this.configPath, null)
 		return raw && typeof raw === 'object' ? raw : structuredClone(this.cfg ?? {})
+	}
+
+	// 운영 모드 검사: 일시정지·시험 모드에서는 HA 설정·집 비서 설정을 바꾸지 않는다.
+	// explicitRollback: CLI·웹 콘솔에서 사람이 직접 실행한 롤백(비상 탈출구)만 예외다.
+	#modeBlock({ explicitRollback = false } = {}) {
+		if (!this.readControl || explicitRollback) return null
+		const c = this.readControl() ?? {}
+		if (c.paused) return { mode: 'paused', error: '일시정지 중이라 설정을 바꾸지 않았어요. 재개(node src/cli.mjs resume)한 뒤 다시 해 주세요.' }
+		if (!c.send) return { mode: 'test_mode', error: '시험 모드(알림 발송 꺼짐)라 설정을 바꾸지 않았어요. send-on 뒤 다시 해 주세요.' }
+		return null
 	}
 
 	// 불변 코어 가드: 자가 튜닝 payload에 보안/정책 키가 섞여 있으면 차단한다.
@@ -305,16 +329,17 @@ export class HaAdmin {
 			next.assist ??= {}
 			next.assist.aliases ??= {}
 			const cur = Array.isArray(next.assist.aliases[entityId]) ? [...next.assist.aliases[entityId]] : []
-			if (!cur.includes(alias)) cur.push(alias)
+			const delta = { entity_id: entityId, added_aliases: [], added_stt_hints: [] }
+			if (!cur.includes(alias)) { cur.push(alias); delta.added_aliases.push(alias) }
 			next.assist.aliases[entityId] = cur
 			if (payload?.add_stt_hint !== false) {
 				next.assist.voice ??= {}
 				const hints = Array.isArray(next.assist.voice.stt_hints) ? [...next.assist.voice.stt_hints] : []
-				if (!hints.includes(alias)) hints.push(alias)
+				if (!hints.includes(alias)) { hints.push(alias); delta.added_stt_hints.push(alias) }
 				next.assist.voice.stt_hints = hints
 			}
 			return {
-				next,
+				next, delta,
 				beforeSlice: { aliases: rawCfg.assist?.aliases?.[entityId] ?? [], stt_hints: rawCfg.assist?.voice?.stt_hints ?? [] },
 				afterSlice: { aliases: next.assist.aliases[entityId], stt_hints: next.assist.voice?.stt_hints ?? [] },
 				summaryText: `별칭 추가: ${entityId} ← "${alias}"`,
@@ -327,10 +352,11 @@ export class HaAdmin {
 				return { error: `보안·재실 핵심 엔티티(${pat})는 소음 목록에 넣을 수 없다` }
 			}
 			const list = Array.isArray(next.noise_entities) ? [...next.noise_entities] : []
-			if (!list.includes(pat)) list.push(pat)
+			const delta = { added: [] }
+			if (!list.includes(pat)) { list.push(pat); delta.added.push(pat) }
 			next.noise_entities = list
 			return {
-				next,
+				next, delta,
 				beforeSlice: { noise_entities: rawCfg.noise_entities ?? [] },
 				afterSlice: { noise_entities: next.noise_entities },
 				summaryText: `소음 엔티티 추가: ${pat}`,
@@ -341,18 +367,20 @@ export class HaAdmin {
 			if (!ep || typeof ep !== 'object' || Array.isArray(ep)) return { error: 'self_stt_tune에는 endpoint 객체가 필요하다' }
 			const allowed = ['enabled', 'silence_ms', 'max_seconds', 'no_speech_seconds', 'start_margin_db', 'bg_margin_db', 'near_field_db', 'end_drop_db', 'preroll_ms']
 			const cleanEp = { ...(rawCfg.assist?.voice?.endpoint ?? {}) }
+			const delta = { endpoint_changes: {} }
 			for (const [k, v] of Object.entries(ep)) {
 				if (!allowed.includes(k)) return { error: `허용되지 않은 STT endpoint 키: ${k}` }
 				if (k === 'silence_ms' && !(Number(v) >= 300 && Number(v) <= 2000)) return { error: 'silence_ms는 300~2000ms 범위여야 한다' }
 				if (k === 'max_seconds' && !(Number(v) >= 4 && Number(v) <= 20)) return { error: 'max_seconds는 4~20초 범위여야 한다' }
 				if (k === 'no_speech_seconds' && !(Number(v) >= 2 && Number(v) <= 15)) return { error: 'no_speech_seconds는 2~15초 범위여야 한다' }
+				if (canonicalJson(cleanEp[k]) !== canonicalJson(v)) delta.endpoint_changes[k] = { before: cleanEp[k] ?? null, after: v }
 				cleanEp[k] = v
 			}
 			next.assist ??= {}
 			next.assist.voice ??= {}
 			next.assist.voice.endpoint = cleanEp
 			return {
-				next,
+				next, delta,
 				beforeSlice: { endpoint: rawCfg.assist?.voice?.endpoint ?? {} },
 				afterSlice: { endpoint: cleanEp },
 				summaryText: `STT endpoint 조정: ${JSON.stringify(cleanEp)}`,
@@ -537,21 +565,33 @@ export class HaAdmin {
 			preSnapshot = { state: cur }
 			diffText = `${target_id}: ${cur} → ${finalPayload.state ?? (cur === 'on' ? 'off' : 'on')}`
 		} else if (kind === 'promote_rule') {
-			const rule = finalPayload.rule
+			let rule = finalPayload.rule
 			if (!rule) return { ok: false, error: 'promote_rule에는 rule 객체가 필요하다' }
+			// 승격하면 지금 감시 중인 규칙을 지운다. 판단(LLM)이 옮겨 적은 규칙이 아니라 지금 엔진의 규칙 정의를 기준으로 삼는다.
+			if (this.currentRule) {
+				const live = this.currentRule(rule.id ?? finalPayload.rule_id)
+				if (!live) return { ok: false, error: `지금 감시 규칙에 없는 규칙은 승격할 수 없다: ${rule.id ?? finalPayload.rule_id}` }
+				rule = live
+			}
 			const configId = sanitizeConfigId(`haagent_${rule.id}`) || `haagent_${now}`
-			let generated
+			// HA 자동화는 감시 규칙을 그대로 옮긴 것이어야 한다(규칙은 지워지므로 조건이 다르면 감시가 바뀐다).
+			// 지금 규칙에서 만들 수 있으면 판단이 써 온 설정보다 그것을 쓰고, 옮길 수 없는 규칙만 판단이 쓴 설정을 경고와 함께 쓴다.
+			let generated, customWarning = null
 			try {
-				generated = finalPayload.config ?? { id: configId, ...ruleToAutomationConfig(rule, this.cfg?.notify_targets) }
+				generated = { id: configId, ...ruleToAutomationConfig(rule, this.cfg?.notify_targets) }
 			} catch (e) {
-				return { ok: false, error: e.message }
+				if (!finalPayload.config) return { ok: false, error: e.message }
+				generated = finalPayload.config
+				customWarning = `이 규칙(${e.message})은 그대로 옮길 수 없어 판단이 쓴 자동화 설정을 씁니다. 규칙과 같은 조건인지 diff로 확인해 주세요`
 			}
 			const config = generated
-			finalPayload = { config_id: configId, rule_id: rule.id, config }
+			// 승격하면 감시 규칙을 지운다. 롤백 때 되살릴 수 있게 규칙 정의를 함께 둔다.
+			finalPayload = { config_id: configId, rule_id: rule.id, rule: structuredClone(rule), config }
 			validation = await this.validateHaConfig('automation_upsert', config)
 			if (!validation.valid) {
 				return { ok: false, error: `사전 검증 실패: ${validation.errors.join(', ')}`, validation }
 			}
+			if (customWarning) validation.warnings = [...(validation.warnings ?? []), customWarning]
 			preSnapshot = await this.#snapshotFor('automation', configId, `automation.${configId}`)
 			diffText = unifiedDiff(preSnapshot ? JSON.stringify(preSnapshot, null, 2) : '', JSON.stringify(config, null, 2), `automation.${configId}`)
 		} else if (kind === 'scene_upsert') {
@@ -696,6 +736,8 @@ export class HaAdmin {
 		if (p.validation && p.validation.valid === false) {
 			return { ok: false, error: `사전 검증 실패: ${(p.validation.errors ?? []).join(', ')}` }
 		}
+		const blocked = this.#modeBlock()
+		if (blocked) return { ok: false, error: blocked.error, blocked: blocked.mode }
 		// 먼저 'applying'으로 선점한다. 그사이 거절·만료·다른 승인이 끼어들면 적용하지 않는다(알림 버튼·콘솔·CLI가 동시에 눌려도 한 번만).
 		if (!this.#transition(pid, 'pending', 'applying', { decidedAt: now })) {
 			return { ok: false, error: `이미 처리 중이거나 처리된 제안 (${this.getProposal(pid)?.status ?? '없음'})` }
@@ -724,6 +766,18 @@ export class HaAdmin {
 				return { ok: false, error: blocked.error, proposal: blocked }
 			}
 		}
+		// 승격 제안 뒤에 원래 감시 규칙이 바뀌었거나 지워졌으면 승격하지 않는다(옛 조건이 HA에 올라가고 새 규칙은 지워지는 일 방지).
+		if (p.kind === 'promote_rule' && this.currentRule) {
+			const live = this.currentRule(p.payload?.rule_id)
+			const why = !p.payload?.rule ? '제안에 승격할 규칙 정의가 없어 지금 규칙과 비교할 수 없어요'
+				: !live ? '제안을 만든 뒤 이 감시 규칙이 지워졌어요'
+					: sameJson(live, p.payload.rule) ? null : '제안을 만든 뒤 이 감시 규칙이 바뀌었어요'
+			if (why) {
+				const stale = { ...p, status: 'error', decided_at: now, error: `${why}. 지금 규칙을 기준으로 다시 제안해야 해요.` }
+				this.#saveProposal(stale)
+				return { ok: false, error: stale.error, proposal: stale }
+			}
+		}
 		// 제안 뒤에 HA에서 같은 설정을 손댔으면(UI 수정 등) 덮어쓰지 않는다. 그 수정이 사라지고, 롤백도 옛 판으로 돌아가기 때문이다.
 		if (mutatedConfig) {
 			const domain = configDomainOf(p.kind)
@@ -747,8 +801,15 @@ export class HaAdmin {
 				return { ok: false, error: failed.error, proposal: failed }
 			}
 		}
+		// 승인을 누른 뒤 HA를 확인하는 사이에 일시정지·시험 모드로 바뀌었으면 쓰지 않고 승인 대기로 되돌린다.
+		const blockedLate = this.#modeBlock()
+		if (blockedLate) {
+			this.#saveProposal(p)
+			return { ok: false, error: blockedLate.error, blocked: blockedLate.mode }
+		}
 		if (p.pre_snapshot) this.#saveSnapFile(pid, 'before', p.pre_snapshot)
 
+		let selfDelta = null
 		try {
 			if (p.kind === 'automation_upsert' || p.kind === 'promote_rule') {
 				await this.#withConfigWrite(() => this.ha.saveConfigRest('automation', p.payload.config_id, p.payload.config))
@@ -794,6 +855,7 @@ export class HaAdmin {
 				const rawCfg = this.#readRawConfig()
 				const built = this.#buildSelfConfigPatch(p.kind, p.target_id, p.payload, rawCfg)
 				if (built.error) throw new Error(built.error)
+				selfDelta = built.delta ?? null
 				const merged = mergeConfig(built.next)
 				const chk = validateConfig(merged)
 				if (chk.errors.length) throw new Error(`설정 검증 실패: ${chk.errors.join(', ')}`)
@@ -810,17 +872,30 @@ export class HaAdmin {
 					throw new Error(`check_config 실패: ${JSON.stringify(chk.errors ?? chk.result)}`)
 				}
 			}
-			const updated = { ...p, ...(appliedPayload ? { payload: appliedPayload } : {}), status: 'applied', decided_at: now, applied_at: now, error: null }
-			this.#saveProposal(updated)
+			// 적용 직후 값: 롤백할 때 "그 뒤 다른 쪽에서 또 바꿨는지(충돌)" 판단하고, 이 제안이 바꾼 항목만 되돌리는 데 쓴다.
+			const post = await this.#capturePost({ ...p, ...(appliedPayload ? { payload: appliedPayload } : {}) }, selfDelta)
 			if (p.kind === 'promote_rule' && this.onRulePromoted && p.payload?.rule_id) {
-				await this.onRulePromoted(p.payload.rule_id)
+				post.removed_rule = (await this.onRulePromoted(p.payload.rule_id)) ?? p.payload?.rule ?? null
 			}
+			const updated = { ...p, ...(appliedPayload ? { payload: appliedPayload } : {}), post_snapshot: post, status: 'applied', decided_at: now, applied_at: now, error: null }
+			this.#saveProposal(updated)
 			try { this.onProposalOutcome?.(updated, 'applied', now) } catch {}
 			return { ok: true, proposal: updated }
 		} catch (e) {
 			if (mutatedConfig) {
 				let rbErr = null
 				try { await this.#restoreSnapshot(p) } catch (re) { rbErr = re }
+				// 승격 도중 실패: 감시 규칙이 이미 지워졌으면 되살린다(HA 자동화와 감시 규칙이 함께 사라지지 않게).
+				if (p.kind === 'promote_rule' && p.payload?.rule && this.onRuleRestore && this.ruleActive && !this.ruleActive(p.payload.rule_id)) {
+					try { await this.onRuleRestore(p.payload.rule) } catch (re) { rbErr ??= re }
+				}
+				// 되돌린 뒤 HA 설정이 정말 정상인지 다시 본다. 아니면 롤백됐다고 기록하지 않는다.
+				if (!rbErr && typeof this.ha.checkConfig === 'function') {
+					try {
+						const chk = await this.ha.checkConfig()
+						if (chk && chk.result && chk.result !== 'valid') rbErr = new Error(`되돌린 뒤 check_config 실패: ${JSON.stringify(chk.errors ?? chk.result)}`)
+					} catch (ce) { rbErr = new Error(`되돌린 뒤 check_config를 확인하지 못함: ${ce.message}`) }
+				}
 				if (rbErr) {
 					// 되돌리기도 실패: HA에 새(깨졌을 수 있는) 설정이 남아 있을 수 있다. 롤백됐다고 기록하지 않는다.
 					const stuck = { ...p, status: 'rollback_failed', decided_at: now, error: `적용 실패(${e.message}) 뒤 자동 롤백도 실패(${rbErr.message}). HA에서 이 설정을 직접 확인하고 [롤백]을 다시 시도하세요.` }
@@ -846,37 +921,30 @@ export class HaAdmin {
 			else this.store.deleteLesson(p.payload?.key || p.target_id, { source: 'user', force: true })
 			return
 		}
-		if (SELF_PROPOSAL_KINDS.has(p.kind)) {
-			const rawCfg = this.#readRawConfig()
-			const next = structuredClone(rawCfg)
-			if (p.kind === 'self_alias_proposal') {
-				const eid = p.payload?.entity_id || p.target_id
-				next.assist ??= {}
-				next.assist.aliases ??= {}
-				if (p.pre_snapshot?.aliases?.length) next.assist.aliases[eid] = p.pre_snapshot.aliases
-				else delete next.assist.aliases[eid]
-				if (Array.isArray(p.pre_snapshot?.stt_hints)) {
-					next.assist.voice ??= {}
-					next.assist.voice.stt_hints = p.pre_snapshot.stt_hints
-				}
-			} else if (p.kind === 'self_noise_proposal') {
-				next.noise_entities = Array.isArray(p.pre_snapshot?.noise_entities) ? p.pre_snapshot.noise_entities : []
-			} else if (p.kind === 'self_stt_tune') {
-				next.assist ??= {}
-				next.assist.voice ??= {}
-				next.assist.voice.endpoint = p.pre_snapshot?.endpoint ?? {}
-			}
-			writeJson(this.configPath, next)
-			const merged = mergeConfig(next)
-			this.cfg = merged
-			await this.onConfigUpdated?.(merged, p)
-			return
-		}
+		// 집 비서 설정(config.json) 제안은 #rollbackApply가 이 제안이 바꾼 항목만 되돌린다. 목록 전체를 덮어쓰는 길은 두지 않는다.
+		if (SELF_PROPOSAL_KINDS.has(p.kind)) throw new Error(`${p.kind}는 항목 단위 롤백으로만 되돌린다`)
 		if (p.kind === 'helper_upsert' || p.kind === 'helper_delete') {
 			const { domain, id, created_id: createdId } = p.payload ?? {}
 			await this.#withConfigWrite(async () => {
-				if (p.kind === 'helper_upsert' && createdId) await this.ha.call({ type: `${domain}/delete`, [`${domain}_id`]: createdId })
-				else if (p.kind === 'helper_upsert' && id && p.pre_snapshot) await this.ha.call({ type: `${domain}/update`, [`${domain}_id`]: id, ...pickHelperFields(domain, p.pre_snapshot) })
+				if (p.kind === 'helper_upsert' && createdId) {
+					let exists = true
+					try { exists = Boolean(await this.#currentHelper(domain, createdId)) } catch {}
+					if (exists) await this.ha.call({ type: `${domain}/delete`, [`${domain}_id`]: createdId })
+				}
+				else if (p.kind === 'helper_upsert' && id && p.pre_snapshot) {
+					// HA 헬퍼 update는 설정 전체를 바꾼다. 지금 설정에서 이 제안이 바꾼 키만 이전 값으로 돌려 보낸다
+					// (그 뒤 다른 키를 바꾼 것은 지우지 않는다).
+					const changed = Object.keys(pickHelperFields(domain, p.payload?.config ?? {}))
+					const prev = pickHelperFields(domain, p.pre_snapshot)
+					let cur = null
+					try { cur = await this.#currentHelper(domain, id) } catch {}
+					const base = pickHelperFields(domain, cur ?? p.pre_snapshot)
+					for (const k of changed.length ? changed : Object.keys(prev)) {
+						if (k in prev) base[k] = prev[k]
+						else delete base[k]
+					}
+					await this.ha.call({ type: `${domain}/update`, [`${domain}_id`]: id, ...base })
+				}
 				else if (p.kind === 'helper_delete' && p.pre_snapshot) await this.ha.call({ type: `${domain}/create`, ...pickHelperFields(domain, p.pre_snapshot) })
 			})
 			return
@@ -895,19 +963,201 @@ export class HaAdmin {
 		await this.ha.callService(domain, 'reload')
 	}
 
-	rollbackProposal(pid, now = Date.now()) {
-		return this.#serializeOp(() => this.#rollbackProposalUnlocked(pid, now))
+	// explicit: CLI·웹 콘솔에서 사람이 직접 실행한 롤백. 일시정지·시험 모드에서도 이것만 허용한다.
+	rollbackProposal(pid, now = Date.now(), { explicit = false } = {}) {
+		return this.#serializeOp(() => this.#rollbackProposalUnlocked(pid, now, { explicit }))
 	}
 
-	async #rollbackProposalUnlocked(pid, now = Date.now()) {
+	// 적용 직후 값. 롤백할 때 그 뒤 다른 쪽에서 또 바꿨는지(충돌) 보고, 이 제안이 바꾼 항목만 되돌리는 데 쓴다.
+	// HA 설정은 적용 뒤 HA에서 다시 읽은 값, 못 읽으면 적용한 내용으로 대신한다.
+	async #capturePost(p, selfDelta) {
+		const post = { v: 1 }
+		try {
+			if (CONFIG_FILE_KINDS.has(p.kind)) {
+				if (p.kind.endsWith('_delete')) post.config = null
+				else {
+					let cur
+					try { cur = await this.#currentConfig(configDomainOf(p.kind), p.payload?.config_id) } catch { cur = undefined }
+					post.config = cur ?? p.payload?.config ?? null
+				}
+			} else if (p.kind === 'automation_toggle') post.state = p.payload?.state === 'off' ? 'off' : 'on'
+			else if (p.kind === 'helper_upsert') {
+				const { domain, id, created_id: createdId, config } = p.payload ?? {}
+				let cur = null
+				try { cur = await this.#currentHelper(domain, id || createdId) } catch {}
+				post.helper = cur ?? { ...(config ?? {}) }
+			} else if (p.kind === 'helper_delete') post.helper = null
+			else if (p.kind === 'self_lesson_proposal') post.lesson = { condition_text: p.payload?.condition_text ?? null, rule_text: p.payload?.rule_text ?? null, scope: p.payload?.scope ?? null }
+			else if (SELF_PROPOSAL_KINDS.has(p.kind)) Object.assign(post, selfDelta ?? {})
+		} catch {}
+		return post
+	}
+
+	// 적용 직후 값. 예전 판이 승인한 제안(post_snapshot 없음)은 제안 내용과 제안 때의 이전 값으로 짐작한다.
+	#appliedFor(p) {
+		if (p.post_snapshot?.v) return p.post_snapshot
+		const pre = p.pre_snapshot ?? {}, pl = p.payload ?? {}
+		if (CONFIG_FILE_KINDS.has(p.kind)) return { legacy: true, config: p.kind.endsWith('_delete') ? null : (pl.config ?? null), removed_rule: pl.rule ?? null }
+		if (p.kind === 'automation_toggle') return { legacy: true, state: pl.state === 'off' ? 'off' : 'on' }
+		if (p.kind === 'helper_upsert') return { legacy: true, helper: { ...(pl.config ?? {}) } }
+		if (p.kind === 'helper_delete') return { legacy: true, helper: null }
+		if (p.kind === 'self_noise_proposal') {
+			const pat = String(pl.entity_id || pl.pattern || p.target_id || '').trim()
+			return { legacy: true, added: pat && !(pre.noise_entities ?? []).includes(pat) ? [pat] : [] }
+		}
+		if (p.kind === 'self_alias_proposal') {
+			const alias = String(pl.alias || '').trim()
+			return {
+				legacy: true, entity_id: String(pl.entity_id || p.target_id || '').trim(),
+				added_aliases: alias && !(pre.aliases ?? []).includes(alias) ? [alias] : [],
+				added_stt_hints: pl.add_stt_hint !== false && alias && !(pre.stt_hints ?? []).includes(alias) ? [alias] : [],
+			}
+		}
+		if (p.kind === 'self_stt_tune') {
+			const changes = {}
+			for (const [k, v] of Object.entries(pl.endpoint ?? {})) {
+				if (canonicalJson(pre.endpoint?.[k] ?? null) !== canonicalJson(v)) changes[k] = { before: pre.endpoint?.[k] ?? null, after: v }
+			}
+			return { legacy: true, endpoint_changes: changes }
+		}
+		if (p.kind === 'self_lesson_proposal') return { legacy: true, lesson: { condition_text: pl.condition_text ?? null, rule_text: pl.rule_text ?? null, scope: pl.scope ?? null } }
+		return { legacy: true }
+	}
+
+	// 롤백 전 검사(쓰기 없음). 이 제안이 바꾼 항목이 그 뒤 다시 바뀌었으면 충돌로 돌려준다.
+	// 적용 도중 중단됐거나 이전 롤백이 실패한 제안은 지금 값이 무엇이든 되돌리는 게 목적이라 충돌을 보지 않는다.
+	async #rollbackPrecheck(p) {
+		const applied = this.#appliedFor(p)
+		const conflicts = []
+		const checkConflict = p.status === 'applied'
+		const readErr = e => ({ error: `지금 HA 설정을 확인하지 못해 롤백하지 않았어요(잠시 뒤 다시): ${e.message}` })
+		if (CONFIG_FILE_KINDS.has(p.kind)) {
+			if (p.kind === 'promote_rule') {
+				const rule = applied.removed_rule ?? p.payload?.rule ?? null
+				if (!rule) return { error: '승격 전 감시 규칙 정의가 남아 있지 않아, 롤백하면 감시가 모두 사라져요. HA 자동화는 그대로 두었어요.' }
+				if (!this.onRuleRestore) return { error: '감시 규칙을 되살릴 집 비서 데몬이 연결되어 있지 않아 롤백하지 않았어요(데몬을 켠 뒤 다시 해 주세요).' }
+			}
+			if (checkConflict) {
+				const domain = configDomainOf(p.kind)
+				let cur
+				try { cur = await this.#currentConfig(domain, p.payload?.config_id) } catch (e) { return readErr(e) }
+				if (cur !== undefined && !sameHaConfig(cur, applied.config)) {
+					conflicts.push(`${domain} ${p.payload?.config_id}: 적용한 뒤 HA에서 이 설정이 다시 ${cur === null ? '삭제됐어요' : applied.config === null ? '만들어졌어요' : '바뀌었어요'}`)
+				}
+			}
+		} else if (p.kind === 'automation_toggle') {
+			const cur = this.states.get(p.target_id)?.state
+			if (checkConflict && (cur === 'on' || cur === 'off') && cur !== applied.state) conflicts.push(`${p.target_id}: 적용한 뒤 켜짐·꺼짐이 다시 바뀌었어요(지금 ${cur})`)
+		} else if (p.kind === 'helper_upsert' && p.payload?.id && checkConflict) {
+			const { domain, id, config } = p.payload
+			let cur
+			try { cur = await this.#currentHelper(domain, id) } catch (e) { return readErr(e) }
+			if (cur) {
+				for (const k of Object.keys(pickHelperFields(domain, config ?? {}))) {
+					if (canonicalJson(cur[k] ?? null) !== canonicalJson(applied.helper?.[k] ?? config[k] ?? null)) conflicts.push(`${domain}.${id}의 ${k}: 적용한 뒤 다시 바뀌었어요`)
+				}
+			}
+		} else if (p.kind === 'helper_upsert' && p.payload?.created_id && checkConflict) {
+			// 이 제안이 새로 만든 헬퍼: 그 뒤 사용자가 고쳤으면 지우지 않는다(이미 지워졌으면 할 일 없음).
+			const { domain, created_id: createdId } = p.payload
+			let cur
+			try { cur = await this.#currentHelper(domain, createdId) } catch (e) { return readErr(e) }
+			if (cur) {
+				const want = pickHelperFields(domain, applied.helper ?? {}), now = pickHelperFields(domain, cur)
+				const keys = [...new Set([...Object.keys(want), ...Object.keys(now)])]
+				const changed = keys.filter(k => canonicalJson(now[k] ?? null) !== canonicalJson(want[k] ?? null))
+				if (changed.length) conflicts.push(`${domain}.${createdId}: 이 제안이 만든 헬퍼를 그 뒤 고쳤어요(${changed.join(', ')})`)
+			}
+		} else if (p.kind === 'helper_delete' && checkConflict && p.pre_snapshot?.name) {
+			// 지운 헬퍼를 같은 이름으로 다시 만들었으면 또 만들지 않는다.
+			const { domain } = p.payload ?? {}
+			let list
+			try { list = await this.ha.call({ type: `${domain}/list` }) } catch (e) { return readErr(e) }
+			const same = (Array.isArray(list) ? list : []).find(h => h.name === p.pre_snapshot.name)
+			if (same) conflicts.push(`${domain}: 지운 뒤 같은 이름(${p.pre_snapshot.name})의 헬퍼가 다시 생겼어요(${same.id})`)
+		} else if (p.kind === 'self_stt_tune' && checkConflict) {
+			const curEp = this.#readRawConfig().assist?.voice?.endpoint ?? {}
+			for (const [k, ch] of Object.entries(applied.endpoint_changes ?? {})) {
+				if (canonicalJson(curEp[k] ?? null) !== canonicalJson(ch.after ?? null)) conflicts.push(`assist.voice.endpoint.${k}: 적용한 뒤 다시 바뀌었어요(지금 ${JSON.stringify(curEp[k] ?? null)})`)
+			}
+		} else if (p.kind === 'self_lesson_proposal' && checkConflict && this.store) {
+			const cur = this.store.getLesson(p.payload?.key || p.target_id)
+			if (cur && (cur.rule_text !== applied.lesson?.rule_text || cur.condition_text !== applied.lesson?.condition_text)) conflicts.push(`교훈 ${p.payload?.key || p.target_id}: 적용한 뒤 내용이 다시 바뀌었어요`)
+		}
+		return { conflicts, applied }
+	}
+
+	// 롤백 쓰기. 집 비서 설정(config.json)은 이 제안이 넣은 항목만 빼거나 바꾼 키만 되돌린다(나중에 승인한 다른 변경은 그대로).
+	async #rollbackApply(p, applied) {
+		if (SELF_PROPOSAL_KINDS.has(p.kind) && p.kind !== 'self_lesson_proposal') {
+			const rawCfg = this.#readRawConfig()
+			const next = structuredClone(rawCfg)
+			if (p.kind === 'self_noise_proposal') {
+				const drop = new Set(applied.added ?? [])
+				next.noise_entities = (Array.isArray(next.noise_entities) ? next.noise_entities : []).filter(x => !drop.has(x))
+			} else if (p.kind === 'self_alias_proposal') {
+				const eid = applied.entity_id || p.payload?.entity_id || p.target_id
+				const dropA = new Set(applied.added_aliases ?? []), dropH = new Set(applied.added_stt_hints ?? [])
+				if (Array.isArray(next.assist?.aliases?.[eid])) {
+					const left = next.assist.aliases[eid].filter(x => !dropA.has(x))
+					if (left.length) next.assist.aliases[eid] = left
+					else delete next.assist.aliases[eid]
+				}
+				if (dropH.size && Array.isArray(next.assist?.voice?.stt_hints)) next.assist.voice.stt_hints = next.assist.voice.stt_hints.filter(x => !dropH.has(x))
+			} else if (p.kind === 'self_stt_tune') {
+				next.assist ??= {}
+				next.assist.voice ??= {}
+				const ep = { ...(next.assist.voice.endpoint ?? {}) }
+				for (const [k, ch] of Object.entries(applied.endpoint_changes ?? {})) {
+					if (ch.before === null || ch.before === undefined) delete ep[k]
+					else ep[k] = ch.before
+				}
+				next.assist.voice.endpoint = ep
+			}
+			if (canonicalJson(next) !== canonicalJson(rawCfg)) {
+				const merged = mergeConfig(next)
+				const chk = validateConfig(merged)
+				if (chk.errors.length) throw new Error(`설정 검증 실패: ${chk.errors.join(', ')}`)
+				writeJson(this.configPath, next)
+				this.cfg = merged
+				await this.onConfigUpdated?.(merged, p)
+			}
+			return
+		}
+		if (p.kind === 'promote_rule') {
+			// 감시 규칙을 먼저 되살린다. 그 뒤 HA 자동화 삭제가 실패해도 감시가 모두 사라지지는 않는다(최악이면 두 번 알림).
+			const rule = applied.removed_rule ?? p.payload?.rule
+			if (!(await this.onRuleRestore(rule))) throw new Error(`감시 규칙(${rule?.id})을 되살리지 못함`)
+		}
+		await this.#restoreSnapshot(p)
+	}
+
+	async #rollbackProposalUnlocked(pid, now = Date.now(), { explicit = false } = {}) {
 		const p = this.getProposal(pid)
 		if (!p) return { ok: false, error: `제안을 찾지 못함: ${pid}` }
 		if (!this.isRollbackable(p)) return { ok: false, error: `${p.kind} 제안은 롤백을 지원하지 않음` }
 		if (!ROLLBACK_FROM.has(p.status)) return { ok: false, error: `적용된 제안만 롤백 가능 (${p.status})` }
+		const blocked = this.#modeBlock({ explicitRollback: explicit })
+		if (blocked) return { ok: false, error: blocked.error, blocked: blocked.mode }
+		const pre = await this.#rollbackPrecheck(p)
+		if (pre.error) return { ok: false, error: pre.error, proposal: p }
+		if (pre.conflicts.length) {
+			// 덮어쓰면 그 뒤의 수정이 사라진다. 상태는 그대로 두고 충돌을 적어 둔다(HA에서 확인한 뒤 다시 [롤백]할 수 있다).
+			const marked = { ...p, error: `롤백 충돌: ${pre.conflicts.join(' / ')}. 그 뒤의 변경을 덮어쓰지 않으려고 되돌리지 않았어요.` }
+			this.#saveProposal(marked)
+			return { ok: false, conflict: true, conflicts: pre.conflicts, error: marked.error, proposal: marked }
+		}
 		try {
-			await this.#restoreSnapshot(p)
-			if (!SELF_PROPOSAL_KINDS.has(p.kind) && typeof this.ha?.checkConfig === 'function') await this.ha.checkConfig()
-			const updated = { ...p, status: 'rolled_back', rollback_at: now }
+			await this.#rollbackApply(p, pre.applied)
+			if (!SELF_PROPOSAL_KINDS.has(p.kind) && typeof this.ha?.checkConfig === 'function') {
+				const chk = await this.ha.checkConfig()
+				if (chk && chk.result && chk.result !== 'valid') throw new Error(`롤백 뒤 check_config 실패: ${JSON.stringify(chk.errors ?? chk.result)}`)
+			}
+			if (p.kind === 'promote_rule' && this.ruleActive) {
+				const rid = (pre.applied.removed_rule ?? p.payload?.rule)?.id ?? p.payload?.rule_id
+				if (!this.ruleActive(rid)) throw new Error(`롤백 뒤 감시 규칙(${rid})이 다시 감시 중이 아님`)
+			}
+			const updated = { ...p, status: 'rolled_back', rollback_at: now, error: null }
 			this.#saveProposal(updated)
 			try { this.onProposalOutcome?.(updated, 'rolled_back', now) } catch {}
 			return { ok: true, proposal: updated }

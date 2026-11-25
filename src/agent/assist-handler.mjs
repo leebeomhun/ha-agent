@@ -37,6 +37,25 @@ const ASSIST_SCHEMA = {
 	},
 }
 
+// Assist 요청 하나의 최종 결과. 성공률·재시도율·모델 전환율을 요청 단위로 따로 셀 수 있게 판단 기록에 남긴다.
+// error: 처리 실패, control_failed: 기기 명령이 실패했거나 확인되지 않음, refused: 정책상 거절만 함,
+// partial: 일부만 실행(나머지는 한도·정책으로 거절), ok: 그 밖. 요청 단계에서 끝난 것: limit(오늘 판단 한도), paused(일시정지)
+export function assistOutcome({ error = null, actions = [] } = {}) {
+	if (error) return 'error'
+	const st = actions.map(x => x?.status)
+	if (st.some(s => s === 'error' || s === 'unverified')) return 'control_failed'
+	const rejected = st.filter(s => s === 'rejected').length
+	if (st.length && rejected === st.length) return 'refused'
+	if (rejected) return 'partial'
+	return 'ok'
+}
+
+// Assist 요청 하나에서 움직일 수 있는 기기 수. 기본은 정기 판단과 같은 actions.per_cycle
+export function assistActionLimit(cfg) {
+	const n = cfg?.assist?.max_actions_per_turn
+	return Number.isInteger(n) && n > 0 ? n : cfg?.actions?.per_cycle ?? 3
+}
+
 export class AssistHandler {
 	constructor(agent) {
 		this.agent = agent
@@ -262,12 +281,18 @@ export class AssistHandler {
 		const now = ag.clock()
 		const a = ag.cfg.assist ?? {}
 		ag.control = loadControl()
-		if (ag.control.paused) {
-			return { conversation_id: sid, speech: '지금은 집 비서가 일시정지 중이에요. 재개한 뒤 다시 말씀해 주세요.', continue_conversation: false, actions: [], proposals: [], ms: 0 }
+		// 요청 단계에서 끝난 요청도 결과 하나로 남긴다(성공률에서 일시정지는 빼고, 한도 거절은 실패로 센다).
+		const endEarly = (path, outcome, speech) => {
+			this.recordAssistDecision({ ts: iso(now), reasons: ['assist'], brain: null, model: null, path, total_ms: 0, tokens: 0, usage: null, summary: speech.slice(0, 200), applied: { actions: [], proposals: [], outcome, fell_back: false } })
+			return { conversation_id: sid, speech, continue_conversation: false, actions: [], proposals: [], ms: 0 }
 		}
+		if (ag.control.paused) return endEarly('paused', 'paused', '지금은 집 비서가 일시정지 중이에요. 재개한 뒤 다시 말씀해 주세요.')
 		const prevUserMsgs = ag.sessions.history(sid, now).filter(m => m.role === 'user')
 		ag.sessions.append(sid, 'user', text, { channel }, now)
-		const exec = ag.assistControl ?? ((req, opts) => ag.actionExecutor.executeControlItem(req, opts))
+		// 한 번의 요청에서 움직일 수 있는 기기 수. 정기 판단과 같은 실행기·같은 방식의 한도를 쓴다(기본은 actions.per_cycle).
+		const perTurn = assistActionLimit(ag.cfg)
+		const budget = ag.actionExecutor.controlBudget(perTurn, '한 번의 요청', ag.assistControl ?? undefined)
+		const exec = budget.run
 		const dir = this.assistDirectory()
 
 		// 1) 로컬 빠른 경로: "주방 불 켜줘" 같은 단순 켜기/끄기는 LLM 없이 정책 게이트만 거쳐 바로 실행
@@ -279,18 +304,17 @@ export class AssistHandler {
 			ag.sessions.append(sid, 'assistant', speech, { mode: 'local' }, ag.clock())
 			ag.implicitFeedback?.onAssistTurn({ text, speech, prevUserMsgs, actions: [r], now })
 			log(`Assist 빠른 경로 (${ms}ms): "${text.slice(0, 60)}" → ${fast.entity_id} ${fast.service} = ${r.status}${r.error ? ` (${r.error})` : ''}`)
-			this.recordAssistDecision({ ts: iso(now), reasons: ['assist'], brain: 'local', model: null, path: 'fast', total_ms: ms, tokens: 0, usage: null, rounds: 0, tool_calls: 0, summary: speech.slice(0, 200), applied: { actions: [r.status], proposals: [] } })
+			this.recordAssistDecision({ ts: iso(now), reasons: ['assist'], brain: 'local', model: null, path: 'fast', total_ms: ms, tokens: 0, usage: null, rounds: 0, tool_calls: 0, summary: speech.slice(0, 200), applied: { actions: [r.status], proposals: [], outcome: assistOutcome({ actions: [r] }), fell_back: false } })
 			return { conversation_id: sid, speech, continue_conversation: false, actions: [r], proposals: [], ms, meta: { path: 'fast', tier: null, mode: 'local', model: null, rounds: 0, tool_calls: 0, tokens: 0 } }
 		}
 
-		if (ag.overLimit([{ type: 'user' }])) {
-			return { conversation_id: sid, speech: '오늘 판단 한도를 모두 사용해서 지금은 답하기 어려워요. 내일 다시 말씀해 주세요.', continue_conversation: false, actions: [], proposals: [], ms: 0 }
-		}
+		if (ag.overLimit([{ type: 'user' }])) return endEarly('limit', 'limit', '오늘 판단 한도를 모두 사용해서 지금은 답하기 어려워요. 내일 다시 말씀해 주세요.')
 
 		const plans = this.assistPlans(text)
 		if (['codex', 'agy'].includes(plans[0].mode) && ag.brain === runBrain) {
 			// CLI 샌드박스 방식(codex/agy)은 직렬화된 cycle 경로로 처리(cycle 내부에서 카운터 증가)
-			const entry = await ag.runCycleSerialized([{ type: 'user', text, about: 'HA Assist', urgent: true, at: now }])
+			// assist: true → 이 판단은 Assist 요청 한도(max_actions_per_turn)를 쓰고, 판단 기록에 Assist 요청 결과로 남는다.
+			const entry = await ag.runCycleSerialized([{ type: 'user', text, about: 'HA Assist', urgent: true, at: now, assist: true }])
 			const speech = entry.error
 				? `죄송해요, 처리 중 오류가 났어요: ${entry.error}`
 				: (entry.summary || '확인하고 처리했어요.')
@@ -353,10 +377,12 @@ export class AssistHandler {
 		const started = ag.clock()
 		const budgetSec = a.timeout_seconds ?? 90
 		let r = null, used = null, lastErr = null, hadUnexecutedClaim = false, fellBack = false
+		const tried = [] // 실제로 부른 단계(계획만 있고 부르지 않은 단계는 기록하지 않는다)
 		for (const [i, plan] of plans.entries()) {
 			const left = Math.max(5, budgetSec - Math.round((ag.clock() - started) / 1000))
 			const timeoutSec = i === 0 && plans.length > 1 ? Math.min(a.fast_timeout_seconds ?? 30, left) : left
 			roundCtl = []
+			tried.push(plan)
 			try {
 				const out = await ag.llmRouter.run({
 					cfg: ag.cfg,
@@ -395,7 +421,15 @@ export class AssistHandler {
 				: `죄송해요, 요청을 처리하지 못했어요: ${lastErr?.message ?? '알 수 없는 오류'}`
 			ag.sessions.append(sid, 'assistant', speech, { error: lastErr?.message }, ag.clock())
 			ag.implicitFeedback?.onAssistTurn({ text, speech, prevUserMsgs, hadUnexecutedClaim, fellBack: true, actions: turnActions, now })
-			return { conversation_id: sid, speech, continue_conversation: false, actions: turnActions, proposals: turnProposals, ms: elapsedMs, meta: { path: 'error', tier: plans.at(-1).tier, mode: plans.at(-1).mode, model: plans.at(-1).model } }
+			// 실패한 요청도 판단 기록에 최종 결과 하나로 남긴다(성공률의 분모에서 빠지지 않게).
+			const last = tried.at(-1) ?? plans[0]
+			this.recordAssistDecision({
+				ts: iso(started), reasons: ['assist'], brain: last.mode, model: last.model, effort: last.effort, tier: last.tier, path: 'error',
+				total_ms: elapsedMs, tokens: null, usage: null, error: String(lastErr?.message ?? '알 수 없는 오류').slice(0, 300),
+				summary: speech.slice(0, 200),
+				applied: { actions: turnActions.map(x => x.status), proposals: turnProposals, outcome: 'error', fell_back: tried.length > 1, tried: tried.map(t => `${t.mode}/${t.model}`), unexecuted_claim: hadUnexecutedClaim },
+			})
+			return { conversation_id: sid, speech, continue_conversation: false, actions: turnActions, proposals: turnProposals, ms: elapsedMs, meta: { path: 'error', tier: last.tier, mode: last.mode, model: last.model } }
 		}
 		const speech = String(r.result?.speech ?? '처리했어요.').trim()
 		const cont = Boolean(r.result?.continue_conversation)
@@ -408,7 +442,8 @@ export class AssistHandler {
 		this.recordAssistDecision({
 			ts: iso(started), reasons: ['assist'], brain: used.mode, model: used.model, effort: used.effort, tier: used.tier, path,
 			total_ms: elapsedMs, rounds: r.rounds ?? null, tool_calls: r.tool_calls ?? null, tokens: r.tokens ?? null, usage: r.usage ?? null,
-			summary: speech.slice(0, 200), applied: { actions: turnActions.map(x => x.status), proposals: turnProposals },
+			summary: speech.slice(0, 200),
+			applied: { actions: turnActions.map(x => x.status), proposals: turnProposals, outcome: assistOutcome({ actions: turnActions }), fell_back: fellBack, unexecuted_claim: hadUnexecutedClaim },
 		})
 		log(`Assist ${used.tier} (${used.mode}/${used.model}, ${elapsedMs}ms, 왕복 ${r.rounds ?? '?'}회, 도구 ${r.tool_calls ?? '?'}회${r.early ? ', 조기 종료' : ''})`)
 		return {

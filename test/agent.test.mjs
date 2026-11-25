@@ -794,15 +794,16 @@ test('행동 안전: TV 되돌리기 미부착, UNDO 실패 시 상태 유지, �
 	await flush(); await flush()
 	assert.equal(x.ha.calls.filter(c => c === 'switch.b turn_off').length, 1, '중복 탭해도 1회만 실행')
 
-	// paused 상태에서는 DO와 REPLY가 차단된다
-	saveControl({ paused: true, send: true })
+	// paused 상태에서는 DO와 REPLY가 차단된다: 일시정지 전에 보낸 승인 버튼을 일시정지 뒤 눌러도 실행하지 않고, 승인 대기는 남는다
 	x.t.brain = async () => ({ result: answer({ actions: [{ entity_id: 'switch.b', action: 'turn_on', reason: '켜기' }] }), ms: 1, tokens: 1 })
-	x.agent.control.paused = false
 	await x.agent.cycle([{ type: 'manual', reason: '시험' }])
 	const doPaused = x.ha.sent.at(-1).data.actions[0].action
+	assert.match(doPaused, /^HAAGENT_DO_/)
+	saveControl({ paused: true, send: true })
 	x.ha.emit('action', { action: doPaused })
 	await flush(); await flush()
 	assert.equal(x.ha.calls.filter(c => c === 'switch.b turn_on').length, 0, '일시정지 중에는 행동 버튼 미실행')
+	assert.ok(x.agent.pendingActs.some(p => `HAAGENT_DO_${p.aid}` === doPaused), '승인 대기는 그대로 남아 재개 뒤 누를 수 있다')
 	x.ha.emit('action', { action: 'REPLY', reply_text: '지금 실행해', tag: 'haagent-summary' })
 	await flush()
 	assert.equal(x.agent.queue.some(q => q.type === 'user'), false, '일시정지 중에는 답장을 큐에 넣지 않음')

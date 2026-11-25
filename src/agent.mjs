@@ -14,6 +14,7 @@ import { MemoryManager } from './core/memory.mjs'
 import { AnomalyEngine } from './engine/anomaly.mjs'
 import { ImplicitFeedbackTracker, buildLearningDigest, registerExperiment, evaluateDueExperiments, proposalExperimentScope } from './engine/learning.mjs'
 import { HaAdmin } from './admin/ha-admin.mjs'
+import { analyzeScriptScope } from './core/script-scope.mjs'
 import { OriginTracker } from './engine/origin.mjs'
 import { suggestAutomations } from './engine/automation-suggest.mjs'
 import { buildScorecard, renderScorecard } from './engine/scorecard.mjs'
@@ -31,7 +32,7 @@ import { automationRuns, deviceActivity, DEVICE_DOMAINS, WEEKLY_HOURS } from './
 import { backtestRule, backtestable } from './backtest.mjs'
 import { Notifier } from './agent/notifier.mjs'
 import { ActionExecutor } from './agent/action-executor.mjs'
-import { AssistHandler } from './agent/assist-handler.mjs'
+import { AssistHandler, assistOutcome, assistActionLimit } from './agent/assist-handler.mjs'
 import { P, DAY, readJson, writeJson, kst, fmt, log, expandHome, globs } from './util.mjs'
 import { loadConfig, loadControl } from './config.mjs'
 
@@ -143,6 +144,11 @@ export class Agent {
 		this.haAdmin = new HaAdmin({
 			cfg: this.cfg, ha: this.ha, store: this.store, states: this.states, meta: this.meta, memory: this.memoryMgr, policy: this.policy,
 			onRulePromoted: async ruleId => this.#removePromotedRule(ruleId),
+			// 승격 롤백: 승격 때 지운 감시 규칙을 되살리고, 정말 다시 감시 중인지 확인한다.
+			onRuleRestore: async rule => this.#restorePromotedRule(rule),
+			ruleActive: ruleId => this.engine.rules.some(r => r.id === ruleId),
+			currentRule: ruleId => { const r = this.engine.rules.find(x => x.id === ruleId); return r ? structuredClone(r) : null },
+			readControl: () => this.liveControl(),
 			// 롤백까지 실패하면 HA가 어떤 설정으로 돌고 있는지 모른다. HA 알림이 막혔을 수도 있으니 비상 길로도 알린다.
 			onRollbackFailed: prop => {
 				log(`제안 롤백 실패: ${prop.pid} ${prop.title} — ${prop.error}`)
@@ -150,6 +156,7 @@ export class Agent {
 			},
 			onConfigUpdated: async merged => {
 				this.cfg = merged
+				if (this.assistServer) this.assistServer.cfg = merged
 				this.isNoise = globs(this.cfg.noise_entities)
 				this.anomaly.isNoise = this.isNoise
 				this.llmRouter.cfg = merged
@@ -223,6 +230,13 @@ export class Agent {
 	waitReady() { return new Promise(res => this.ha.once('ready', () => setImmediate(res))) }
 
 	enqueueExternal(item) { this.#enqueue(item) }
+
+	// 운영 모드(일시정지·시험 모드)를 지금 control 파일에서 다시 읽는다.
+	// CLI의 pause/send-off가 진행 중인 판단·Assist 요청·예전 버튼·하루 작업에도 바로 먹게 기기 호출·설정 쓰기·알림 직전에 부른다.
+	liveControl() {
+		if (!this.dry) this.control = loadControl()
+		return this.control
+	}
 
 	statusSummary() {
 		const c = this.todayCounters()
@@ -323,7 +337,7 @@ export class Agent {
 		}
 		log(`버튼 ${kind}: ${rec.title}${muted.length ? ` (규칙 쉼: ${muted.join(', ')})` : ''}`)
 		const descs = muted.map(id => this.engine.rules.find(r => r.id === id)?.description).filter(Boolean)
-		await this.notifier.send(feedbackPayload(rec, kind, descs, this.cfg.limits.mute_days))
+		await this.notifier.send(feedbackPayload(rec, kind, descs, this.cfg.limits.mute_days), { reply: true })
 	}
 
 	async #onReply(d) {
@@ -331,10 +345,9 @@ export class Agent {
 		const nid = d.action_data?.nid, tag = typeof d.tag === 'string' ? d.tag : null
 		const rec = this.journal.findNotification({ nid, tag })
 		if (!text || !(rec || tag?.startsWith(TAG_PREFIX))) return
-		if (!this.dry) this.control = loadControl()
-		if (this.control.paused) {
+		if (this.liveControl().paused) {
 			log(`일시정지 중이라 답장을 처리하지 않음: "${text}"`)
-			if (rec) await this.notifier.send(feedbackPayload(rec, 'PAUSED')).catch(() => {})
+			if (rec) await this.notifier.send(feedbackPayload(rec, 'PAUSED'), { reply: true }).catch(() => {})
 			return
 		}
 		const now = this.clock()
@@ -342,7 +355,7 @@ export class Agent {
 		this.journal.feedback(fbRec)
 		log(`답장: "${text}"${rec ? ` ← ${rec.title}` : ''}`)
 		this.#enqueue({ type: 'user', text, about: rec?.title ?? null, urgent: true, at: now })
-		if (rec) await this.notifier.send(feedbackPayload(rec, 'REPLY'))
+		if (rec) await this.notifier.send(feedbackPayload(rec, 'REPLY'), { reply: true })
 	}
 
 	// ── 규칙 발동과 깨움 대기열 ──
@@ -464,7 +477,8 @@ export class Agent {
 		await this.notifier.flushOutbox(now)
 		// 하루 한 번 자가개선 작업(실험 후속 조치·회귀 평가·기기 건강·루틴 자동화 제안). 판단(LLM)과 따로 돌고 기다리지 않는다.
 		const dailyHour = this.cfg.learning?.daily_hour ?? 19
-		if (!this.dry && this.ha.connected && k.h === dailyHour && this.runtime.last_daily_learning !== k.date && this.cfg.learning?.enabled !== false) {
+		// 일시정지 중에는 돌리지 않는다(설정·규칙을 바꾸고 알림·제안을 내는 작업이라). 같은 시간 안에 재개하면 그때 돈다.
+		if (!this.dry && this.ha.connected && !this.control.paused && k.h === dailyHour && this.runtime.last_daily_learning !== k.date && this.cfg.learning?.enabled !== false) {
 			this.runtime.last_daily_learning = k.date
 			this.saveRuntime()
 			this.runDailyLearning(now).catch(e => log('하루 자가개선 작업 실패:', e.message))
@@ -483,7 +497,7 @@ export class Agent {
 			if (c?.cmd === 'wake') this.#enqueue({ type: 'manual', reason: String(c.reason || '수동 점검').slice(0, 200), urgent: true })
 			else if (c?.cmd === 'say' && c.text) this.#enqueue({ type: 'user', text: String(c.text).slice(0, 500), about: null, urgent: true, at: this.clock() })
 			else if (c?.cmd === 'weekly') this.#enqueue({ type: 'weekly', urgent: true })
-			else if (c?.cmd === 'weekly-publish') { const r = readWeekly(); if (r) this.#publishWeekly(r.name, r.text) }
+			else if (c?.cmd === 'weekly-publish') { const r = readWeekly(); if (r) this.#publishWeekly(r.name, r.text, { explicit: true }) }
 			else if (c?.cmd === 'restore') try { this.#restore(String(c.file)) } catch (e) { log('되돌리기 실패:', e.message) }
 		}
 	}
@@ -587,10 +601,18 @@ export class Agent {
 		const deep = weekly || reasons.some(r => r.type === 'bootstrap' || r.type === 'reflection')
 		const forceMeta = weekly || reasons.some(r => r.type === 'manual' || r.type === 'user')
 		const entry = { ts: iso(started), reasons: reasons.map(r => r.type + (r.rule_id ? `:${r.rule_id}` : '')), dry: this.dry }
+		// Assist 요청을 CLI 판단 방식(codex/agy)으로 처리하는 판단: Assist 요청 한도를 쓰고, 기록도 Assist 요청으로 남긴다.
+		const assistReq = reasons.some(r => r.assist)
+		if (assistReq) entry.reasons.unshift('assist')
 		const rounds = []
 		let input = null, mode = null, primary = null
 		// 판단 중 도구(ha_control_device·ha_propose_admin)로 한 일. JSON 답의 actions와 같은 한도(per_cycle)를 쓰고 판단 기록에 남긴다.
 		const toolLog = { calls: 0, actions: [], proposals: [], rejected: [] }
+		// 도구 호출과 JSON 답의 actions가 같은 한도(per_cycle)를 함께 쓴다. Assist도 같은 실행기·같은 방식의 한도를 쓴다.
+		const budget = assistReq
+			? this.actionExecutor.controlBudget(assistActionLimit(this.cfg), '한 번의 요청')
+			: this.actionExecutor.controlBudget(this.cfg.actions.per_cycle, '한 번의 판단')
+		toolLog.budget = budget
 		try {
 			const ctx = await this.#gather(started, { forceMeta })
 			const sysDelta = this.#computeSysDelta(ctx)
@@ -664,20 +686,14 @@ export class Agent {
 				let infoFiles = [], res, repairFeedback = null, repairedProposals = false, repairedWeeklyDrafts = false
 				entry.codex_ms = 0
 				this.runAbort = new AbortController()
-				const perCycle = this.cfg.actions.per_cycle
 				const toolContext = {
 					allowDirectRequest: reasons.some(r => r.type === 'user'),
 					adminEnabled: Boolean(this.cfg.policy?.admin_enabled),
 					source: reasons.map(r => r.type).join('+'),
 					executeControl: async (req, opts) => {
 						const label = `${req.entity_id} ${req.action}`
-						if (toolLog.calls >= perCycle) {
-							const error = `행동은 한 번의 판단에 ${perCycle}개까지`
-							toolLog.rejected.push({ action: label, error, via: 'tool' })
-							return { ok: false, status: 'rejected', error }
-						}
-						toolLog.calls++
-						const r = await this.actionExecutor.executeControlItem(req, opts)
+						const r = await budget.run(req, opts)
+						toolLog.calls = budget.used
 						if (r.ok) toolLog.actions.push(`${r.status}: ${label} (도구)`)
 						else toolLog.rejected.push({ action: label, error: r.error, via: 'tool' })
 						return r
@@ -744,8 +760,22 @@ export class Agent {
 				this.failures = 0
 				this.lastFailedMode = null
 				if (mode !== primary && !this.failover) await this.#startFailover(primary, mode, started, failedBefore)
-				entry.applied = await this.#apply(res, reasons, toolLog)
-				this.#commitSysDelta(ctx)
+				// 판단(LLM)을 기다리는 사이 일시정지됐으면 결과를 하나도 적용하지 않는다(규칙·기억·예약·제안·알림·보고서).
+				// 깨운 이유는 대기열에 되돌려 재개한 뒤 다시 판단한다. 보류 알림·시스템 변화 기록도 그대로 둔다.
+				if (!this.dry && this.liveControl().paused) {
+					entry.deferred = true
+					entry.paused = true
+					entry.summary = `판단 도중 일시정지되어 결과를 적용하지 않음(재개 뒤 다시 판단). 버린 판단: ${String(res.summary ?? '').slice(0, 150)}`
+					if (toolLog.actions.length || toolLog.proposals.length) entry.tool_done = { actions: toolLog.actions, proposals: toolLog.proposals }
+					// 사용자 지시(답장·say·Assist 요청)는 되돌려 넣지 않는다. 재개한 뒤 몇 시간 지나 옛 명령이 실행되면 안 된다.
+					const again = reasons.filter(r => r.type !== 'user')
+					this.queue.push(...again.map(r => ({ ...r })))
+					this.#saveQueue()
+					log('판단 도중 일시정지되어 결과를 버림:', reasons.map(r => r.type).join(', '), again.length < reasons.length ? '(사용자 지시는 다시 넣지 않음)' : '')
+				} else {
+					entry.applied = await this.#apply(res, reasons, toolLog)
+					this.#commitSysDelta(ctx)
+				}
 			}
 		} catch (e) {
 			entry.error = e.message
@@ -758,6 +788,11 @@ export class Agent {
 			if (!this.dry) await this.#onFailure(reasons, e, mode)
 		}
 		entry.total_ms = this.clock() - started
+		if (assistReq) {
+			const sts = [...(entry.applied?.actions ?? []).map(x => String(x).split(':')[0]), ...(entry.applied?.rejected ?? []).filter(x => x.action).map(() => 'rejected')]
+			const outcome = entry.error ? 'error' : entry.paused ? 'paused' : assistOutcome({ actions: sts.map(status => ({ status })) })
+			entry.applied = { ...(entry.applied ?? {}), outcome, fell_back: Boolean(entry.failover) }
+		}
 		if (!entry.skipped && !entry.deferred) this.lastRun = entry
 		if (!this.dry) {
 			this.journal.decision(entry)
@@ -782,15 +817,17 @@ export class Agent {
 		return this.journal.notifications({ sinceMs: this.clock() - hours * 3600000, limit })
 	}
 
-	async handleProposalAction(pid, decision) {
+	// explicit: CLI·웹 콘솔에서 사람이 직접 누른 것. 일시정지·시험 모드에서도 이때의 롤백만 허용한다(비상 탈출구).
+	// 알림 버튼·Assist 도구·자동 작업에서 온 승인·롤백은 운영 모드를 따른다.
+	async handleProposalAction(pid, decision, { explicit = false } = {}) {
 		const now = this.clock()
 		let res
 		if (decision === 'approve') res = await this.haAdmin.approveProposal(pid, now)
 		else if (decision === 'reject') res = this.haAdmin.rejectProposal(pid, now)
-		else if (decision === 'rollback') res = await this.haAdmin.rollbackProposal(pid, now)
+		else if (decision === 'rollback') res = await this.haAdmin.rollbackProposal(pid, now, { explicit })
 		else return { ok: false, error: `알 수 없는 결정: ${decision}` }
 
-		if (res.proposal && this.ha.connected && this.control.send) {
+		if (res.proposal && this.ha.connected && this.liveControl().send) {
 			await this.notifier.send(proposalResultPayload(res.proposal, {
 				rollback: this.haAdmin.canRollback(res.proposal),
 			})).catch(() => {})
@@ -800,17 +837,21 @@ export class Agent {
 
 	async createAndNotifyProposal(req) {
 		if (!this.cfg.policy?.admin_enabled) return { ok: false, error: 'HA 관리 권한(policy.admin_enabled)이 꺼져 있음' }
+		// 일시정지 중에는 진행 중이던 판단의 도구 호출로도 새 제안을 만들지 않는다.
+		if (this.liveControl().paused) return { ok: false, error: '일시정지 중이라 제안을 만들지 않았어요' }
 		const r = await this.haAdmin.createProposal(req, this.clock())
 		if (!r.ok) return r
-		if (this.control.send && this.ha.connected) {
+		if (this.liveControl().send && this.ha.connected) {
 			await this.notifier.send(proposalApprovalPayload(r.proposal)).catch(e => log('제안 승인 알림 실패:', e.message))
 		}
 		return r
 	}
 
+	// 지운 규칙 정의를 돌려준다(제안에 보관해 롤백 때 되살린다). 없으면 null.
 	async #removePromotedRule(ruleId) {
+		const removed = this.engine.rules.find(r => r.id === ruleId) ?? null
 		const rules = this.engine.rules.filter(r => r.id !== ruleId)
-		if (rules.length === this.engine.rules.length) return
+		if (!removed) return null
 		const now = this.clock()
 		snapshot('rules', this.rulesDoc, now, this.cfg.limits.keep_snapshots)
 		this.engine.setRules(rules, this.states, now, [])
@@ -818,6 +859,23 @@ export class Agent {
 		writeJson(P.rules, this.rulesDoc)
 		this.saveRuntime()
 		log(`승격된 감시 규칙 삭제 완료: ${ruleId}`)
+		return structuredClone(removed)
+	}
+
+	async #restorePromotedRule(rule) {
+		if (!rule?.id) throw new Error('되살릴 감시 규칙 정의가 없음')
+		if (this.engine.rules.some(r => r.id === rule.id)) return true
+		const v = validateRule(rule, this.states)
+		if (!v.ok) throw new Error(`감시 규칙을 되살리지 못함(${rule.id}): ${v.error}`)
+		const now = this.clock()
+		const rules = [...this.engine.rules, v.rule]
+		snapshot('rules', this.rulesDoc, now, this.cfg.limits.keep_snapshots)
+		this.engine.setRules(rules, this.states, now, [v.rule.id])
+		this.rulesDoc = { updated: iso(now), rules }
+		writeJson(P.rules, this.rulesDoc)
+		this.saveRuntime()
+		log(`승격을 되돌려 감시 규칙을 되살림: ${rule.id}`)
+		return this.engine.rules.some(r => r.id === rule.id)
 	}
 
 	#failoverTarget(primary) {
@@ -951,11 +1009,13 @@ export class Agent {
 			const [areas, devices, entities] = await Promise.all(['area', 'device', 'entity'].map(k => this.ha.call({ type: `config/${k}_registry/list` })))
 			const areaName = new Map(areas.map(a => [a.area_id, a.name]))
 			const deviceArea = new Map(devices.map(d => [d.id, d.area_id]))
-			const areaOf = new Map(), catOf = new Map()
+			const areaOf = new Map(), catOf = new Map(), platformOf = new Map()
 			for (const e of entities) {
 				const name = areaName.get(e.area_id ?? deviceArea.get(e.device_id))
 				if (name) areaOf.set(e.entity_id, name)
 				if (e.entity_category) catOf.set(e.entity_id, e.entity_category)
+				// 통합 이름(zha·matter·tplink…): 조작자 기록 없는 변화를 물리 조작으로 볼 수 있는지 가린다(생활 루틴 근거)
+				if (e.platform) platformOf.set(e.entity_id, e.platform)
 			}
 			const autoCfg = {}
 			const autoIds = [...this.states.keys()].filter(id => id.startsWith('automation.'))
@@ -967,6 +1027,7 @@ export class Agent {
 			this.meta.at = now
 			this.meta.areaOf = areaOf
 			this.meta.catOf = catOf
+			this.meta.platformOf = platformOf
 			const prevAutoCfg = this.meta.autoCfg
 			this.meta.autoCfg = autoCfg
 			if (!this.dry) try { this.#detectAutomationEdits(prevAutoCfg, autoCfg, now) } catch (e) { log('자동화 변경 감지 실패:', e.message) }
@@ -976,15 +1037,22 @@ export class Agent {
 
 	// 제어할 수 있는 스크립트가 받는 필드(fields)를 HA에서 받아 둔다(6시간 캐시).
 	// 받지 못한 스크립트는 Map에 넣지 않는다 → 정책 엔진이 그 스크립트 실행을 막는다(필드 없이 불러 반대로 동작하는 일 방지).
-	async loadScriptFields(ids, { now = this.clock(), force = false } = {}) {
+	// maxAgeMs: 이보다 오래된 설정은 다시 읽는다. 실행 직전에는 짧게 잡아 그사이 스크립트가 바뀌었는지 본다.
+	async loadScriptFields(ids, { now = this.clock(), force = false, maxAgeMs = 6 * 3600000 } = {}) {
 		const cache = this.meta.scriptFields ??= new Map()
 		const want = [...new Set(ids)].filter(id => typeof id === 'string' && id.startsWith('script.')
-			&& (force || !cache.has(id) || now - cache.get(id).at >= 6 * 3600000))
+			&& (force || !cache.has(id) || now - cache.get(id).at >= maxAgeMs))
 		await Promise.all(want.map(async id => {
 			try {
 				const cfg = (await this.ha.call({ type: 'script/config', entity_id: id }))?.config
-				if (cfg && typeof cfg === 'object') cache.set(id, { fields: cfg.fields && typeof cfg.fields === 'object' ? cfg.fields : {}, at: now })
-			} catch (e) { log(`스크립트 설정을 가져오지 못함(${id}):`, e.message) }
+				// 받는 필드와 함께 스크립트가 최종적으로 움직이는 기기도 분석해 둔다(정책의 스크립트 범위 검사).
+				if (cfg && typeof cfg === 'object') cache.set(id, { fields: cfg.fields && typeof cfg.fields === 'object' ? cfg.fields : {}, scope: analyzeScriptScope(cfg, { autoCfg: this.meta.autoCfg ?? {} }), at: now })
+			} catch (e) {
+				// 다시 읽지 못했으면 예전 분석을 믿지 않는다(그사이 스크립트가 바뀌었을 수 있음). 정책 검사에서 승인을 받게 한다.
+				const old = cache.get(id)
+				if (old) cache.set(id, { ...old, stale: true, stale_error: String(e.message).slice(0, 120) })
+				log(`스크립트 설정을 가져오지 못함(${id}):`, e.message)
+			}
 		}))
 		return cache
 	}
@@ -1213,7 +1281,7 @@ export class Agent {
 			}
 		}
 		const notes = [...res.notifications]
-		out.actions = [...(toolLog?.actions ?? []), ...await this.actionExecutor.applyActions(res.actions, out, reasons, { used: toolLog?.calls ?? 0 })]
+		out.actions = [...(toolLog?.actions ?? []), ...await this.actionExecutor.applyActions(res.actions, out, reasons, toolLog?.budget ? { budget: toolLog.budget } : { used: toolLog?.calls ?? 0 })]
 		const rejectedProposals = []
 		for (const p of res.proposals ?? []) {
 			const pr = await this.createAndNotifyProposal(p)
@@ -1240,8 +1308,14 @@ export class Agent {
 		return out
 	}
 
-	async #publishWeekly(name, text) {
+	// explicit: CLI의 weekly publish처럼 사람이 직접 시킨 게시. 판단이 끝나고 자동으로 올리는 것은 운영 모드를 따른다.
+	async #publishWeekly(name, text, { explicit = false } = {}) {
 		if (this.dry || !this.cfg.weekly.publish) return false
+		const c = this.liveControl()
+		if (!explicit && (c.paused || !c.send)) {
+			log(`${c.paused ? '일시정지' : '시험 모드'}라 주간 보고서를 HA에 올리지 않음(파일로만 남김): ${name}`)
+			return false
+		}
 		const [domain, service] = PUBLISH_SERVICE.split('.')
 		try {
 			await this.ha.callService(domain, service, { data: { title: `📊 집 비서 주간 분석 ${String(name).replace('.md', '')}`, message: text, notification_id: 'haagent_weekly' } })
@@ -1441,6 +1515,10 @@ export class Agent {
 	// 하루 한 번: 실험 평가·후속 조치 → 빠른 경로 회귀 평가 → 기기 건강 → 루틴 자동화 제안
 	async runDailyLearning(now = this.clock()) {
 		if (this.dry || !this.store || this.dailyRunning) return null
+		if (this.liveControl().paused) {
+			log('일시정지 중이라 하루 자가개선 작업을 건너뜀')
+			return { skipped: 'paused' }
+		}
 		this.dailyRunning = true
 		const out = {}
 		try {

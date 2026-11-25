@@ -317,6 +317,8 @@ export class Store {
 		this.#addColumn('events', 'actor', 'TEXT')
 		// 실험 판정 뒤 후속 조치(규칙 원복·롤백 알림·교훈 비활성화)를 했는지
 		this.#addColumn('experiments', 'actioned_at', 'INTEGER')
+		// 제안 적용 직후 값(롤백 충돌 판단·항목 단위 되돌리기)
+		this.#addColumn('proposals', 'post_snapshot', 'TEXT')
 		this.#addColumn('sensor_samples', 'context', 'TEXT')
 		this.#addColumn('memory_items', 'priority', 'INTEGER DEFAULT 3')
 		this.#addColumn('memory_items', 'pinned', 'INTEGER DEFAULT 0')
@@ -581,19 +583,21 @@ export class Store {
 
 	upsertProposal(p) {
 		this.db.prepare(`
-			INSERT INTO proposals (pid, ts, kind, title, summary, target_id, payload, diff_text, pre_snapshot, validation, status, decided_at, applied_at, rollback_at, error, expires)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			INSERT INTO proposals (pid, ts, kind, title, summary, target_id, payload, diff_text, pre_snapshot, validation, status, decided_at, applied_at, rollback_at, error, expires, post_snapshot)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT(pid) DO UPDATE SET
 				status = excluded.status, decided_at = COALESCE(excluded.decided_at, proposals.decided_at),
 				payload = COALESCE(excluded.payload, proposals.payload),
 				applied_at = COALESCE(excluded.applied_at, proposals.applied_at),
 				rollback_at = COALESCE(excluded.rollback_at, proposals.rollback_at),
 				error = excluded.error, pre_snapshot = COALESCE(excluded.pre_snapshot, proposals.pre_snapshot),
-				validation = COALESCE(excluded.validation, proposals.validation)
+				validation = COALESCE(excluded.validation, proposals.validation),
+				post_snapshot = COALESCE(excluded.post_snapshot, proposals.post_snapshot)
 		`).run(
 			p.pid, p.ts, p.kind, p.title, p.summary, p.target_id ?? null,
 			jsonOrNull(p.payload), p.diff_text ?? null, jsonOrNull(p.pre_snapshot), jsonOrNull(p.validation),
 			p.status, p.decided_at ?? null, p.applied_at ?? null, p.rollback_at ?? null, p.error ?? null, p.expires ?? null,
+			jsonOrNull(p.post_snapshot),
 		)
 	}
 
@@ -643,6 +647,7 @@ export class Store {
 			payload: parseJson(r.payload, null),
 			pre_snapshot: parseJson(r.pre_snapshot, null),
 			validation: parseJson(r.validation, null),
+			post_snapshot: parseJson(r.post_snapshot, null),
 		}
 	}
 

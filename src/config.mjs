@@ -157,6 +157,9 @@ export const DEFAULTS = {
 		admin_enabled: false,
 		proposal_expire_hours: 24,
 		away_override_exempt: ['light.hwanpunggi', 'switch.geosil_gonggiceongjeonggi_power'],
+		// 스크립트별로 허용하는 최종 기기·동작. 예: { "script.ha_turn_off_and_check": { "entities": ["switch.a", "light.b"], "services": ["homeassistant.turn_off"] } }
+		// 움직일 기기가 실행할 때 정해지는 스크립트(템플릿 대상·다른 자동화 호출)는 여기 적지 않으면 Tier 1이어도·직접 요청이어도 승인을 거친다.
+		script_targets: {},
 	},
 	// HA Assist 주력 대화 서버 및 Tailscale 관리 콘솔
 	assist: {
@@ -168,6 +171,8 @@ export const DEFAULTS = {
 		timeout_seconds: 90,
 		model: null,
 		effort: null,
+		// 한 번의 요청에서 움직일 수 있는 기기 수. null이면 actions.per_cycle(정기 판단과 같은 한도)
+		max_actions_per_turn: null,
 		voice: {
 			provider: 'gemini',
 			stt_model: 'gemini-3.5-transcribe',
@@ -280,6 +285,21 @@ export function validateConfig(cfg) {
 		|| (cfg?.api?.effort_weekly == null && cfg?.api?.effort_deep == null && cfg?.codex?.effort_weekly === 'max')) {
 		warnings.push('api.effort/effort_deep이 비어 있어 codex의 "max"를 상속합니다 (API 비용 증가·호환성 주의)')
 	}
+	const st = cfg?.policy?.script_targets
+	if (st != null) {
+		if (typeof st !== 'object' || Array.isArray(st)) errors.push('policy.script_targets는 { "script.x": { entities: [...], services: [...] } } 객체여야 함')
+		else {
+			for (const [id, t] of Object.entries(st)) {
+				if (!/^script\.[a-z0-9_]+$/.test(id)) errors.push(`policy.script_targets의 키는 script 엔티티여야 함: ${id}`)
+				else if (!t || typeof t !== 'object' || !Array.isArray(t.entities) || !t.entities.every(e => typeof e === 'string' && /^[a-z_]+\.[a-z0-9_]+$/.test(e))) errors.push(`policy.script_targets.${id}.entities는 entity_id 목록이어야 함`)
+				else if (t.services != null && !(Array.isArray(t.services) && t.services.every(x => typeof x === 'string' && /^[a-z_]+\.([a-z0-9_]+|[a-z0-9_]*\*)$/.test(x)))) errors.push(`policy.script_targets.${id}.services는 서비스 이름 목록이어야 함(끝에 *로 범위 가능: switch.turn_*)`)
+			}
+		}
+	}
+	const pp = cfg?.learning?.suggest?.physical_platforms
+	if (pp != null && !(Array.isArray(pp) && pp.every(x => typeof x === 'string' && /^[a-z0-9_]+$/.test(x)))) errors.push('learning.suggest.physical_platforms는 통합 이름 목록이어야 함(예: ["zha", "matter"])')
+	const mt = cfg?.assist?.max_actions_per_turn
+	if (mt != null && !(Number.isInteger(mt) && mt >= 1 && mt <= 10)) errors.push(`assist.max_actions_per_turn은 null 또는 1~10 정수 (${mt})`)
 	const hasActionsList = Boolean((cfg?.actions?.auto?.length ?? 0) || (cfg?.actions?.confirm?.length ?? 0))
 	const hasPolicyList = Boolean((cfg?.policy?.tier1_auto?.length ?? 0) || (cfg?.policy?.tier2_confirm?.length ?? 0))
 	if (hasActionsList && hasPolicyList) {

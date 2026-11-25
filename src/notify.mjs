@@ -108,7 +108,7 @@ export function approvalPayload(a, minutes) {
 	const v = verbFor(a.action)
 	return {
 		title: `🤖 ${a.name} ${v[0]}?`.slice(0, 60),
-		message: `${a.reason} (${minutes}분 안에 눌러 주세요)`,
+		message: `${a.reason}${a.approval_reason ? ` · ${a.approval_reason}` : ''} (${minutes}분 안에 눌러 주세요)`,
 		data: {
 			tag: actionTag(a.aid), group: 'ha-agent', notification_icon: ICON, ...CHANNELS.normal,
 			actions: [{ action: `HAAGENT_DO_${a.aid}`, title: '실행' }, { action: `HAAGENT_NO_${a.aid}`, title: '아니요' }],
@@ -117,11 +117,14 @@ export function approvalPayload(a, minutes) {
 }
 
 // 행동 결과. 스스로 한 행동에는 [되돌리기]가 붙고, 승인 알림은 같은 tag라 결과 문구로 바뀐다.
-export function actionResultPayload(a, { undo = false } = {}) {
+// undoAid: [되돌리기]가 가리킬 행동(되돌리기가 확인되지 않아 원래 행동을 다시 되돌리게 할 때)
+export function actionResultPayload(a, { undo = false, undoAid = null } = {}) {
 	const v = verbFor(a.action)
 	const text = {
 		done: [`🤖 ${a.name} ${v[1]}`, a.reason],
-		unverified: [`🤖 ${a.name} ${v[2]} 확인 안 됨`, `${a.reason} 명령은 보냈지만 상태가 바뀐 것을 확인하지 못했어요.`],
+		unverified: a.undo_of
+			? [`🤖 ${a.name}: 되돌리기 확인 안 됨`, '되돌리기 명령은 보냈지만 이전 상태로 돌아간 것을 확인하지 못했어요. 기기를 확인해 주세요.']
+			: [`🤖 ${a.name} ${v[2]} 확인 안 됨`, `${a.reason} 명령은 보냈지만 상태가 바뀐 것을 확인하지 못했어요.`],
 		error: [`🤖 ${a.name} ${v[2]} 실패`, `${a.reason} (오류: ${a.error ?? '알 수 없음'})`],
 		declined: [`🤖 ${a.name}: 하지 않을게요`, '알겠어요. 이런 제안은 줄일게요.'],
 		expired: [`🤖 ${a.name}: 시간이 지나 취소했어요`, a.reason],
@@ -132,7 +135,7 @@ export function actionResultPayload(a, { undo = false } = {}) {
 		message: text[1],
 		data: {
 			tag: actionTag(a.undo_of ?? a.aid), group: 'ha-agent', notification_icon: ICON, ...CHANNELS.quiet, alert_once: true,
-			...(undo ? { actions: [{ action: `HAAGENT_UNDO_${a.aid}`, title: '되돌리기' }] } : {}),
+			...(undo ? { actions: [{ action: `HAAGENT_UNDO_${undoAid ?? a.aid}`, title: undoAid ? '다시 되돌리기' : '되돌리기' }] } : {}),
 		},
 	}
 }

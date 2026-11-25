@@ -10,6 +10,8 @@ export const SCORE_METRICS = [
 	['alert_useful_pct', '알림 뒤 조치 비율(%)', 'up'],
 	['proposal_accept_pct', '제안 수락률(%)', 'up'],
 	['assist_success_pct', 'Assist 성공률(%)', 'up'],
+	['assist_retry_pct', 'Assist 재요청·정정 비율(%)', 'down'],
+	['assist_fallback_pct', 'Assist 모델 전환 비율(%)', 'down'],
 	['noop_pct', '빈 판단 비율(%)', 'down'],
 	['avg_tokens', '판단당 토큰', 'down'],
 	['errors', '판단 오류', 'down'],
@@ -23,11 +25,24 @@ function weekStats(store, start, end) {
 	const okCycles = cycles.filter(d => !d.error)
 	const noop = okCycles.filter(d => !(d.applied?.notifications?.length || d.applied?.actions?.length || d.applied?.added?.length || d.applied?.changed?.length || d.applied?.deleted?.length || d.applied?.proposals?.length || d.applied?.report)).length
 	const tokenRuns = cycles.filter(d => Number.isFinite(d.tokens))
-	const assistTurns = decs.filter(d => (d.reasons ?? []).includes('assist')).length
+	const assistDecs = decs.filter(d => (d.reasons ?? []).includes('assist'))
+	const assistTurns = assistDecs.length
 
 	const impl = store.recentImplicitFeedback({ sinceMs: start, limit: 5000 }).filter(i => i.ts < end)
 	const count = kind => impl.filter(i => i.kind === kind).length
 	const assistNeg = impl.filter(i => String(i.kind).startsWith('assist_') && i.score < 0).length
+
+	// Assist는 요청마다 최종 결과(applied.outcome)가 하나씩 남는다. 그 기록이 있는 요청만 센다(예전 기록은 실패 요청이 빠져 있어 섞지 않는다).
+	// 사용자의 재요청·정정은 바로 앞 요청이 실패했다는 신호다. 한 번의 말에서 함께 잡힌 신호(같은 시각)는 하나로, 앞 요청 하나에만 매긴다.
+	// 일시정지 중 받은 요청은 운영자가 멈춘 것이라 분모에서 뺀다. 오늘 판단 한도로 거절한 요청·일부만 실행한 요청은 실패로 센다.
+	const reqs = assistDecs.filter(d => d.applied?.outcome && d.applied.outcome !== 'paused').map(d => ({ d, t: Date.parse(d.ts) })).sort((a, b) => a.t - b.t)
+	const userRejected = new Set()
+	for (const t of new Set(impl.filter(i => (i.kind === 'assist_retry' || i.kind === 'assist_correction') && i.score < 0).map(i => i.ts))) {
+		const prev = reqs.filter(x => x.t < t).at(-1)
+		if (prev) userRejected.add(prev)
+	}
+	const FAILED = new Set(['error', 'control_failed', 'partial', 'limit'])
+	const failed = reqs.filter(x => FAILED.has(x.d.applied.outcome) || userRejected.has(x))
 
 	const notes = store.notificationsInRange(start, end)
 	const alerts = notes.filter(n => n.kind === 'alert' && ['sent', 'queued'].includes(n.status)).length
@@ -47,8 +62,13 @@ function weekStats(store, start, end) {
 		noop_pct: pct(noop, okCycles.length),
 		avg_tokens: tokenRuns.length ? Math.round(tokenRuns.reduce((a, d) => a + d.tokens, 0) / tokenRuns.length) : null,
 		assist_turns: assistTurns,
+		assist_requests: reqs.length,
+		assist_legacy_turns: assistTurns - reqs.length,
 		assist_negative: assistNeg,
-		assist_success_pct: assistTurns ? Math.max(0, pct(assistTurns - assistNeg, assistTurns)) : null,
+		assist_errors: reqs.filter(x => x.d.applied.outcome === 'error').length,
+		assist_success_pct: reqs.length ? pct(reqs.length - failed.length, reqs.length) : null,
+		assist_retry_pct: reqs.length ? pct(userRejected.size, reqs.length) : null,
+		assist_fallback_pct: reqs.length ? pct(reqs.filter(x => x.d.applied.fell_back).length, reqs.length) : null,
 		alerts,
 		alerts_acted: count('notification_acted'),
 		alert_feedback_negative: fb.filter(f => f.kind === 'mute' || f.kind === 'less').length,
@@ -97,6 +117,7 @@ export function renderScorecard(sc) {
 	]
 	const w = sc.weeks[0] ?? {}
 	lines.push('', `최근 7일: 판단 ${w.cycles ?? 0}회, Assist ${w.assist_turns ?? 0}턴, 알림 ${w.alerts ?? 0}건(뒤이은 조치 ${w.alerts_acted ?? 0}건, 🔕/🔽 ${w.alert_feedback_negative ?? 0}건), 제안 ${w.proposals_created ?? 0}건(수락 ${w.proposals_accepted ?? 0}·거절 ${w.proposals_rejected ?? 0}·무시 ${w.proposals_ignored ?? 0}), 사용자의 자동화 직접 수정 ${w.user_automation_edits ?? 0}건.`)
+	if (sc.weeks.some(x => x?.assist_legacy_turns > 0)) lines.push('Assist 지표는 요청마다 최종 결과를 남기기 시작한 뒤의 기록만 셉니다(그 전 기록은 실패한 요청이 빠져 있어 비교하지 않음).')
 	if (sc.regression) lines.push(`Assist 빠른 경로 회귀 평가: ${sc.regression.passed}/${sc.regression.total} 통과${sc.regression.failed?.length ? ` (실패: ${sc.regression.failed.slice(0, 3).map(f => `"${f.text}"`).join(', ')})` : ''}.`)
 	return lines.join('\n')
 }
