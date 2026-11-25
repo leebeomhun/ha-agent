@@ -2,9 +2,20 @@
 // Assist 응답 지연 없이 부재 일정·선호·영구 지시·사실 정정을 탐지해 구조화 장기 기억(memory_items)에 즉시 반영한다.
 import { DAY, kst, log } from '../util.mjs'
 
+// 아래 세 패턴은 "LLM 추출기를 깨울지"만 정한다(넓게 잡아도 LLM이 걸러 낸다).
 const ABSENCE_RE = /(원주집|출장|여행|외박|다녀올|다녀올게|다녀올께|집\s*비울|비워|휴가|본가|시골|갔다\s*올|갔다가|며칠\s*있다가|돌아올|복귀)/
 const ORDER_PREF_RE = /(앞으로|항상|절대|하지\s*마|끄지\s*마|켜지\s*마|꺼주지\s*마|켜주지\s*마|알리지\s*마|알려주지\s*마|기억해|잊지\s*마|원해|선호|로\s*해\s*둬|로\s*유지|로\s*두길|보내지\s*마)/
 const CORRECTION_RE = /(아니야|그게\s*아니라|맞는데|바뀌었어|바꿨어|사실은|원래\s*)/
+
+// LLM 없이 바로 저장하는 결정론적 폴백은 좁게 잡는다. 잘못 저장하면 며칠~무기한 프롬프트에 남기 때문이다.
+// 부재: 어디로 가는지(장소·일정 낱말)와 떠나거나 돌아오는 말이 함께 있고, 질문·요청이 아니어야 한다.
+const TRIP_RE = /(원주집|본가|시골|출장|여행|외박|휴가|집\s*(?:을\s*)?비(?:울|워|우))/
+const MOVE_RE = /(다녀\s*올|다녀\s*오|갔다\s*(?:올|와|가)|갔다가|가서|갈게|갈께|가요|가려고|떠나|올게|올께|와요|돌아올|돌아와|복귀|비울게|비울께|비워요|비울\s*거|비워\s*둘)/
+const QUESTION_RE = /([?？]\s*$|알려\s*줘|알려\s*줄래|뭐야|뭐지|몇\s*(?:시|도|개|번)|어때)/
+// 지시·선호: 지속 표시(앞으로·항상…)와 금지·유지 지시가 함께 있어야 한다. "앞으로 상태 알려줘" 같은 요청은 저장하지 않는다.
+const PERSIST_RE = /(앞으로|항상|절대|매번|기억해|잊지\s*마)/
+const PROHIBIT_RE = /([가-힣]지\s*마(?:세요|라|요)?(?=$|[\s.,!~])|말아\s*줘|하지\s*말)/
+const KEEP_RE = /(기억해\s*(?:줘|둬)|로\s*유지해|로\s*해\s*둬|로\s*두길|로\s*둬)/
 
 const WEEKDAYS = { 일: 0, 월: 1, 화: 2, 수: 3, 목: 4, 금: 5, 토: 6 }
 const KST_WD_IDX = { 일: 0, 월: 1, 화: 2, 수: 3, 목: 4, 금: 5, 토: 6 }
@@ -69,14 +80,15 @@ export function estimateKoreanExpiryMs(text, now = Date.now()) {
 	return null
 }
 
-// LLM 호출이 불가능하거나 비활성화되었을 때의 안전한 결정론적 폴백 추출
+// LLM 호출이 불가능하거나 비활성화되었을 때의 안전한 결정론적 폴백 추출.
+// 확실한 말만 저장하고, 고정(pinned)은 붙이지 않는다(잘못 저장돼도 대화·콘솔에서 지울 수 있게).
 export function deterministicExtract(userText, now = Date.now()) {
 	const t = String(userText ?? '').trim()
-	if (!t) return []
+	if (!t || QUESTION_RE.test(t)) return []
 	const k = kst(new Date(now))
 	const dayTag = k.date.replace(/-/g, '')
 
-	if (ABSENCE_RE.test(t)) {
+	if (TRIP_RE.test(t) && MOVE_RE.test(t)) {
 		const expMs = estimateKoreanExpiryMs(t, now) ?? (now + 7 * DAY)
 		const ttlDays = Math.max(1, Math.ceil((expMs - now) / DAY))
 		return [{
@@ -91,17 +103,17 @@ export function deterministicExtract(userText, now = Date.now()) {
 		}]
 	}
 
-	if (/(앞으로|항상|절대|기억해|잊지\s*마)/.test(t) && ORDER_PREF_RE.test(t)) {
+	const isOrder = PROHIBIT_RE.test(t)
+	if (t.length >= 8 && PERSIST_RE.test(t) && (isOrder || KEEP_RE.test(t))) {
 		const slug = t.replace(/[^a-zA-Z0-9가-힣]+/g, '_').replace(/^_|_$/g, '').slice(0, 24)
-		const isOrder = /(앞으로|항상|절대|하지\s*마|끄지\s*마|켜지\s*마|알리지\s*마|보내지\s*마)/.test(t)
 		return [{
 			op: 'upsert',
 			category: isOrder ? 'standing_order' : 'preference',
 			key: `${isOrder ? 'order' : 'pref'}_${dayTag}_${Math.abs(hashSimple(slug)).toString(36).slice(0, 6)}`,
 			content: `(${k.date}) 사용자 대화 지시·선호: "${t.slice(0, 220)}"`,
 			ttl_days: null,
-			pinned: isOrder,
-			confidence: 0.85,
+			pinned: false,
+			confidence: 0.6,
 			entity_ids: [],
 		}]
 	}
@@ -133,8 +145,9 @@ export async function extractMemoryFromTurn({
 				'위 대화에서 앞으로의 집 관리·브리핑·제어에 꼭 기억해야 할 사실(임시 부재·귀가 일정, 영구 지시 standing_order, 선호 preference, 사실 정정, 거절)만 추출하라.',
 				'- 단순 기기 제어 명령이나 잡담은 빈 배열 {"ops":[]}로 답한다.',
 				'- 임시 부재/일정(예: "원주집에 갔다가 월요일에 올게")은 category="incident"로 두고 복귀 다음 날까지 ttl_days를 계산해 넣는다.',
-				'- 영구 지시("앞으로 ~하지 마")는 category="standing_order", pinned=true, ttl_days=null로 둔다.',
-				'- 기존 키와 같은 주제면 그 키를 그대로 재사용(upsert)한다.',
+				'- 영구 지시("앞으로 ~하지 마")는 category="standing_order", ttl_days=null로 둔다. pinned는 null로 둔다(고정은 사용자가 콘솔에서 한다).',
+				'- "앞으로 ~ 알려줘"처럼 지금 한 번 답하면 되는 요청은 지시가 아니다.',
+				'- 기존 키와 같은 주제면 그 키를 그대로 재사용(upsert)한다. 사용자가 직접 등록했거나 고정한 기억은 바뀌지 않는다.',
 			].filter(Boolean).join('\n')
 
 			const res = await llmRouter.run({
@@ -150,8 +163,15 @@ export async function extractMemoryFromTurn({
 				toolBroker: null,
 				runDir: null,
 			})
-			const ops = Array.isArray(res?.result?.ops) ? res.result.ops : []
-			if (ops.length) return ops.slice(0, 5)
+			// LLM이 스키마대로 답했으면 빈 배열("기억할 것 없음")도 그 판단을 따른다. 결정론적 폴백은 LLM을 쓰지 못했을 때만 쓴다.
+			const ops = res?.result?.ops
+			if (Array.isArray(ops)) {
+				return ops
+					.filter(o => o && typeof o === 'object' && typeof o.key === 'string' && ['upsert', 'delete'].includes(o.op))
+					.map(o => ({ ...o, pinned: null }))
+					.slice(0, 5)
+			}
+			log('Post-Turn LLM 기억 추출 응답에 ops 배열이 없음(결정론적 폴백 사용)')
 		} catch (e) {
 			log('Post-Turn LLM 기억 추출 실패(결정론적 폴백 시도):', e.message)
 		}

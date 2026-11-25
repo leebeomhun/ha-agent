@@ -158,6 +158,7 @@ export class ImplicitFeedbackTracker {
 			applied: ['proposal_applied', 1],
 			rejected: ['proposal_rejected', -1],
 			rolled_back: ['proposal_rolled_back', -1],
+			rollback_failed: ['proposal_rollback_failed', -1],
 			validation_failed: ['proposal_validation_failed', -0.5],
 		}
 		const mapped = kindMap[status]
@@ -570,7 +571,63 @@ export function generateSelfProposals({ store, cfg = {}, rules = [], states = ne
 }
 
 // ── 7) 변경 실험 원장(Change Experiment Ledger) ──
-export function collectMetricsSnapshot(store, now = Date.now(), windowDays = 7) {
+// 실험 하나는 "무엇을 바꿨는지"에 맞는 신호만 비교한다(scope). 집 전체 신호로 판정하면 다른 변경·우연이 결과를 뒤집는다.
+//  rule_ids   → 그 규칙 알림에 대한 🔕(mute)/🔽(less) 부정, 👍(up) 긍정
+//  entity_ids → 그 엔티티의 부정 암묵적 피드백(되돌림·거절 등), 되돌리거나 거절한 행동
+//  channel    → 'assist'(Assist 대화 부정 신호) | 'cycle'(자율 제어 되돌림·판단 오류·🔕/🔽) | 'proposal'(제안 거절·롤백·검증 실패)
+// scope가 없으면 예전처럼 집 전체 지표를 쓰되, 아래 최소 표본·차이 기준은 똑같이 적용한다.
+export const EXPERIMENT_MIN_SIGNALS = 3
+const ENTITY_ID_RE = /^[a-z_]+\.[a-z0-9_]+$/
+const CYCLE_IMPLICIT_KINDS = new Set(['action_reverted', 'action_undone', 'action_declined'])
+
+export function lessonExperimentScope(lessonScope) {
+	if (lessonScope === 'assist') return { channel: 'assist' }
+	if (lessonScope === 'cycle') return { channel: 'cycle' }
+	if (lessonScope === 'weekly') return { channel: 'proposal' }
+	return null
+}
+
+// 적용된 관리·자가 튜닝 제안을 어떤 신호로 검증할지
+export function proposalExperimentScope(p) {
+	if (!p) return null
+	if (p.kind === 'self_lesson_proposal') return lessonExperimentScope(p.payload?.scope)
+	const ids = [...new Set([p.payload?.entity_id, p.target_id].filter(id => typeof id === 'string' && ENTITY_ID_RE.test(id)))]
+	const ents = ids.length ? { entity_ids: ids } : {}
+	if (p.kind === 'self_alias_proposal' || p.kind === 'self_stt_tune') return { channel: 'assist', ...ents }
+	if (p.kind === 'promote_rule' && p.payload?.rule_id) return { rule_ids: [p.payload.rule_id], ...ents }
+	return ids.length ? ents : null
+}
+
+function scopedSignals(store, since, now, scope) {
+	const ruleIds = new Set(scope.rule_ids ?? [])
+	const ents = new Set(scope.entity_ids ?? [])
+	const channel = scope.channel ?? null
+	const parts = {}
+	const add = (k, n) => { if (n) parts[k] = (parts[k] ?? 0) + n }
+	const impl = store.recentImplicitFeedback({ sinceMs: since, limit: 5000 }).filter(i => i.ts <= now && i.score < 0)
+	const fbs = store.feedbackInRange(since, now + 1)
+	let positive = 0
+	if (ruleIds.size) {
+		const mine = fbs.filter(f => (f.rules ?? []).some(r => ruleIds.has(r)))
+		add('rule_mute_less', mine.filter(f => f.kind === 'mute' || f.kind === 'less').length)
+		positive += mine.filter(f => f.kind === 'up').length
+	}
+	if (ents.size) {
+		add('entity_negative_implicit', impl.filter(i => ents.has(i.entity_id)).length)
+		add('entity_actions_declined', store.actionsInRange(since, now + 1).filter(a => ents.has(a.entity_id) && (a.status === 'undone' || a.status === 'declined')).length)
+	}
+	if (channel === 'assist') add('assist_negative', impl.filter(i => String(i.kind).startsWith('assist_')).length)
+	if (channel === 'cycle') {
+		add('cycle_reverted', impl.filter(i => CYCLE_IMPLICIT_KINDS.has(i.kind)).length)
+		add('cycle_errors', store.decisionsInRange(since, now + 1).filter(d => !d.skipped && !d.deferred && d.error && !(d.reasons ?? []).includes('assist')).length)
+		add('fb_mute_less', fbs.filter(f => f.kind === 'mute' || f.kind === 'less').length)
+	}
+	if (channel === 'proposal') add('proposal_negative', impl.filter(i => String(i.kind).startsWith('proposal_')).length)
+	const negative = Object.values(parts).reduce((a, b) => a + b, 0)
+	return { negative, positive, parts }
+}
+
+export function collectMetricsSnapshot(store, now = Date.now(), windowDays = 7, scope = null) {
 	if (!store) return null
 	const since = now - windowDays * DAY
 	const decs = store.decisionsInRange(since, now)
@@ -580,7 +637,7 @@ export function collectMetricsSnapshot(store, now = Date.now(), windowDays = 7) 
 	const acts = store.actionsInRange(since, now)
 	const impl = store.recentImplicitFeedback({ sinceMs: since, limit: 500 })
 	const fbs = store.feedbackInRange(since, now)
-	return {
+	const snap = {
 		at: new Date(now).toISOString(),
 		window_days: windowDays,
 		runs: real.length,
@@ -592,11 +649,50 @@ export function collectMetricsSnapshot(store, now = Date.now(), windowDays = 7) 
 		fb_mute: fbs.filter(f => f.kind === 'mute').length,
 		fb_less: fbs.filter(f => f.kind === 'less').length,
 	}
+	if (scope && (scope.rule_ids?.length || scope.entity_ids?.length || scope.channel)) {
+		snap.scope = scope
+		snap.scoped = scopedSignals(store, since, now, scope)
+	}
+	return snap
 }
 
-export function registerExperiment(store, { kind, ref_id = null, title, evalDays = 7, now = Date.now() }) {
+const globalNegative = m => (m?.negative_implicit ?? 0) + (m?.actions_undone ?? 0) + (m?.fb_mute ?? 0) + (m?.errors ?? 0)
+
+// 전후 지표로 판정한다. 신호가 적으면 우연과 구분할 수 없으니 'inconclusive'로 두고 아무것도 보정하지 않는다.
+export function judgeExperiment(before = {}, after = {}) {
+	const scoped = Boolean(before?.scoped && after?.scoped)
+	const negB = scoped ? before.scoped.negative : globalNegative(before)
+	const negA = scoped ? after.scoped.negative : globalNegative(after)
+	const posB = scoped ? (before.scoped.positive ?? 0) : 0
+	const posA = scoped ? (after.scoped.positive ?? 0) : 0
+	const signals = negB + negA + posB + posA
+	// 빈 호출 비율은 범위 없는(집 전체) 실험에서, 양쪽 판단이 10회 이상일 때만 본다.
+	const noopComparable = !scoped && (before?.runs ?? 0) >= 10 && (after?.runs ?? 0) >= 10
+	const noopDelta = Math.round(((after?.noop_pct ?? 0) - (before?.noop_pct ?? 0)) * 10) / 10
+	const margin = Math.max(2, Math.ceil(negB * 0.5))
+	let notes = `${scoped ? '대상 범위' : '집 전체'} 부정 신호 ${negB}→${negA}${scoped && (posB || posA) ? `, 긍정 ${posB}→${posA}` : ''}${noopComparable ? `, 빈 호출 ${before.noop_pct}%→${after.noop_pct}%` : ''}`
+	let verdict = 'neutral'
+	if (signals < EXPERIMENT_MIN_SIGNALS && !(noopComparable && noopDelta <= -10)) {
+		verdict = 'inconclusive'
+		notes += ` (신호 ${signals}건으로 판단하기에 부족: ${EXPERIMENT_MIN_SIGNALS}건 이상 필요)`
+	} else if (negA - negB >= margin) {
+		verdict = 'regressed'
+		notes += ' (악화 감지: 롤백 또는 재조정 검토 권장)'
+	} else if (negB - negA >= margin || (noopComparable && noopDelta <= -10)) {
+		verdict = 'improved'
+		notes += ' (개선 확인)'
+	}
+	return { verdict, notes, signals }
+}
+
+export function registerExperiment(store, { kind, ref_id = null, title, evalDays = 7, now = Date.now(), scope = undefined }) {
 	if (!store) return null
-	const baseline = collectMetricsSnapshot(store, now, 7)
+	// 범위를 넘기지 않으면 종류에서 짐작한다(규칙 → 그 규칙, 교훈 → 그 교훈이 쓰이는 경로).
+	const resolved = scope !== undefined ? scope
+		: kind === 'rule' && ref_id ? { rule_ids: [ref_id] }
+			: kind === 'lesson' && ref_id ? lessonExperimentScope(store.getLesson(ref_id)?.scope)
+				: null
+	const baseline = collectMetricsSnapshot(store, now, 7, resolved)
 	return store.upsertExperiment({
 		eid: `exp_${newId()}`,
 		ts: now,
@@ -613,22 +709,9 @@ export function evaluateExperiment(store, eid, now = Date.now()) {
 	if (!store) return null
 	const exp = store.getExperiment(eid)
 	if (!exp || exp.status !== 'active') return exp
-	const after = collectMetricsSnapshot(store, now, 7)
 	const before = exp.baseline_metrics ?? {}
-
-	const negBefore = (before.negative_implicit ?? 0) + (before.actions_undone ?? 0) + (before.fb_mute ?? 0) + (before.errors ?? 0)
-	const negAfter = (after.negative_implicit ?? 0) + (after.actions_undone ?? 0) + (after.fb_mute ?? 0) + (after.errors ?? 0)
-	const noopDelta = (after.noop_pct ?? 0) - (before.noop_pct ?? 0)
-
-	let verdict = 'neutral'
-	let notes = `부정 신호 ${negBefore}→${negAfter}, 빈 호출(noop) ${before.noop_pct ?? 0}%→${after.noop_pct ?? 0}%`
-	if (negAfter > negBefore + 1 || (after.errors ?? 0) > (before.errors ?? 0) + 1) {
-		verdict = 'regressed'
-		notes += ' (악화 감지: 롤백 또는 재조정 검토 권장)'
-	} else if (negAfter < negBefore || noopDelta <= -5) {
-		verdict = 'improved'
-		notes += ' (개선 확인)'
-	}
+	const after = collectMetricsSnapshot(store, now, 7, before.scope ?? null)
+	const { verdict, notes } = judgeExperiment(before, after)
 
 	const updated = store.upsertExperiment({
 		...exp,
@@ -639,12 +722,11 @@ export function evaluateExperiment(store, eid, now = Date.now()) {
 		status: verdict,
 	})
 
-	// 교훈 기반 실험이면 결과에 따라 교훈 신뢰도 자동 보정
-	if (exp.kind === 'lesson' && exp.ref_id) {
+	// 교훈 기반 실험이면 결과에 따라 교훈 신뢰도 자동 보정(판단 보류면 그대로 둔다)
+	if (exp.kind === 'lesson' && exp.ref_id && (verdict === 'improved' || verdict === 'regressed')) {
 		const l = store.getLesson(exp.ref_id)
 		if (l) {
-			const nextConf = verdict === 'improved' ? Math.min(1, l.confidence + 0.1)
-				: verdict === 'regressed' ? Math.max(0.1, l.confidence - 0.25) : l.confidence
+			const nextConf = verdict === 'improved' ? Math.min(1, l.confidence + 0.1) : Math.max(0.1, l.confidence - 0.25)
 			store.upsertLesson({ ...l, confidence: nextConf, evidence_count: l.evidence_count, now })
 		}
 	}

@@ -31,7 +31,23 @@ export const MEMORY_DEFAULT_PRIORITY = {
 	incident: 2,
 }
 
-const USER_SOURCES = new Set(['user', 'cli', 'console'])
+// 기억을 바꾸고 지울 수 있는 권한은 출처에 따라 세 단계로 나뉜다.
+// 1) 사용자 직접 조작(콘솔·CLI·알림 답장 판단의 user): 무엇이든 바꿀 수 있다.
+// 2) 사용자 대화에서 나온 것(Assist 대화의 기억 도구·대화 직후 추출기·제안 거절): 1)이 만든 것과 고정된 것은 못 바꾼다.
+// 3) 백그라운드 자동(cycle·agent·tool·정리 등): 1)·2)가 만든 것과 고정된 것은 못 바꾼다.
+export const USER_SOURCES = new Set(['user', 'cli', 'console'])
+export const CONVERSATION_SOURCES = new Set(['assist_user', 'extractor', 'user_rejection'])
+
+// 이 출처(source)가 기존 기억(prev)을 바꾸거나 지울 수 없으면 그 까닭을, 할 수 있으면 null을 돌려준다.
+export function memoryWriteBlock(prev, source, { force = false } = {}) {
+	if (!prev || force || USER_SOURCES.has(source)) return null
+	const key = prev.key
+	if (prev.pinned) return `고정(pinned)된 기억(${key})은 자동으로 바꾸거나 지울 수 없다. 웹 콘솔(메모리 관리)이나 CLI(node src/cli.mjs memory)에서 사용자가 직접 바꿔야 한다.`
+	if (USER_SOURCES.has(prev.source)) return `사용자가 직접 등록한 기억(${key})은 자동으로 바꾸거나 지울 수 없다. 웹 콘솔이나 CLI에서 바꿔야 한다.`
+	if (CONVERSATION_SOURCES.has(prev.source) && !CONVERSATION_SOURCES.has(source)) return `사용자 대화에서 저장한 기억(${key})은 백그라운드 판단이 바꾸거나 지울 수 없다. 사용자와의 대화나 웹 콘솔에서 바꿔야 한다.`
+	return null
+}
+
 const normalizeEntityIds = v => {
 	if (!v) return []
 	const arr = Array.isArray(v) ? v : typeof v === 'string' ? parseJson(v, v.split(',')) : []
@@ -587,11 +603,32 @@ export class Store {
 		return rows.map(r => this.#mapProposal(r))
 	}
 
+	// 제안 상태를 from일 때만 to로 바꾼다(원자적 비교 후 교체). 데몬과 CLI가 같은 DB를 함께 쓰므로 프로세스 사이에서도 안전하다.
+	// 바뀌었으면 바뀐 제안을, 그사이 다른 쪽이 먼저 처리했으면 null을 돌려준다.
+	transitionProposal(pid, from, to, { decidedAt = null, error } = {}) {
+		const r = this.db.prepare(`
+			UPDATE proposals SET status = ?, decided_at = COALESCE(?, decided_at)${error !== undefined ? ', error = ?' : ''}
+			WHERE pid = ? AND status = ?
+			RETURNING *
+		`).get(...[to, decidedAt, ...(error !== undefined ? [error] : []), pid, from])
+		return r ? this.#mapProposal(r) : null
+	}
+
 	expirePendingProposals(now = Date.now()) {
-		const rows = this.db.prepare("SELECT * FROM proposals WHERE status = 'pending' AND expires IS NOT NULL AND expires < ?").all(now)
-		if (!rows.length) return []
-		this.db.prepare("UPDATE proposals SET status = 'expired', decided_at = ? WHERE status = 'pending' AND expires IS NOT NULL AND expires < ?").run(now, now)
-		return rows.map(r => this.#mapProposal({ ...r, status: 'expired', decided_at: now }))
+		return this.db.prepare(`
+			UPDATE proposals SET status = 'expired', decided_at = ?
+			WHERE status = 'pending' AND expires IS NOT NULL AND expires < ?
+			RETURNING *
+		`).all(now, now).map(r => this.#mapProposal(r))
+	}
+
+	// 적용 도중 프로세스가 죽어 'applying'에 멈춘 제안을 'interrupted'로 돌린다(결과를 알 수 없으니 사용자 확인·롤백 대상).
+	recoverStuckProposals(now = Date.now(), olderThanMs = 15 * 60000) {
+		return this.db.prepare(`
+			UPDATE proposals SET status = 'interrupted', error = ?
+			WHERE status = 'applying' AND COALESCE(decided_at, ts) < ?
+			RETURNING *
+		`).all('적용 도중 중단되어 결과를 알 수 없어요. HA에서 이 설정을 확인하고, 필요하면 [롤백]하세요.', now - olderThanMs).map(r => this.#mapProposal(r))
 	}
 
 	#mapProposal(r) {
@@ -712,17 +749,8 @@ export class Store {
 	deleteMemoryDetailed(key, { source = 'agent', force = false, now = Date.now() } = {}) {
 		const prev = this.db.prepare('SELECT * FROM memory_items WHERE key = ? AND active = 1').get(key)
 		if (!prev) return { ok: false, notFound: true, error: `기억을 찾지 못함: ${key}` }
-		const protectedByPin = Boolean(prev.pinned)
-		const protectedByUser = USER_SOURCES.has(prev.source) && !USER_SOURCES.has(source)
-		if (!force && !USER_SOURCES.has(source) && (protectedByPin || protectedByUser)) {
-			return {
-				ok: false,
-				protected: true,
-				error: protectedByPin
-					? `고정(pinned)된 기억(${key})은 자동으로 삭제할 수 없다. 사용자 확인이 필요하다.`
-					: `사용자가 직접 등록한 기억(${key})은 자동으로 삭제할 수 없다.`,
-			}
-		}
+		const blocked = memoryWriteBlock(prev, source, { force })
+		if (blocked) return { ok: false, protected: true, error: blocked }
 		const r = this.db.prepare('UPDATE memory_items SET active = 0, updated_at = ? WHERE key = ? AND active = 1').run(now, key)
 		if ((r?.changes ?? 0) > 0) {
 			this.#syncFtsRow(key, null, null, false)

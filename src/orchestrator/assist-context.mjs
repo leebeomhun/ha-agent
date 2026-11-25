@@ -156,7 +156,7 @@ export function buildAssistInstructions({ policyDesc, directoryText = '', profil
 			? '- ha_control_device의 speech_if_success에는 제어가 성공하면 사용자에게 그대로 들려줄 짧은 한 문장을 넣는다(예: "주방 불을 켰어요."). 여러 기기를 한 번에 제어하면 모든 호출에 같은 전체 요약 문장을 넣는다.'
 			: '',
 		'- 날씨 예보는 ha_get_weather, 일정은 ha_get_calendar, 최근 보낸 알림 문의는 ha_get_recent_notifications로 조회한다.',
-		'- 사용자가 임시 부재·일정(ttl_days 지정, incident), 선호(preference), 영구 지시(standing_order, pinned=true)를 말하면 memory_upsert로 저장하고, 과거 기억 확인은 memory_search(필요 시 include_archived=true), 취소·삭제 요청은 memory_delete를 쓴다.',
+		'- 사용자가 임시 부재·일정(ttl_days 지정, incident), 선호(preference), 영구 지시(standing_order)를 말하면 memory_upsert로 저장하고(pinned는 사용자가 "고정해"라고 할 때만 true), 과거 기억 확인은 memory_search(필요 시 include_archived=true), 취소·삭제 요청은 memory_delete를 쓴다. 고정됐거나 콘솔에서 등록한 기억이라 막히면 웹 콘솔(메모리 관리)에서 바꾸도록 안내한다.',
 		'- 안전 정책으로 차단된 기기나 목록에 없는 기기의 제어 요청은 도구 없이 이유를 짧게 설명하고 거절한다.',
 		'- 자동화/스크립트 생성·수정·삭제·통합 리로드·백업·규칙 승격 및 자가 튜닝(별칭·소음·STT·교훈)은 ha_propose_admin으로 검증 후 Tier 2 승인 제안을 만든다.',
 		'- 사용자가 기존 제안의 승인/거절/롤백을 직접 지시했으면 ha_proposal_action을 호출한다.',

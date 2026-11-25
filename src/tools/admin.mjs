@@ -1,4 +1,9 @@
 // Tool Broker 관리/메모리 도구: Tier 2 HA 관리 제안 생성, 사용자 명시 승인/거절/롤백 처리, 구조화 기억 갱신
+
+// 기억 도구가 남길 출처. Assist 대화는 memorySource('assist_user')를 넘겨, LLM이 해석한 요청이
+// 고정·사용자 등록 기억을 바꾸지 못하게 한다(src/core/store.mjs의 memoryWriteBlock).
+const memorySourceOf = ctx => ctx.memorySource ?? (ctx.allowDirectRequest ? 'user' : (ctx.source ?? 'tool'))
+
 export function adminTools() {
 	return [
 		{
@@ -52,12 +57,12 @@ export function adminTools() {
 				content: { type: 'string', description: '기억할 내용(한국어)' },
 				ttl_days: { type: ['integer', 'null'], description: '만료 일수(임시 부재·사건 등). 무기한 또는 카테고리 기본값이면 null' },
 				confidence: { type: ['number', 'null'], description: '확신도 0~1. null이면 1.0' },
-				pinned: { type: ['boolean', 'null'], description: '영구 고정 여부(영구 지시는 true 권장). null이면 기존 유지' },
+				pinned: { type: ['boolean', 'null'], description: '영구 고정 여부. 사용자가 "고정해"처럼 분명히 요청했을 때만 true. 그 밖에는 null(기존 유지)' },
 				entity_ids: { type: ['array', 'null'], items: { type: 'string' }, description: '연관 HA entity_id 목록. 없으면 null' },
 			},
 			async run(ctx, a) {
 				if (!ctx.memory) return '메모리 모듈이 없음'
-				const src = ctx.allowDirectRequest ? 'user' : (ctx.source ?? 'tool')
+				const src = memorySourceOf(ctx)
 				const res = ctx.memory.applyOps([{
 					op: 'upsert',
 					category: a.category,
@@ -74,13 +79,13 @@ export function adminTools() {
 		},
 		{
 			name: 'memory_delete',
-			description: '더 이상 유효하지 않은 구조화 장기 기억 항목을 삭제한다(고정된 기억은 사용자 직접 요청일 때만 삭제 가능)',
+			description: '더 이상 유효하지 않은 구조화 장기 기억 항목을 삭제한다. 고정됐거나 사용자가 콘솔·CLI로 등록한 기억은 지울 수 없으니, 그때는 웹 콘솔(메모리 관리)에서 지우도록 안내한다',
 			properties: {
 				key: { type: 'string', description: '삭제할 기억 키' },
 			},
 			async run(ctx, a) {
 				if (!ctx.memory) return '메모리 모듈이 없음'
-				const src = ctx.allowDirectRequest ? 'user' : (ctx.source ?? 'tool')
+				const src = memorySourceOf(ctx)
 				const res = ctx.memory.applyOps([{ op: 'delete', key: a.key }], { source: src })
 				return JSON.stringify(res)
 			},

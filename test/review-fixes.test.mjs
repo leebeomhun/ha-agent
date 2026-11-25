@@ -111,7 +111,7 @@ test('1.1 AssistServer: XSS 제거, CSP/보안 헤더, allowed_networks 403 차�
 test('1.2 PolicyEngine ADMIN_SERVICES Tier3 차단 & Config 중복·effort_weekly 검증', () => {
 	const pol = new PolicyEngine(mergeConfig({
 		actions: { enabled: true },
-		policy: { admin_enabled: true, tier1_auto: ['light.a'] },
+		policy: { admin_enabled: true, tier1_auto: ['light.a'], tier3_blocked: ['switch.jubang_jubang_hairaiteu*'] },
 	}))
 	// service_data.entity_id 및 배열 우회 차단
 	assert.match(pol.checkHaServiceCall({

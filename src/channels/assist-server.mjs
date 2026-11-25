@@ -100,16 +100,36 @@ export function ensureAssistToken(tokenFile) {
 	return tok
 }
 
+// 클라이언트 잘못(본문 초과·JSON 오류 등)은 이 오류로 던져 알맞은 4xx와 그 이유를 돌려준다.
+// 그 밖의 예외는 500과 일반 문구만 돌려주고, 자세한 내용은 서버 로그에만 남긴다.
+export class HttpError extends Error {
+	constructor(status, message) {
+		super(message)
+		this.status = status
+	}
+}
+
 function readRawBody(req, maxBytes = MAX_AUDIO_BODY) {
 	return new Promise((resolve, reject) => {
 		let size = 0
+		let tooBig = false
 		const chunks = []
 		req.on('data', c => {
 			size += c.length
-			if (size > maxBytes) { reject(new Error('요청 본문이 너무 큼')); req.destroy(); return }
+			if (tooBig) {
+				// 413을 보낸 뒤에도 남은 본문은 버리며 받는다(바로 끊으면 클라이언트는 응답 대신 연결 오류를 본다). 너무 크면 끊는다.
+				if (size > maxBytes * 4) req.destroy()
+				return
+			}
+			if (size > maxBytes) {
+				tooBig = true
+				chunks.length = 0
+				reject(new HttpError(413, `요청 본문이 너무 큼 (최대 ${Math.round(maxBytes / 1024)}KB)`))
+				return
+			}
 			chunks.push(c)
 		})
-		req.on('end', () => resolve(Buffer.concat(chunks)))
+		req.on('end', () => { if (!tooBig) resolve(Buffer.concat(chunks)) })
 		req.on('error', reject)
 	})
 }
@@ -118,7 +138,10 @@ function readJsonBody(req, maxBytes = MAX_BODY) {
 	return readRawBody(req, maxBytes).then(buf => {
 		const text = buf.toString('utf8').trim()
 		if (!text) return {}
-		try { return JSON.parse(text) } catch { throw new Error('JSON 파싱 실패') }
+		let body
+		try { body = JSON.parse(text) } catch { throw new HttpError(400, 'JSON 파싱 실패') }
+		if (!body || typeof body !== 'object' || Array.isArray(body)) throw new HttpError(400, 'JSON 본문은 객체여야 함')
+		return body
 	})
 }
 
@@ -464,7 +487,7 @@ async function loadProposals(){
         const b1 = document.createElement('button'); b1.className = 'ok'; b1.textContent = '승인'; b1.onclick = async () => { await api('/api/proposals/' + p.pid + '/approve', { method: 'POST' }); loadProposals(); };
         const b2 = document.createElement('button'); b2.className = 'bad'; b2.textContent = '거절'; b2.onclick = async () => { await api('/api/proposals/' + p.pid + '/reject', { method: 'POST' }); loadProposals(); };
         btns.append(b1, b2);
-      } else if (p.status === 'applied' && ROLLBACK_KINDS.has(p.kind)) {
+      } else if (['applied', 'rollback_failed', 'interrupted'].includes(p.status) && ROLLBACK_KINDS.has(p.kind)) {
         const b3 = document.createElement('button'); b3.className = 'bad'; b3.textContent = '롤백'; b3.onclick = async () => { await api('/api/proposals/' + p.pid + '/rollback', { method: 'POST' }); loadProposals(); };
         btns.append(b3);
       }
@@ -502,8 +525,13 @@ export class AssistServer {
 		if (!this.token) this.token = ensureAssistToken(a.token_file)
 		this.server = createServer((req, res) => {
 			this.#handle(req, res).catch(e => {
-				log('Assist HTTP 오류:', e.message)
-				if (!res.headersSent) sendJson(res, 500, { error: e.message })
+				if (e instanceof HttpError) {
+					log(`Assist HTTP ${e.status} (${req.method} ${String(req.url ?? '').split('?')[0]}): ${e.message}`)
+					if (!res.headersSent) sendJson(res, e.status, { error: e.message })
+					return
+				}
+				log(`Assist HTTP 오류 (${req.method} ${String(req.url ?? '').split('?')[0]}):`, e?.stack ?? e)
+				if (!res.headersSent) sendJson(res, 500, { error: '서버 내부 오류 (자세한 내용은 ha-agent 로그 확인)' })
 			})
 		})
 		await new Promise((resolve, reject) => {

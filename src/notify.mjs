@@ -166,6 +166,8 @@ export function proposalResultPayload(p, { rollback = false } = {}) {
 		expired: [`⌛ 기한 만료: ${p.title}`, '승인 기한이 지나 제안이 자동으로 만료되었어요.'],
 		rolled_back: [`↩️ 롤백됨: ${p.title}`, p.error || '이전 설정으로 되돌렸어요.'],
 		error: [`❌ 적용 실패: ${p.title}`, p.error || '알 수 없는 오류'],
+		rollback_failed: [`🚨 롤백 실패: ${p.title}`, p.error || 'HA에서 이 설정을 직접 확인해 주세요.'],
+		interrupted: [`⚠️ 적용 중단: ${p.title}`, p.error || '적용 도중 중단되어 결과를 알 수 없어요.'],
 	}[p.status] ?? [`🛠️ ${p.title}`, p.summary]
 	return {
 		title: text[0].slice(0, 60),

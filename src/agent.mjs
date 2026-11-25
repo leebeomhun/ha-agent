@@ -11,7 +11,7 @@ import { Store } from './core/store.mjs'
 import { Journal } from './core/journal.mjs'
 import { MemoryManager } from './core/memory.mjs'
 import { AnomalyEngine } from './engine/anomaly.mjs'
-import { ImplicitFeedbackTracker, buildLearningDigest, registerExperiment, evaluateDueExperiments } from './engine/learning.mjs'
+import { ImplicitFeedbackTracker, buildLearningDigest, registerExperiment, evaluateDueExperiments, proposalExperimentScope } from './engine/learning.mjs'
 import { HaAdmin } from './admin/ha-admin.mjs'
 import { ToolBroker } from './tools/registry.mjs'
 import { digestHaData } from './tools/read.mjs'
@@ -114,6 +114,11 @@ export class Agent {
 		this.haAdmin = new HaAdmin({
 			cfg: this.cfg, ha: this.ha, store: this.store, states: this.states, meta: this.meta, memory: this.memoryMgr, policy: this.policy,
 			onRulePromoted: async ruleId => this.#removePromotedRule(ruleId),
+			// 롤백까지 실패하면 HA가 어떤 설정으로 돌고 있는지 모른다. HA 알림이 막혔을 수도 있으니 비상 길로도 알린다.
+			onRollbackFailed: prop => {
+				log(`제안 롤백 실패: ${prop.pid} ${prop.title} — ${prop.error}`)
+				if (!this.dry) this.notifier.oobSend('🚨 집 비서: HA 설정 롤백 실패', `${prop.title}: ${prop.error}`.slice(0, 450))
+			},
 			onConfigUpdated: async merged => {
 				this.cfg = merged
 				this.isNoise = globs(this.cfg.noise_entities)
@@ -128,6 +133,7 @@ export class Agent {
 						kind: `proposal:${prop.kind}`,
 						ref_id: prop.pid,
 						title: prop.title,
+						scope: proposalExperimentScope(prop),
 						evalDays: this.cfg.learning?.experiment_eval_days ?? 7,
 						now: at,
 					})
@@ -417,7 +423,7 @@ export class Agent {
 		if (!this.dry) {
 			const expiredProps = this.haAdmin.expireProposals(now)
 			if (expiredProps.length && this.control.send && this.ha.connected) {
-				for (const p of expiredProps) await this.notifier.send(proposalResultPayload(p)).catch(() => {})
+				for (const p of expiredProps) await this.notifier.send(proposalResultPayload(p, { rollback: this.haAdmin.canRollback(p) })).catch(() => {})
 			}
 		}
 		await this.notifier.flushOutbox(now)
@@ -736,7 +742,7 @@ export class Agent {
 
 		if (res.proposal && this.ha.connected && this.control.send) {
 			await this.notifier.send(proposalResultPayload(res.proposal, {
-				rollback: res.proposal.status === 'applied' && this.haAdmin.isRollbackable(res.proposal),
+				rollback: this.haAdmin.canRollback(res.proposal),
 			})).catch(() => {})
 		}
 		return res
@@ -1112,9 +1118,11 @@ export class Agent {
 			this.saveRuntime()
 			if (this.store && this.cfg.learning?.enabled !== false) {
 				for (const rid of [...out.added, ...out.changed]) {
+					const rule = rules.find(r => r.id === rid)
 					registerExperiment(this.store, {
 						kind: 'rule',
 						ref_id: rid,
+						scope: { rule_ids: [rid], entity_ids: [...new Set([rule?.entity_id, ...(rule?.also ?? []).map(c => c.entity_id)].filter(Boolean))] },
 						title: `감시 규칙 ${out.added.includes(rid) ? '추가' : '수정'}: ${rid}`,
 						evalDays: this.cfg.learning?.experiment_eval_days ?? 7,
 						now,

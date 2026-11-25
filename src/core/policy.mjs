@@ -5,18 +5,12 @@ import { globs } from '../util.mjs'
 const DEAD = new Set(['unavailable', 'unknown'])
 export const TIER3_DOMAINS = new Set(['lock', 'alarm_control_panel', 'update'])
 export const TIER3_SERVICES = new Set(['homeassistant.restart', 'homeassistant.stop', 'update.install'])
+// 설정과 상관없이 늘 막는 바닥(어느 집에나 맞는 도메인 단위). 집마다 다른 기기(주방 하이라이트·세탁기 전원 등)는
+// config.json의 policy.tier3_blocked에만 둔다. 이 목록은 그 위에 더해질 뿐 설정으로 뺄 수 없다.
 export const DEFAULT_TIER3_PATTERNS = [
 	'lock.*',
 	'alarm_control_panel.*',
 	'update.*',
-	'switch.jubang_jubang_hairaiteu*',
-	'switch.geosil_geosil_seumateu_peulreogeu*',
-	'switch.setagsil_setagsil_setaggi_power',
-	'switch.setagsil_setagsil_geonjogi_power',
-	'script.unknown',
-	'input_boolean.kona_*',
-	'select.*_jeongjeon_bosang_*',
-	'select.hwajangsil_seuwici_*',
 ]
 export const ADMIN_SERVICES = new Set([
 	'automation.turn_on', 'automation.turn_off', 'automation.toggle', 'automation.reload', 'automation.trigger',

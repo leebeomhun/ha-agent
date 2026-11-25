@@ -12,6 +12,8 @@ const RUNTIME_TEMPLATE_VARS = new Set(['trigger', 'this', 'context', 'repeat', '
 const UNDEF_VAR_RE = /UndefinedError:\s*'([A-Za-z_][A-Za-z0-9_]*)' is undefined/
 export const SELF_PROPOSAL_KINDS = new Set(['self_alias_proposal', 'self_noise_proposal', 'self_stt_tune', 'self_lesson_proposal'])
 export const ROLLBACKABLE_KINDS = new Set(['automation_upsert', 'automation_delete', 'automation_toggle', 'script_upsert', 'script_delete', 'promote_rule', ...SELF_PROPOSAL_KINDS])
+// [롤백]을 받을 수 있는 상태: 적용됨, 자동 롤백 실패, 적용 도중 중단(결과 불명)
+export const ROLLBACK_FROM = new Set(['applied', 'rollback_failed', 'interrupted'])
 export const PROMOTABLE_OPS = new Set(['eq', 'ne', 'in', 'not_in', 'gt', 'lt', 'unavailable'])
 // 불변 코어 보호: 자가개선 제안은 보안·정책·네트워크 경계를 절대 건드릴 수 없다.
 const IMMUTABLE_CORE_KEYS = new Set(['policy', 'tier3_blocked', 'admin_enabled', 'allowed_networks', 'oob', 'token_file', 'actions'])
@@ -235,7 +237,7 @@ export function ruleToAutomationConfig(rule, notifyTargets = ['mobile_app_ibeomh
 }
 
 export class HaAdmin {
-	constructor({ cfg, ha, store = null, states = new Map(), meta = {}, memory = null, onRulePromoted = null, policy = null, configPath = P.config, onConfigUpdated = null, onProposalOutcome = null } = {}) {
+	constructor({ cfg, ha, store = null, states = new Map(), meta = {}, memory = null, onRulePromoted = null, policy = null, configPath = P.config, onConfigUpdated = null, onProposalOutcome = null, onRollbackFailed = null } = {}) {
 		this.cfg = cfg
 		this.policy = policy ?? new PolicyEngine(cfg ?? {})
 		this.ha = ha
@@ -247,6 +249,8 @@ export class HaAdmin {
 		this.configPath = configPath
 		this.onConfigUpdated = onConfigUpdated
 		this.onProposalOutcome = onProposalOutcome
+		// 자동·수동 롤백이 실패했을 때(HA 설정이 어떤 상태인지 모름) 비상 알림을 보내는 데 쓴다.
+		this.onRollbackFailed = onRollbackFailed
 		this.memProposals = new Map()
 		this._writeChain = Promise.resolve()
 		this._opChain = Promise.resolve()
@@ -420,8 +424,23 @@ export class HaAdmin {
 		return Boolean(p && ROLLBACKABLE_KINDS.has(p.kind))
 	}
 
+	// 지금 상태에서 [롤백]을 누를 수 있는지(적용됨·롤백 실패·적용 중단).
+	canRollback(p) {
+		return this.isRollbackable(p) && ROLLBACK_FROM.has(p?.status)
+	}
+
+	// 제안 상태를 from일 때만 to로 바꾼다. 다른 쪽(알림 버튼·콘솔·CLI·만료)이 먼저 처리했으면 null.
+	#transition(pid, from, to, { decidedAt = null, error } = {}) {
+		if (this.store) return this.store.transitionProposal(pid, from, to, { decidedAt, error })
+		const p = this.memProposals.get(pid)
+		if (!p || p.status !== from) return null
+		const next = { ...p, status: to, decided_at: decidedAt ?? p.decided_at ?? null, ...(error !== undefined ? { error } : {}) }
+		this.memProposals.set(pid, next)
+		return next
+	}
+
 	expireProposals(now = Date.now()) {
-		if (this.store) return this.store.expirePendingProposals(now)
+		if (this.store) return [...this.store.expirePendingProposals(now), ...this.store.recoverStuckProposals(now)]
 		const expired = []
 		for (const [pid, p] of this.memProposals) {
 			if (p.status === 'pending' && p.expires && now > p.expires) {
@@ -568,12 +587,29 @@ export class HaAdmin {
 		if (!p) return { ok: false, error: `제안을 찾지 못함: ${pid}` }
 		if (p.status !== 'pending') return { ok: false, error: `이미 처리된 제안 (${p.status})` }
 		if (p.expires && now > p.expires) {
-			this.#saveProposal({ ...p, status: 'expired', decided_at: now })
+			this.#transition(pid, 'pending', 'expired', { decidedAt: now })
 			return { ok: false, error: '제안 승인 기한이 지남' }
 		}
 		if (p.validation && p.validation.valid === false) {
 			return { ok: false, error: `사전 검증 실패: ${(p.validation.errors ?? []).join(', ')}` }
 		}
+		// 먼저 'applying'으로 선점한다. 그사이 거절·만료·다른 승인이 끼어들면 적용하지 않는다(알림 버튼·콘솔·CLI가 동시에 눌려도 한 번만).
+		if (!this.#transition(pid, 'pending', 'applying', { decidedAt: now })) {
+			return { ok: false, error: `이미 처리 중이거나 처리된 제안 (${this.getProposal(pid)?.status ?? '없음'})` }
+		}
+		try {
+			return await this.#applyClaimed(p, now)
+		} catch (e) {
+			// 예상 못 한 오류로 'applying'에 멈춰 있지 않게 한다.
+			const failed = { ...p, status: 'error', decided_at: now, error: `적용 중 오류: ${e.message}` }
+			this.#saveProposal(failed)
+			return { ok: false, error: failed.error, proposal: failed }
+		}
+	}
+
+	// 'applying'으로 선점한 제안을 적용한다. p는 선점 전(pending) 내용이다.
+	async #applyClaimed(p, now) {
+		const pid = p.pid
 		const mutatedConfig = ['automation_upsert', 'automation_delete', 'script_upsert', 'script_delete', 'promote_rule'].includes(p.kind)
 		// 예전 판이 만든 제안도 승인할 때 Tier 3 검사를 다시 거친다.
 		if (['automation_upsert', 'script_upsert', 'promote_rule'].includes(p.kind)) {
@@ -589,6 +625,7 @@ export class HaAdmin {
 			const domain = p.kind.startsWith('script') ? 'script' : 'automation'
 			let cur
 			try { cur = await this.#currentConfig(domain, p.payload?.config_id) } catch (e) {
+				this.#saveProposal(p) // 다시 승인할 수 있게 pending으로 되돌린다
 				return { ok: false, error: `지금 HA 설정을 확인하지 못해 적용하지 않음(잠시 뒤 다시 승인): ${e.message}` }
 			}
 			if (cur !== undefined && canonicalJson(cur) !== canonicalJson(p.pre_snapshot ?? null)) {
@@ -653,7 +690,15 @@ export class HaAdmin {
 			return { ok: true, proposal: updated }
 		} catch (e) {
 			if (mutatedConfig) {
-				try { await this.#restoreSnapshot(p) } catch {}
+				let rbErr = null
+				try { await this.#restoreSnapshot(p) } catch (re) { rbErr = re }
+				if (rbErr) {
+					// 되돌리기도 실패: HA에 새(깨졌을 수 있는) 설정이 남아 있을 수 있다. 롤백됐다고 기록하지 않는다.
+					const stuck = { ...p, status: 'rollback_failed', decided_at: now, error: `적용 실패(${e.message}) 뒤 자동 롤백도 실패(${rbErr.message}). HA에서 이 설정을 직접 확인하고 [롤백]을 다시 시도하세요.` }
+					this.#saveProposal(stuck)
+					this.#notifyRollbackFailed(stuck)
+					return { ok: false, error: stuck.error, proposal: stuck }
+				}
 				const rolled = { ...p, status: 'rolled_back', decided_at: now, rollback_at: Date.now(), error: `적용 실패로 자동 롤백: ${e.message}` }
 				this.#saveProposal(rolled)
 				try { this.onProposalOutcome?.(rolled, 'rolled_back', now, e.message) } catch {}
@@ -720,7 +765,7 @@ export class HaAdmin {
 		const p = this.getProposal(pid)
 		if (!p) return { ok: false, error: `제안을 찾지 못함: ${pid}` }
 		if (!this.isRollbackable(p)) return { ok: false, error: `${p.kind} 제안은 롤백을 지원하지 않음` }
-		if (p.status !== 'applied') return { ok: false, error: `적용된 제안만 롤백 가능 (${p.status})` }
+		if (!ROLLBACK_FROM.has(p.status)) return { ok: false, error: `적용된 제안만 롤백 가능 (${p.status})` }
 		try {
 			await this.#restoreSnapshot(p)
 			if (!SELF_PROPOSAL_KINDS.has(p.kind) && typeof this.ha?.checkConfig === 'function') await this.ha.checkConfig()
@@ -729,16 +774,26 @@ export class HaAdmin {
 			try { this.onProposalOutcome?.(updated, 'rolled_back', now) } catch {}
 			return { ok: true, proposal: updated }
 		} catch (e) {
-			return { ok: false, error: `롤백 실패: ${e.message}` }
+			// 일부만 되돌려졌을 수 있다. 상태를 남겨 콘솔·알림에서 다시 [롤백]할 수 있게 한다.
+			const stuck = { ...p, status: 'rollback_failed', error: `롤백 실패: ${e.message}. HA에서 이 설정을 직접 확인하고 다시 시도하세요.` }
+			this.#saveProposal(stuck)
+			this.#notifyRollbackFailed(stuck)
+			return { ok: false, error: `롤백 실패: ${e.message}`, proposal: stuck }
 		}
+	}
+
+	#notifyRollbackFailed(p) {
+		try { this.onProposalOutcome?.(p, 'rollback_failed', Date.now(), p.error) } catch {}
+		try { this.onRollbackFailed?.(p) } catch {}
 	}
 
 	rejectProposal(pid, now = Date.now(), reason = '') {
 		const p = this.getProposal(pid)
 		if (!p) return { ok: false, error: `제안을 찾지 못함: ${pid}` }
 		if (p.status !== 'pending') return { ok: false, error: `이미 처리된 제안 (${p.status})` }
-		const updated = { ...p, status: 'rejected', decided_at: now, ...(reason ? { error: reason } : {}) }
-		this.#saveProposal(updated)
+		// 승인이 'applying'으로 먼저 선점했거나 만료됐으면 거절하지 않는다(거절 기억이 적용된 제안에 남지 않게).
+		const updated = this.#transition(pid, 'pending', 'rejected', { decidedAt: now, ...(reason ? { error: reason } : {}) })
+		if (!updated) return { ok: false, error: `이미 처리 중이거나 처리된 제안 (${this.getProposal(pid)?.status ?? '없음'})` }
 		if (this.memory) {
 			this.memory.applyOps([{ op: 'upsert', category: 'rejection', key: `rej_${p.kind}_${p.target_id || pid}`, content: `사용자가 거절한 제안: ${p.title}${reason ? ` (${reason})` : ''}` }], { source: 'user_rejection', now })
 		}

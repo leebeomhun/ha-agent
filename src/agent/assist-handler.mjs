@@ -321,6 +321,7 @@ export class AssistHandler {
 			allowDirectRequest: true,
 			adminEnabled: Boolean(ag.cfg.policy?.admin_enabled),
 			source: channel,
+			memorySource: 'assist_user',
 			onMemoryMutated: () => { turnMemoryMutated = true },
 			executeControl: async (req, opts) => {
 				const r = await exec(req, opts)

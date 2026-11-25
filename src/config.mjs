@@ -256,6 +256,9 @@ export function validateConfig(cfg) {
 	if (!Number.isFinite(cfg?.limits?.user_reserve_runs) || cfg.limits.user_reserve_runs < 0) {
 		errors.push(`limits.user_reserve_runs는 0 이상이어야 함 (${cfg?.limits?.user_reserve_runs})`)
 	}
+	if (cfg?.actions?.enabled && !(Array.isArray(cfg?.policy?.tier3_blocked) && cfg.policy.tier3_blocked.length)) {
+		warnings.push('policy.tier3_blocked가 비어 있음: 기본으로는 lock.*·alarm_control_panel.*·update.*만 막는다. 집에서 절대 자동 제어하면 안 되는 기기(가열·세탁기 전원 등)를 넣을 것')
+	}
 	const o = cfg?.oob ?? {}
 	validateOobEntry(o, 'oob', errors)
 	if (o.fallback?.type) validateOobEntry(o.fallback, 'oob.fallback', errors)

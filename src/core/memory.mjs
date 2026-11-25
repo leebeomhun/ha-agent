@@ -6,7 +6,7 @@ import {
 	tokenize, charNgrams, jaccard, embedText, EmbeddingCache,
 	DEFAULT_EMBEDDING_DIMS, DEFAULT_SEMANTIC_THRESHOLD,
 } from './embeddings.mjs'
-import { MEMORY_DEFAULT_PRIORITY } from './store.mjs'
+import { MEMORY_DEFAULT_PRIORITY, memoryWriteBlock } from './store.mjs'
 
 export const CATEGORY_ORDER = ['standing_order', 'preference', 'rejection', 'pattern', 'incident']
 export const CAT_LABEL = {
@@ -23,7 +23,7 @@ export const DEFAULT_TTL_DAYS = {
 	rejection: 90,
 	incident: 21,
 }
-const AUTO_SOURCES = new Set(['agent', 'cycle', 'extractor', 'tool', 'ha_assist', 'web', 'cli_assist', 'cli_say', 'openai_compat'])
+const AUTO_SOURCES = new Set(['agent', 'cycle', 'extractor', 'tool', 'assist_user', 'ha_assist', 'web', 'cli_assist', 'cli_say', 'openai_compat'])
 
 function resolveExpiresAt(item, category, pinned, now) {
 	if (item.expires_at != null && item.expires_at !== '') {
@@ -226,6 +226,14 @@ export class MemoryManager {
 			} else if (item.content) {
 				let category = CATEGORY_ORDER.includes(item.category) ? item.category : 'pattern'
 				const prev = this.store.getMemory(key)
+				// 고정·사용자 등록·대화 기억은 그보다 낮은 출처가 덮어쓸 수 없다(삭제와 같은 규칙). 내용이 같으면 조용히 건너뛴다.
+				const live = prev?.active ? prev : null
+				const writeBlocked = memoryWriteBlock(live, source, { force })
+				if (writeBlocked) {
+					const same = live.content === String(item.content).trim().slice(0, 500) && (!item.category || live.category === category)
+					if (!same) blocked.push({ key, error: writeBlocked })
+					continue
+				}
 				const rawConf = item.confidence != null ? Number(item.confidence) : null
 				const confidence = Number.isFinite(rawConf) ? Math.min(Math.max(rawConf, 0), 1) : (prev?.confidence ?? 1.0)
 				const pinned = item.pinned === true ? true : item.pinned === false ? false : null
@@ -470,11 +478,11 @@ export class MemoryManager {
 				const sim = Math.max(tokSim, biSim)
 				if (sim < 0.55) continue
 				duplicates.push({ category: a.category, keep: a.key, dup: b.key, similarity: Math.round(sim * 100) / 100 })
-				// 동일 카테고리 incident/rejection의 고도 중복(>= mergeThreshold)은 자동 병합(pinned 제외)
-				if (!dry && sim >= mergeThreshold && !b.pinned && ['incident', 'rejection'].includes(a.category)) {
+				// 동일 카테고리 incident/rejection의 고도 중복(>= mergeThreshold)은 자동 병합(고정·사용자 등록·대화 기억은 제외)
+				const mergeable = !memoryWriteBlock(a, 'consolidation') && !memoryWriteBlock(b, 'consolidation')
+				if (!dry && mergeable && sim >= mergeThreshold && ['incident', 'rejection'].includes(a.category)) {
 					const keeper = a.updated_at >= b.updated_at ? a : b
 					const victim = keeper === a ? b : a
-					if (victim.pinned) continue
 					const mergedEntities = [...new Set([...(keeper.entity_ids ?? []), ...(victim.entity_ids ?? [])])]
 					const mergedEvidence = (keeper.evidence_count ?? 1) + (victim.evidence_count ?? 1)
 					const mergedContent = keeper.content.length >= victim.content.length ? keeper.content : victim.content

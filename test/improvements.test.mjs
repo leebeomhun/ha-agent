@@ -139,7 +139,8 @@ test('1. 스크립트: 빠른 경로에서 빠지고, 필수 필드 없이는 �
 test('2. 관리 제안: 자동화·스크립트 동작에 Tier 3가 들어가면 거절하고, 승인 알림에는 트리거·동작 요약을 보여 준다', async () => {
 	const states = new Map(['lock.front', 'light.a', 'binary_sensor.door', 'switch.setagsil_setagsil_setaggi_power', 'script.unknown', 'automation.morning']
 		.map(id => [id, st(id, 'off')]))
-	const adm = new HaAdmin({ cfg: mergeConfig({ policy: { admin_enabled: true } }), ha: { connected: false }, states, meta: {} })
+	// 집 특화 Tier 3 기기는 코드 기본값이 아니라 설정(policy.tier3_blocked)에서 온다
+	const adm = new HaAdmin({ cfg: mergeConfig({ policy: { admin_enabled: true, tier3_blocked: ['switch.setagsil_setagsil_setaggi_power', 'script.unknown'] } }), ha: { connected: false }, states, meta: {} })
 	const propose = (actions, triggers = [{ trigger: 'state', entity_id: 'binary_sensor.door', to: 'on' }], kind = 'automation_upsert') => adm.createProposal({
 		kind, target_id: '', title: '시험', summary: '시험',
 		payload: { config: kind === 'script_upsert' ? { alias: 's', sequence: actions } : { alias: 'a', triggers, actions } },
