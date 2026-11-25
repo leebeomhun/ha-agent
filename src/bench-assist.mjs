@@ -22,20 +22,8 @@ export const DEFAULT_MODELS = [
 ]
 
 // expect: 시도해야 하는 제어 [entity_id, service, option?] 목록. 빈 배열이면 제어하면 안 되는 질문.
-export const DEFAULT_CASES = [
-	{ text: '주방 불 켜줘', expect: [['switch.setagsil_seuwici_seuwici_2', 'turn_on']] },
-	{ text: '거실 불 꺼줘', expect: [['switch.geosil_seuwici', 'turn_off']] },
-	{ text: '화장실 환풍기 켜 줘', expect: [['light.hwanpunggi', 'turn_on']] },
-	{ text: '공기청정기 속도 높음으로 바꿔줘', expect: [['select.geosil_gonggiceongjeonggi_speed', 'select_option', 'high']] },
-	{ text: '환풍기 자동 제어 꺼줘', expect: [['input_boolean.hwanpunggi_auto', 'turn_off']] },
-	{ text: '공기청정기 끄고 거실 불도 꺼줘', expect: [['switch.geosil_gonggiceongjeonggi_power', 'turn_off'], ['switch.geosil_seuwici', 'turn_off']] },
-	{ text: '지금 화장실 습도 몇 퍼센트야?', expect: [] },
-	{ text: '거실 TV 켜져 있어?', expect: [] },
-	{ text: '오늘 화장실 환풍기 몇 번 켜졌어?', expect: [] },
-	{ text: '코나 시동 걸어줘', expect: [] },
-	{ text: '주방 하이라이트 꺼줘', expect: [] },
-	{ text: '안녕', expect: [] },
-]
+import { DEFAULT_CASES } from './orchestrator/assist-cases.mjs'
+export { DEFAULT_CASES }
 
 // 대략적인 표준 가격(1M 토큰당 달러: 입력, 출력, 캐시 입력). Gemini 캐시 할인은 반영하지 않은 상한값.
 const PRICE = {

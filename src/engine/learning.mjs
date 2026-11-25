@@ -10,11 +10,13 @@ import { dirname, join } from 'node:path'
 import { P, DAY, kst, readJson, writeJson, newId, globs } from '../util.mjs'
 import { recentFires } from '../rules.mjs'
 import { jaccard, tokenize } from '../core/embeddings.mjs'
+import { HUMAN_ORIGINS, isHumanChange } from './origin.mjs'
 
 const MIN = 60000
 const CORRECTION_RE = /(아니야|아니[,.\s]|그게\s*아니|취소해|왜\s*껐|왜\s*켰|잘못\s*(?:껐|켰|바꿨|알아)|다시\s*원래대로|그만해)/
 const ROUTINE_DOMAINS = new Set(['light', 'switch', 'media_player', 'fan', 'climate', 'input_boolean', 'cover'])
 const ACTIVE_STATES = new Set(['on', 'playing', 'open', 'heat', 'cool', 'auto'])
+const INACTIVE_STATES = new Set(['off', 'closed', 'standby'])
 
 // ── 1) HA 재시작/재연결 스파이크 필터 ──
 // 짧은 창(기본 90초) 안에 서로 다른 엔티티가 N개(기본 15개) 이상 한꺼번에 바뀌면 재부팅/재연결 버스트로 간주해 제외한다.
@@ -86,6 +88,17 @@ export class ImplicitFeedbackTracker {
 		this.evalPath = evalPath
 		// 최근 에이전트가 실행한 제어 추적(entity_id → { aid, prevState, toState, ts, reason })
 		this.recentControls = new Map()
+		// 최근 HA 자동화가 바꾼 기기(entity_id → { automation, from, to, ts }) — 사람이 곧바로 되돌리면 자동화가 틀린 것
+		this.recentAutomation = new Map()
+		// 최근 보낸 규칙 알림({ nid, rule_ids, entity_ids, ts, acted }) — 알림 뒤 사람이 그 기기를 만지면 알림이 쓸모 있었던 것
+		this.recentAlerts = []
+	}
+
+	trackAlert({ nid, rule_ids = [], entity_ids = [], ts = Date.now() } = {}) {
+		const ents = [...new Set(entity_ids.filter(Boolean))]
+		if (!nid || !ents.length) return
+		this.recentAlerts.push({ nid, rule_ids, entity_ids: ents, ts, acted: false })
+		if (this.recentAlerts.length > 50) this.recentAlerts.shift()
 	}
 
 	#evalPath() { return this.evalPath ?? evalCasesPath() }
@@ -104,37 +117,74 @@ export class ImplicitFeedbackTracker {
 		})
 	}
 
-	// 에이전트 제어 후 15분 이내에 사람이 이전 상태로 되돌렸는지 실시간 감지
-	onStateEvent(change, { now = Date.now(), windowMs = 15 * MIN } = {}) {
+	// 상태 변화 하나로 세 가지를 본다. change.origin(user·device·automation·agent)이 없으면(예전 기록·시험) 사람 조작일 수도 있다고 본다.
+	// 1) 집 비서가 제어한 기기를 사람이 15분 안에 되돌림 → action_reverted(-1)
+	// 2) HA 자동화가 바꾼 기기를 사람이 15분 안에 되돌림 → automation_overridden(-1, ref_id=자동화)
+	// 3) 규칙 알림 뒤 30분 안에 사람이 그 기기를 만짐 → notification_acted(+1, ref_id=알림)
+	// 돌려주는 값: 기록한 것 중 첫 번째(없으면 null)
+	onStateEvent(change, { now = Date.now(), windowMs = 15 * MIN, alertWindowMs = 30 * MIN } = {}) {
 		if (!change?.id) return null
+		const human = isHumanChange(change) // true·false·null(모름)
+		const recorded = []
+		const rec = r => { this.store?.recordImplicitFeedback(r); recorded.push(r) }
+
 		const tracked = this.recentControls.get(change.id)
-		if (!tracked) return null
-		if (now - tracked.ts > windowMs) {
-			this.recentControls.delete(change.id)
-			return null
-		}
-		// 제어 직후 3초 이내의 바운스는 무시
-		if (now - tracked.ts < 3000) return null
-		if (String(change.to) === tracked.prevState && String(change.from) === tracked.toState) {
-			this.recentControls.delete(change.id)
-			const rec = {
-				ts: now,
-				kind: 'action_reverted',
-				entity_id: change.id,
-				ref_id: tracked.aid,
-				score: -1,
-				detail: {
-					from: tracked.toState,
-					to: tracked.prevState,
-					after_sec: Math.round((now - tracked.ts) / 1000),
-					reason: tracked.reason,
-					requested: tracked.requested,
-				},
+		if (tracked) {
+			if (now - tracked.ts > windowMs) this.recentControls.delete(change.id)
+			// 제어 직후 3초 이내의 바운스는 무시, 사람이 아닌 쪽(자동화·집 비서)이 되돌린 것도 사람의 거부가 아니다
+			else if (now - tracked.ts >= 3000 && human !== false
+				&& String(change.to) === tracked.prevState && String(change.from) === tracked.toState) {
+				this.recentControls.delete(change.id)
+				rec({
+					ts: now,
+					kind: 'action_reverted',
+					entity_id: change.id,
+					ref_id: tracked.aid,
+					score: -1,
+					detail: {
+						from: tracked.toState,
+						to: tracked.prevState,
+						after_sec: Math.round((now - tracked.ts) / 1000),
+						reason: tracked.reason,
+						requested: tracked.requested,
+						origin: change.origin ?? null,
+					},
+				})
 			}
-			this.store?.recordImplicitFeedback(rec)
-			return rec
 		}
-		return null
+
+		if (change.origin === 'automation') {
+			this.recentAutomation.set(change.id, { automation: change.actor ?? null, from: String(change.from), to: String(change.to), ts: now })
+			if (this.recentAutomation.size > 300) this.recentAutomation.delete(this.recentAutomation.keys().next().value)
+		} else if (human === true) {
+			const a = this.recentAutomation.get(change.id)
+			if (a && now - a.ts <= windowMs && now - a.ts >= 3000 && String(change.to) === a.from && String(change.from) === a.to) {
+				this.recentAutomation.delete(change.id)
+				rec({
+					ts: now,
+					kind: 'automation_overridden',
+					entity_id: change.id,
+					ref_id: a.automation,
+					score: -1,
+					detail: { automation: a.automation, automation_set: a.to, user_set: String(change.to), after_sec: Math.round((now - a.ts) / 1000), origin: change.origin },
+				})
+			} else if (a && now - a.ts > windowMs) this.recentAutomation.delete(change.id)
+
+			for (const al of this.recentAlerts) {
+				if (al.acted || now - al.ts > alertWindowMs || now < al.ts || !al.entity_ids.includes(change.id)) continue
+				al.acted = true
+				rec({
+					ts: now,
+					kind: 'notification_acted',
+					entity_id: change.id,
+					ref_id: al.nid,
+					score: 1,
+					detail: { rule_ids: al.rule_ids, after_sec: Math.round((now - al.ts) / 1000), to: String(change.to) },
+				})
+			}
+			this.recentAlerts = this.recentAlerts.filter(al => now - al.ts <= alertWindowMs)
+		}
+		return recorded[0] ?? null
 	}
 
 	onActionButtonOutcome(rec, status, now = Date.now()) {
@@ -159,6 +209,11 @@ export class ImplicitFeedbackTracker {
 			rejected: ['proposal_rejected', -1],
 			rolled_back: ['proposal_rolled_back', -1],
 			rollback_failed: ['proposal_rollback_failed', -1],
+			// 승인도 거절도 없이 기한이 지남 = 제안이 관심을 끌지 못함
+			ignored: ['proposal_ignored', -0.5],
+			// 집 비서가 만든 자동화를 사용자가 직접 고치거나 지움
+			edited_by_user: ['proposal_edited_by_user', -0.5],
+			deleted_by_user: ['proposal_deleted_by_user', -1],
 			validation_failed: ['proposal_validation_failed', -0.5],
 		}
 		const mapped = kindMap[status]
@@ -321,19 +376,24 @@ export function mineRoutines({ store, now = Date.now(), days = 42, isNoise = () 
 	}
 	presence_routines.sort((a, b) => b.observed_days - a.observed_days)
 
-	// B) 반복 기기 활성화 루틴 (30분 슬롯 단위)
-	const devSlots = new Map() // `${id}|${dayType}|${slot30}` -> { name, dates: Set }
+	// B) 반복 기기 켜기·끄기 루틴 (30분 슬롯 단위). 조작 주체가 기록된 변화는 사람(앱·벽 스위치) 조작만 센다
+	//    — 이미 있는 자동화가 한 일을 루틴으로 보면 같은 자동화를 또 제안하게 된다.
+	const devSlots = new Map() // `${id}|${dayType}|${direction}|${slot30}` -> { name, dates: Set, mins: [] }
 	for (const e of events) {
 		const dom = e.id.split('.')[0]
 		if (!ROUTINE_DOMAINS.has(dom) || isNoise(e.id)) continue
-		if (!ACTIVE_STATES.has(e.to)) continue
+		if (e.origin && !HUMAN_ORIGINS.has(e.origin)) continue
+		const direction = ACTIVE_STATES.has(e.to) ? 'on' : (INACTIVE_STATES.has(e.to) && ACTIVE_STATES.has(e.from)) ? 'off' : null
+		if (!direction) continue
 		const dt = dayTypeOf(e.t)
 		const k = kst(new Date(e.t))
-		const slot = Math.floor((k.h * 60 + k.mi) / 30)
-		const key = `${e.id}|${dt}|${slot}`
+		const minOfDay = k.h * 60 + k.mi
+		const slot = Math.floor(minOfDay / 30)
+		const key = `${e.id}|${dt}|${direction}|${slot}`
 		let rec = devSlots.get(key)
-		if (!rec) { rec = { entity_id: e.id, name: e.name ?? e.id, day_type: dt, slot, dates: new Set() }; devSlots.set(key, rec) }
+		if (!rec) { rec = { entity_id: e.id, name: e.name ?? e.id, day_type: dt, direction, slot, dates: new Set(), mins: new Map() }; devSlots.set(key, rec) }
 		rec.dates.add(k.date)
+		if (!rec.mins.has(k.date)) rec.mins.set(k.date, minOfDay)
 	}
 
 	const device_routines = []
@@ -346,6 +406,9 @@ export function mineRoutines({ store, now = Date.now(), days = 42, isNoise = () 
 			entity_id: rec.entity_id,
 			name: rec.name,
 			day_type: rec.day_type,
+			direction: rec.direction,
+			median_time: fmtMin(median([...rec.mins.values()])),
+			dates: [...rec.dates].sort(),
 			window: `${fmtMin(rec.slot * 30)}~${fmtMin((rec.slot + 1) * 30)}`,
 			observed_days: rec.dates.size,
 			total_days: totalDays,
@@ -358,7 +421,7 @@ export function mineRoutines({ store, now = Date.now(), days = 42, isNoise = () 
 		period_days: days,
 		filtered_restart_events: removed,
 		presence_routines: presence_routines.slice(0, 10),
-		device_routines: device_routines.slice(0, 15),
+		device_routines: device_routines.slice(0, 20),
 	}
 }
 
@@ -685,7 +748,7 @@ export function judgeExperiment(before = {}, after = {}) {
 	return { verdict, notes, signals }
 }
 
-export function registerExperiment(store, { kind, ref_id = null, title, evalDays = 7, now = Date.now(), scope = undefined }) {
+export function registerExperiment(store, { kind, ref_id = null, title, evalDays = 7, now = Date.now(), scope = undefined, revert = null }) {
 	if (!store) return null
 	// 범위를 넘기지 않으면 종류에서 짐작한다(규칙 → 그 규칙, 교훈 → 그 교훈이 쓰이는 경로).
 	const resolved = scope !== undefined ? scope
@@ -693,6 +756,8 @@ export function registerExperiment(store, { kind, ref_id = null, title, evalDays
 			: kind === 'lesson' && ref_id ? lessonExperimentScope(store.getLesson(ref_id)?.scope)
 				: null
 	const baseline = collectMetricsSnapshot(store, now, 7, resolved)
+	// 악화로 판정되면 되돌릴 수 있게 바꾸기 전 모습을 함께 둔다(규칙: 이전 판, 새로 만든 규칙이면 null)
+	if (revert) baseline.revert = revert
 	return store.upsertExperiment({
 		eid: `exp_${newId()}`,
 		ts: now,
@@ -764,7 +829,7 @@ export function buildLearningDigest({ store, rules = [], runtime = {}, cfg = {},
 		sections.push(`- 통계적 출퇴근·재실 루틴: ${routines.presence_routines.slice(0, 4).map(r => `${r.entity_id} ${r.day_type} ${r.direction} 중앙 ${r.median_time}(IQR ${r.iqr_min ?? '?'}분, ${r.observed_days}/${r.total_days}일 ${r.consistency_pct}%)`).join(' / ')}`)
 	}
 	if (routines.device_routines.length) {
-		sections.push(`- 통계적 반복 기기 조작: ${routines.device_routines.slice(0, 5).map(r => `${r.name}(${r.entity_id}) ${r.day_type} ${r.window} (${r.observed_days}/${r.total_days}일 ${r.consistency_pct}%)`).join(' / ')}`)
+		sections.push(`- 통계적 반복 기기 조작(사람 조작 기준): ${routines.device_routines.slice(0, 5).map(r => `${r.name}(${r.entity_id}) ${r.day_type} ${r.window} ${r.direction === 'off' ? '끄기' : '켜기'} (${r.observed_days}/${r.total_days}일 ${r.consistency_pct}%)`).join(' / ')}`)
 	}
 
 	// 4) 실험 원장 결과 (최근 평가 완료 또는 대기 중)

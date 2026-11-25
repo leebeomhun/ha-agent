@@ -20,6 +20,7 @@ const ALL_ACTIONS = new Set(Object.values(ACTION_SERVICES).flat())
 const PROPOSAL_KINDS = new Set([
 	'automation_upsert', 'automation_delete', 'automation_toggle', 'script_upsert', 'script_delete',
 	'reload_config_entry', 'backup_create', 'entity_admin', 'promote_rule',
+	'scene_upsert', 'scene_delete', 'helper_upsert', 'helper_delete',
 	'self_alias_proposal', 'self_noise_proposal', 'self_stt_tune', 'self_lesson_proposal',
 ])
 const MEMORY_CATS = new Set(['preference', 'standing_order', 'incident', 'pattern', 'rejection'])

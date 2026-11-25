@@ -33,10 +33,10 @@ export const MEMORY_DEFAULT_PRIORITY = {
 
 // 기억을 바꾸고 지울 수 있는 권한은 출처에 따라 세 단계로 나뉜다.
 // 1) 사용자 직접 조작(콘솔·CLI·알림 답장 판단의 user): 무엇이든 바꿀 수 있다.
-// 2) 사용자 대화에서 나온 것(Assist 대화의 기억 도구·대화 직후 추출기·제안 거절): 1)이 만든 것과 고정된 것은 못 바꾼다.
+// 2) 사용자에게서 나온 것(Assist 대화의 기억 도구·대화 직후 추출기·제안 거절·사용자의 자동화 직접 수정): 1)이 만든 것과 고정된 것은 못 바꾼다.
 // 3) 백그라운드 자동(cycle·agent·tool·정리 등): 1)·2)가 만든 것과 고정된 것은 못 바꾼다.
 export const USER_SOURCES = new Set(['user', 'cli', 'console'])
-export const CONVERSATION_SOURCES = new Set(['assist_user', 'extractor', 'user_rejection'])
+export const CONVERSATION_SOURCES = new Set(['assist_user', 'extractor', 'user_rejection', 'user_edit'])
 
 // 이 출처(source)가 기존 기억(prev)을 바꾸거나 지울 수 없으면 그 까닭을, 할 수 있으면 null을 돌려준다.
 export function memoryWriteBlock(prev, source, { force = false } = {}) {
@@ -312,6 +312,11 @@ export class Store {
 			);
 		`)
 		this.#addColumn('actions', 'name', 'TEXT')
+		// 상태 변화를 일으킨 쪽(user·device·automation·agent)과 그 주체(자동화 entity_id 등). 예전 기록은 NULL.
+		this.#addColumn('events', 'origin', 'TEXT')
+		this.#addColumn('events', 'actor', 'TEXT')
+		// 실험 판정 뒤 후속 조치(규칙 원복·롤백 알림·교훈 비활성화)를 했는지
+		this.#addColumn('experiments', 'actioned_at', 'INTEGER')
 		this.#addColumn('sensor_samples', 'context', 'TEXT')
 		this.#addColumn('memory_items', 'priority', 'INTEGER DEFAULT 3')
 		this.#addColumn('memory_items', 'pinned', 'INTEGER DEFAULT 0')
@@ -429,17 +434,17 @@ export class Store {
 		}
 	}
 
-	recordEvent({ t, id, name = null, from = null, to = null, isNoise = false }) {
-		this.db.prepare('INSERT INTO events (ts, entity_id, name, old_state, new_state, is_noise) VALUES (?, ?, ?, ?, ?, ?)')
-			.run(t, id, name, from, to, isNoise ? 1 : 0)
+	recordEvent({ t, id, name = null, from = null, to = null, isNoise = false, origin = null, actor = null }) {
+		this.db.prepare('INSERT INTO events (ts, entity_id, name, old_state, new_state, is_noise, origin, actor) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+			.run(t, id, name, from, to, isNoise ? 1 : 0, origin, actor)
 	}
 
 	recentEvents({ sinceMs = 0, entityId = null, limit = 500 } = {}) {
 		if (entityId) {
-			return this.db.prepare('SELECT ts AS t, entity_id AS id, name, old_state AS "from", new_state AS "to", is_noise FROM events WHERE ts >= ? AND entity_id = ? ORDER BY ts DESC LIMIT ?')
+			return this.db.prepare('SELECT ts AS t, entity_id AS id, name, old_state AS "from", new_state AS "to", is_noise, origin, actor FROM events WHERE ts >= ? AND entity_id = ? ORDER BY ts DESC LIMIT ?')
 				.all(sinceMs, entityId, limit).reverse()
 		}
-		return this.db.prepare('SELECT ts AS t, entity_id AS id, name, old_state AS "from", new_state AS "to", is_noise FROM events WHERE ts >= ? ORDER BY ts DESC LIMIT ?')
+		return this.db.prepare('SELECT ts AS t, entity_id AS id, name, old_state AS "from", new_state AS "to", is_noise, origin, actor FROM events WHERE ts >= ? ORDER BY ts DESC LIMIT ?')
 			.all(sinceMs, limit).reverse()
 	}
 
@@ -580,6 +585,7 @@ export class Store {
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT(pid) DO UPDATE SET
 				status = excluded.status, decided_at = COALESCE(excluded.decided_at, proposals.decided_at),
+				payload = COALESCE(excluded.payload, proposals.payload),
 				applied_at = COALESCE(excluded.applied_at, proposals.applied_at),
 				rollback_at = COALESCE(excluded.rollback_at, proposals.rollback_at),
 				error = excluded.error, pre_snapshot = COALESCE(excluded.pre_snapshot, proposals.pre_snapshot),
@@ -1051,6 +1057,17 @@ export class Store {
 		return this.#mapExperiment(this.db.prepare('SELECT * FROM experiments WHERE eid = ?').get(eid))
 	}
 
+	// 판정은 났는데(개선·악화) 아직 후속 조치를 하지 않은 실험
+	unactionedExperiments({ verdicts = ['improved', 'regressed'], limit = 50 } = {}) {
+		return this.db.prepare(`SELECT * FROM experiments WHERE actioned_at IS NULL AND status IN (${verdicts.map(() => '?').join(',')}) ORDER BY evaluated_at ASC LIMIT ?`)
+			.all(...verdicts, limit).map(r => this.#mapExperiment(r))
+	}
+
+	markExperimentActioned(eid, now = Date.now(), note = null) {
+		this.db.prepare(`UPDATE experiments SET actioned_at = ?${note ? ", notes = COALESCE(notes, '') || ?" : ''} WHERE eid = ?`)
+			.run(...[now, ...(note ? [` / 조치: ${note}`] : []), eid])
+	}
+
 	listExperiments({ status = null, dueBefore = null, limit = 50 } = {}) {
 		const clauses = []
 		const params = []
@@ -1129,8 +1146,8 @@ export class Store {
 
 	eventsInRange(sinceMs = 0, untilMs = Infinity) {
 		const rows = Number.isFinite(untilMs)
-			? this.db.prepare('SELECT ts AS t, entity_id AS id, name, old_state AS "from", new_state AS "to", is_noise FROM events WHERE ts >= ? AND ts < ? ORDER BY ts ASC').all(sinceMs, untilMs)
-			: this.db.prepare('SELECT ts AS t, entity_id AS id, name, old_state AS "from", new_state AS "to", is_noise FROM events WHERE ts >= ? ORDER BY ts ASC').all(sinceMs)
+			? this.db.prepare('SELECT ts AS t, entity_id AS id, name, old_state AS "from", new_state AS "to", is_noise, origin, actor FROM events WHERE ts >= ? AND ts < ? ORDER BY ts ASC').all(sinceMs, untilMs)
+			: this.db.prepare('SELECT ts AS t, entity_id AS id, name, old_state AS "from", new_state AS "to", is_noise, origin, actor FROM events WHERE ts >= ? ORDER BY ts ASC').all(sinceMs)
 		return rows
 	}
 

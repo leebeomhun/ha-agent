@@ -8,13 +8,14 @@ export function adminTools() {
 	return [
 		{
 			name: 'ha_propose_admin',
-			description: '자동화/스크립트 생성·수정·삭제, 통합 리로드, 백업 생성, 엔티티 정리, 규칙 승격, 자가 튜닝(별칭·소음·STT·교훈)을 검증·Diff와 함께 Tier 2 승인 제안으로 등록한다',
+			description: '자동화/스크립트/씬/헬퍼 생성·수정·삭제, 통합 리로드, 백업 생성, 엔티티 정리(방·라벨·별칭·이름), 규칙 승격, 자가 튜닝(별칭·소음·STT·교훈)을 검증·Diff와 함께 Tier 2 승인 제안으로 등록한다. 씬: scene_upsert payload {config:{name, entities:{entity_id: 상태 또는 {state, 속성...}}}}. 헬퍼: helper_upsert payload {domain:input_boolean|input_number|input_select|input_text|input_datetime|input_button|counter|timer, id:(고칠 때만), config:{name, ...}}',
 			properties: {
 				kind: {
 					type: 'string',
 					enum: [
 						'automation_upsert', 'automation_delete', 'automation_toggle', 'script_upsert', 'script_delete',
 						'reload_config_entry', 'backup_create', 'entity_admin', 'promote_rule',
+						'scene_upsert', 'scene_delete', 'helper_upsert', 'helper_delete',
 						'self_alias_proposal', 'self_noise_proposal', 'self_stt_tune', 'self_lesson_proposal',
 					],
 					description: '관리 또는 자가개선 제안 종류',

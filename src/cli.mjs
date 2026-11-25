@@ -15,6 +15,11 @@ import { checkOobSlackConfig, checkOobKakaoConfig } from './oob.mjs'
 import { HA } from './ha.mjs'
 import { HaAdmin } from './admin/ha-admin.mjs'
 import { geminiKey } from './llm/providers/gemini.mjs'
+import { buildScorecard, renderScorecard } from './engine/scorecard.mjs'
+import { suggestAutomations } from './engine/automation-suggest.mjs'
+import { scanDeviceHealth } from './engine/device-health.mjs'
+import { fastPathCases, runFastPathRegression, directoryIndexFor } from './engine/regression.mjs'
+import { globs } from './util.mjs'
 
 const [cmd, ...rest] = process.argv.slice(2)
 const daemonPid = () => { const p = Number(existsSync(P.pid) ? readFileSync(P.pid, 'utf8') : 0); try { return p && process.kill(p, 0) ? p : 0 } catch { return 0 } }
@@ -249,6 +254,64 @@ const cmds = {
 	},
 	evals() {
 		console.log(JSON.stringify(loadEvalCases(), null, 2))
+	},
+	// 자기 성능 지표(주 단위 추세)
+	scorecard() {
+		const st = new Store()
+		try {
+			const sc = buildScorecard({ store: st, weeks: Number(rest[0]) || 4, regression: readJson(P.runtime, {}).last_regression ?? null })
+			if (rest.includes('--json')) return console.log(JSON.stringify(sc, null, 2))
+			console.log(renderScorecard(sc))
+		} finally { st.close() }
+	},
+	// 생활 루틴 → 자동화 제안. 기본은 계산만(dry), apply면 데몬을 통해 승인 대기 제안으로 올린다.
+	async 'suggest-automations'() {
+		const cfg = loadConfig()
+		const apply = rest[0] === 'apply'
+		const ipc = await assistIpc(cfg, apply ? 'POST' : 'GET', '/api/automation-suggestions').catch(() => null)
+		let res = ipc
+		if (!res) {
+			if (apply) return console.log('데몬이 돌고 있지 않아 제안을 올릴 수 없어요(계산만 하려면 apply 없이 실행)')
+			const st = new Store()
+			try {
+				res = await withLiveHa(cfg, async (ha, states) => {
+					const autoCfg = {}
+					for (const id of [...states.keys()].filter(i => i.startsWith('automation.'))) {
+						try { autoCfg[id] = (await ha.call({ type: 'automation/config', entity_id: id }))?.config } catch {}
+					}
+					return suggestAutomations({ store: st, ha, states, meta: { autoCfg }, policy: new PolicyEngine(cfg), cfg, isNoise: globs(cfg.noise_entities), proposals: st.listProposals({ limit: 500 }), dry: true })
+				})
+			} finally { st.close() }
+		}
+		const label = { eligible: '✅ 제안 가능', proposed: '📨 제안함', skipped: '·' }
+		for (const c of res.candidates ?? []) {
+			const bt = c.backtest?.[0]
+			console.log(`${label[c.status] ?? c.status} ${c.name} (${c.entity_id}) ${c.day_type} ${c.window} ${c.direction === 'on' ? '켜기' : '끄기'} — ${c.status === 'skipped' ? `건너뜀: ${c.reason}${c.automations ? ` [${c.automations.join(', ')}]` : ''}` : ''}${bt ? ` 백테스트(${bt.trigger}): 맞음 ${bt.agree}·불필요 ${bt.unwanted}·놓침 ${bt.missed}` : ''}${c.attribution ? ` 주체 ${JSON.stringify(c.attribution)}` : ''}`)
+			if (c.evidence && c.status !== 'skipped') console.log(`    ${c.evidence}`)
+		}
+		if (!(res.candidates ?? []).length) console.log('루틴 후보가 없어요')
+		if (res.created?.length) console.log(`새 제안 ${res.created.length}건: ${res.created.map(p => p.pid).join(', ')}`)
+	},
+	// 기기 건강(응답 없음·배터리·신호·방 미지정)
+	async health() {
+		const cfg = loadConfig()
+		const ipc = await assistIpc(cfg, 'GET', '/api/health').catch(() => null)
+		const res = ipc ?? await withLiveHa(cfg, async (ha, states) => scanDeviceHealth({ states, cfg, isNoise: globs(cfg.noise_entities) }))
+		console.log(JSON.stringify(res, null, 2))
+	},
+	// Assist 빠른 경로 회귀 평가(LLM 없이)
+	async regression() {
+		const cfg = loadConfig()
+		const ipc = await assistIpc(cfg, 'GET', '/api/regression').catch(() => null)
+		const res = ipc ?? await withLiveHa(cfg, async (ha, states) => runFastPathRegression({ index: directoryIndexFor({ policy: new PolicyEngine(cfg), states, cfg }), cases: fastPathCases() }))
+		console.log(`빠른 경로 회귀 평가: ${res.passed}/${res.total} 통과${res.skipped ? ` (기대값 없는 사례 ${res.skipped}건 제외)` : ''}`)
+		for (const f of res.failed ?? []) console.log(`  ✘ "${f.text}" → ${f.got ? f.got.join(' ') : '없음'} (기대 ${f.expect.map(e => e.join(' ')).join(', ') || '제어 없음'})`)
+	},
+	// 하루 자가개선 작업을 지금 한 번 돌린다(데몬 필요)
+	async 'daily-learning'() {
+		const cfg = loadConfig()
+		const ipc = await assistIpc(cfg, 'POST', '/api/learning/daily').catch(e => ({ error: e.message }))
+		console.log(JSON.stringify(ipc ?? { error: '데몬이 돌고 있지 않음' }, null, 2))
 	},
 	async 'self-tune'() {
 		const cfg = loadConfig(), rules = readJson(P.rules, null)?.rules ?? []
@@ -674,7 +737,7 @@ const cmds = {
 }
 
 if (!cmds[cmd]) {
-	console.log('명령: status | policy | rules | log [n] | notes [YYYY-MM-DD] | actions [n] | memory [list|search|add|rm|pin|unpin|history|restore|consolidate] | learning | routines [일수] | experiments [eval] | evals | self-tune [propose] | proposals [list|show|approve|reject|rollback] | audit | traces [id] | assist <말> | stats [일수] | doctor | weekly [list|run|publish|YYYY-MM-DD] | wake [이유] | say <말> | brain [codex|api|agy|gemini|default] | pause | resume | send-on | send-off | history | restore <파일> | runs [n] | replay [이름|latest] [codex|api|agy|gemini] | oob-test | once [bootstrap|hourly|weekly|manual] [이유] | bench-assist [provider:model[:effort] ...] [--repeat N] [--learned] [--case 말]')
+	console.log('명령: status | policy | rules | log [n] | notes [YYYY-MM-DD] | actions [n] | memory [list|search|add|rm|pin|unpin|history|restore|consolidate] | learning | routines [일수] | experiments [eval] | evals | scorecard [주수] [--json] | suggest-automations [apply] | health | regression | daily-learning | self-tune [propose] | proposals [list|show|approve|reject|rollback] | audit | traces [id] | assist <말> | stats [일수] | doctor | weekly [list|run|publish|YYYY-MM-DD] | wake [이유] | say <말> | brain [codex|api|agy|gemini|default] | pause | resume | send-on | send-off | history | restore <파일> | runs [n] | replay [이름|latest] [codex|api|agy|gemini] | oob-test | once [bootstrap|hourly|weekly|manual] [이유] | bench-assist [provider:model[:effort] ...] [--repeat N] [--learned] [--case 말]')
 	process.exit(cmd ? 1 : 0)
 }
 await cmds[cmd]()

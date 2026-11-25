@@ -5,7 +5,11 @@ import { EventEmitter } from 'node:events'
 import { log } from './util.mjs'
 
 export const HEARTBEAT_EVENT = 'haagent_heartbeat'
+// 설정 화면의 "도우미(헬퍼)" 도메인. 목록 조회는 늘 허용하고, 만들기·고치기·지우기는 승인된 관리 제안을 적용할 때만(allowConfigWrite) 허용한다.
+export const HELPER_DOMAINS = ['input_boolean', 'input_number', 'input_select', 'input_text', 'input_datetime', 'input_button', 'counter', 'timer']
+const HELPER_WRITE_TYPES = new Set(HELPER_DOMAINS.flatMap(d => [`${d}/create`, `${d}/update`, `${d}/delete`]))
 const READ_TYPES = [
+	...HELPER_DOMAINS.map(d => `${d}/list`),
 	'get_states', 'subscribe_events', 'ping', 'history/history_during_period',
 	'config/area_registry/list', 'config/device_registry/list', 'config/entity_registry/list',
 	'config/label_registry/list', 'config/floor_registry/list',
@@ -46,7 +50,14 @@ const LEGACY_ACTION_SERVICES = {
 }
 
 // 보내기 전 검사. 통과하지 못하면 이유를 돌려준다.
-export function checkMessage(msg, { services, actionEntities = new Set(), policy = null }) {
+export function checkMessage(msg, { services, actionEntities = new Set(), policy = null, allowConfigWrite = false }) {
+	if (HELPER_WRITE_TYPES.has(msg.type)) {
+		if (!allowConfigWrite) return `승인된 관리 제안 밖에서는 헬퍼를 바꿀 수 없다: ${msg.type}`
+		const domain = msg.type.split('/')[0]
+		const id = msg[`${domain}_id`]
+		if (id != null && policy?.isTier3Blocked?.(`${domain}.${id}`)) return `안전 정책(Tier 3)으로 차단된 대상: ${domain}.${id}`
+		return null
+	}
 	if (!ALLOWED_TYPES.has(msg.type)) return `허용되지 않은 명령: ${msg.type}`
 	if (msg.type === 'fire_event' && msg.event_type !== HEARTBEAT_EVENT) return `허용되지 않은 이벤트: ${msg.event_type}`
 	if (msg.type !== 'call_service') return null
@@ -184,6 +195,8 @@ export class HA extends EventEmitter {
 	async #ready() {
 		await this.#subscribe('state_changed', 'state')
 		await this.#subscribe('mobile_app_notification_action', 'action')
+		// 어떤 자동화가 돌았는지(그 실행 context로 바뀐 상태 변화를 자동화가 한 일로 본다)
+		await this.#subscribe('automation_triggered', 'automation_triggered')
 		const states = await this.call({ type: 'get_states' })
 		clearTimeout(this.openTimer)
 		this.connected = true

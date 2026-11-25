@@ -5,6 +5,8 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { expandHome, log, DAY } from '../util.mjs'
 import { mineRoutines, scoreRules, generateSelfProposals, loadEvalCases, evaluateExperiment, evaluateDueExperiments } from '../engine/learning.mjs'
+import { renderScorecard } from '../engine/scorecard.mjs'
+import { scanDeviceHealth } from '../engine/device-health.mjs'
 
 const MAX_BODY = 256 * 1024
 const MAX_AUDIO_BODY = 10 * 1024 * 1024
@@ -244,6 +246,9 @@ pre{background:#0b1220;padding:10px;border-radius:8px;overflow:auto;font-size:12
     <div class="row" style="justify-content:space-between;margin-bottom:10px">
       <strong>자가학습 · 교훈(Playbook) · 사후 검증 실험</strong>
       <div class="row">
+        <button class="sec" onclick="showScorecard()">성능 지표</button>
+        <button class="sec" onclick="findAutomations()">루틴 자동화 후보 보기</button>
+        <button class="sec" onclick="proposeAutomations()">루틴 자동화 제안 올리기</button>
         <button class="sec" onclick="proposeSelf()">자가 튜닝 후보 제안 등록</button>
         <button class="sec" onclick="loadLearning()">새로고침</button>
       </div>
@@ -371,7 +376,7 @@ async function toggleMic(){
     infoEl.textContent = '듣고 있어요... 다시 누르면 전송합니다.';
   } catch (err) { infoEl.textContent = '마이크 오류: ' + err.message; }
 }
-const ROLLBACK_KINDS = new Set(['automation_upsert','automation_delete','automation_toggle','script_upsert','script_delete','promote_rule','self_alias_proposal','self_noise_proposal','self_stt_tune','self_lesson_proposal']);
+const ROLLBACK_KINDS = new Set(['automation_upsert','automation_delete','automation_toggle','script_upsert','script_delete','promote_rule','scene_upsert','scene_delete','helper_upsert','helper_delete','self_alias_proposal','self_noise_proposal','self_stt_tune','self_lesson_proposal']);
 async function loadMemory(){
   try {
     const q = (document.getElementById('mSearch')?.value || '').trim();
@@ -450,6 +455,25 @@ async function loadLearning(){
     pre.textContent = JSON.stringify(d, null, 2);
     box.appendChild(pre);
   } catch (err) { document.getElementById('learnOut').textContent = '불러오기 실패: ' + err.message; }
+}
+function showText(text){
+  const box = document.getElementById('learnOut'); box.textContent = '';
+  const pre = document.createElement('pre'); pre.textContent = text; box.appendChild(pre);
+}
+async function showScorecard(){
+  try { const r = await api('/api/scorecard'); showText(r.text); } catch (err) { showText('불러오기 실패: ' + err.message); }
+}
+function suggestionLines(r){
+  const lines = (r.candidates || []).map(c => (c.status === 'skipped' ? '· ' : c.status === 'proposed' ? '📨 ' : '✅ ') + c.name + ' ' + c.day_type + ' ' + c.window + ' ' + (c.direction === 'on' ? '켜기' : '끄기') + (c.status === 'skipped' ? ' — 건너뜀: ' + c.reason : '\\n    ' + (c.evidence || '')));
+  return (lines.length ? lines.join('\\n') : '루틴 후보가 없어요') + ((r.created || []).length ? '\\n\\n새 제안 ' + r.created.length + '건을 승인 대기에 올렸어요.' : '');
+}
+async function findAutomations(){
+  showText('계산 중...');
+  try { showText(suggestionLines(await api('/api/automation-suggestions'))); } catch (err) { showText('실패: ' + err.message); }
+}
+async function proposeAutomations(){
+  showText('제안 올리는 중...');
+  try { showText(suggestionLines(await api('/api/automation-suggestions', { method: 'POST' }))); loadProposals(); } catch (err) { showText('실패: ' + err.message); }
 }
 async function proposeSelf(){
   try {
@@ -803,7 +827,27 @@ export class AssistServer {
 				eval_cases: loadEvalCases(),
 				self_proposal_candidates: generateSelfProposals({ store: st, cfg: this.agent.cfg, rules: this.agent.engine.rules, states: this.agent.states, now }),
 				rollups: st ? { daily: st.listDailyRollups(14).length, monthly: st.listMonthlyRollups(12) } : null,
+				scorecard: this.agent.scorecardNow?.(now) ?? null,
 			})
+		}
+		if (method === 'GET' && path === '/api/scorecard') {
+			const sc = this.agent.scorecardNow?.(this.agent.clock()) ?? null
+			return sendJson(res, 200, { scorecard: sc, text: renderScorecard(sc) || '지표를 계산할 기록이 없어요' })
+		}
+		if (path === '/api/automation-suggestions' && (method === 'GET' || method === 'POST')) {
+			if (!this.agent.suggestAutomationsNow) return sendJson(res, 400, { error: '지원하지 않음' })
+			if (method === 'POST' && !this.agent.cfg.policy?.admin_enabled) return sendJson(res, 400, { error: 'HA 관리 권한(policy.admin_enabled)이 꺼져 있음' })
+			return sendJson(res, 200, await this.agent.suggestAutomationsNow({ dry: method === 'GET' }))
+		}
+		if (method === 'GET' && path === '/api/health') {
+			return sendJson(res, 200, scanDeviceHealth({ states: this.agent.states, meta: this.agent.meta ?? {}, cfg: this.agent.cfg, isNoise: this.agent.isNoise, now: this.agent.clock() }))
+		}
+		if (method === 'GET' && path === '/api/regression') {
+			return sendJson(res, 200, this.agent.regressionNow())
+		}
+		if (method === 'POST' && path === '/api/learning/daily') {
+			const r = await this.agent.runDailyLearning(this.agent.clock())
+			return sendJson(res, r ? 200 : 409, r ?? { error: '이미 도는 중이거나 저장소가 없음' })
 		}
 		if (method === 'POST' && path === '/api/lessons') {
 			if (!this.agent.store) return sendJson(res, 400, { error: '저장소 없음' })

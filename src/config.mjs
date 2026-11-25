@@ -56,7 +56,13 @@ export const DEFAULTS = {
 		enabled: true,
 		experiment_eval_days: 7,
 		auto_consolidate_on_reflection: true,
+		// 하루 한 번 자가개선 작업(실험 후속 조치·빠른 경로 회귀 평가·기기 건강·루틴 자동화 제안)을 도는 시각(KST, 0~23)
+		daily_hour: 19,
+		// 루틴 자동화 제안 기준(src/engine/automation-suggest.mjs의 SUGGEST_DEFAULTS를 덮어씀)
+		suggest: {},
 	},
+	// 기기 건강 점검 기준: 응답 없음 시간, 배터리 %, Zigbee LQI·Wi-Fi RSSI 하한
+	health: { unavailable_hours: 6, battery_pct: 20, lqi_min: 40, rssi_min: -85 },
 	// 판단 방식: 'codex'(Codex CLI를 격리해 실행) 또는 'api'(OpenAI API 직접 호출). 실행 중에는 `cli.mjs brain`으로 바꾼다.
 	brain: 'codex',
 	codex: {
@@ -237,6 +243,8 @@ export function validateConfig(cfg) {
 	if (!Number.isInteger(ah.start) || !Number.isInteger(ah.end) || ah.start < 0 || ah.end > 24 || ah.start >= ah.end) {
 		errors.push(`active_hours 범위 오류 (${ah.start}~${ah.end}, 0 <= start < end <= 24 정수 필요)`)
 	}
+	const dh = cfg?.learning?.daily_hour
+	if (dh != null && (!Number.isInteger(dh) || dh < 0 || dh > 23)) errors.push(`learning.daily_hour 오류 (${dh}, 0~23 정수 필요)`)
 	const rh = cfg?.reflection_hour
 	if (rh != null && (!Number.isInteger(rh) || rh < 0 || rh > 23)) errors.push(`reflection_hour 오류 (${rh}, null 또는 0~23 정수 필요)`)
 	if (cfg?.briefing_hours != null) {

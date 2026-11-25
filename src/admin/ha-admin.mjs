@@ -1,9 +1,12 @@
 // HA DevOps 관리: 자동화/스크립트 검증·Diff·Proposal 승인·자동/수동 롤백·규칙 승격·종합 건강 감사
 import { mkdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { P, newId, fmt, readJson, writeJson } from '../util.mjs'
+import { P, newId, fmt, readJson, writeJson, globs } from '../util.mjs'
 import { ADMIN_SERVICES, NON_ENTITY_TARGET_KEYS, PolicyEngine } from '../core/policy.mjs'
 import { mergeConfig, validateConfig } from '../config.mjs'
+import { HELPER_DOMAINS } from '../ha.mjs'
+import { checkAliasChange } from '../engine/regression.mjs'
+import { scanDeviceHealth } from '../engine/device-health.mjs'
 
 const ENTITY_REF_RE = /^[a-z_]+\.[a-z0-9_]+$/
 const JINJA_ENTITY_RE = /(?:states|is_state|state_attr|is_state_attr|has_value)\(\s*['"]([a-z_]+\.[a-z0-9_]+)['"]/g
@@ -11,7 +14,22 @@ const TPL_RE = /\{\{[\s\S]*?\}\}|\{%[\s\S]*?%\}/
 const RUNTIME_TEMPLATE_VARS = new Set(['trigger', 'this', 'context', 'repeat', 'wait'])
 const UNDEF_VAR_RE = /UndefinedError:\s*'([A-Za-z_][A-Za-z0-9_]*)' is undefined/
 export const SELF_PROPOSAL_KINDS = new Set(['self_alias_proposal', 'self_noise_proposal', 'self_stt_tune', 'self_lesson_proposal'])
-export const ROLLBACKABLE_KINDS = new Set(['automation_upsert', 'automation_delete', 'automation_toggle', 'script_upsert', 'script_delete', 'promote_rule', ...SELF_PROPOSAL_KINDS])
+export const ROLLBACKABLE_KINDS = new Set(['automation_upsert', 'automation_delete', 'automation_toggle', 'script_upsert', 'script_delete', 'promote_rule', 'scene_upsert', 'scene_delete', 'helper_upsert', 'helper_delete', ...SELF_PROPOSAL_KINDS])
+// HA 설정 파일(automations/scripts/scenes.yaml)을 바꾸는 제안: 적용 뒤 check_config, 실패하면 자동 롤백
+const CONFIG_FILE_KINDS = new Set(['automation_upsert', 'automation_delete', 'script_upsert', 'script_delete', 'promote_rule', 'scene_upsert', 'scene_delete'])
+export const configDomainOf = kind => (kind.startsWith('script') ? 'script' : kind.startsWith('scene') ? 'scene' : 'automation')
+// 헬퍼 도메인별로 받아 주는 설정 키(그 밖의 키는 버린다)
+const HELPER_FIELDS = {
+	input_boolean: ['name', 'icon', 'initial'],
+	input_number: ['name', 'icon', 'min', 'max', 'step', 'mode', 'unit_of_measurement', 'initial'],
+	input_select: ['name', 'icon', 'options', 'initial'],
+	input_text: ['name', 'icon', 'min', 'max', 'mode', 'pattern', 'initial'],
+	input_datetime: ['name', 'icon', 'has_date', 'has_time', 'initial'],
+	input_button: ['name', 'icon'],
+	counter: ['name', 'icon', 'initial', 'minimum', 'maximum', 'step', 'restore'],
+	timer: ['name', 'icon', 'duration', 'restore'],
+}
+const pickHelperFields = (domain, cfg = {}) => Object.fromEntries(Object.entries(cfg ?? {}).filter(([k, v]) => (HELPER_FIELDS[domain] ?? []).includes(k) && v !== undefined && v !== null))
 // [롤백]을 받을 수 있는 상태: 적용됨, 자동 롤백 실패, 적용 도중 중단(결과 불명)
 export const ROLLBACK_FROM = new Set(['applied', 'rollback_failed', 'interrupted'])
 export const PROMOTABLE_OPS = new Set(['eq', 'ne', 'in', 'not_in', 'gt', 'lt', 'unavailable'])
@@ -269,6 +287,12 @@ export class HaAdmin {
 		return null
 	}
 
+	#aliasRegression(payload, targetId) {
+		const entityId = String(payload?.entity_id || targetId || '').trim()
+		const alias = String(payload?.alias || '').trim()
+		return checkAliasChange({ policy: this.policy, states: this.states, meta: this.meta ?? {}, cfg: this.cfg ?? {}, entityId, alias })
+	}
+
 	#buildSelfConfigPatch(kind, targetId, payload, rawCfg) {
 		const next = structuredClone(rawCfg)
 		if (kind === 'self_alias_proposal') {
@@ -399,7 +423,35 @@ export class HaAdmin {
 			if (cfgId != null) return sanitizeConfigId(cfgId)
 			return sanitizeConfigId(targetId.replace(/^automation\./, ''))
 		}
+		if (kind.startsWith('scene')) {
+			const stateId = this.states?.get(targetId)?.attributes?.id
+			if (stateId != null) return sanitizeConfigId(stateId)
+			const cfgId = payload?.config?.id ?? payload?.id
+			if (cfgId != null) return sanitizeConfigId(cfgId)
+			return sanitizeConfigId(String(targetId).replace(/^scene\./, ''))
+		}
 		return sanitizeConfigId(targetId.replace(/^script\./, ''))
+	}
+
+	// 헬퍼 하나의 지금 설정(없으면 null). 목록을 받아 id로 찾는다.
+	async #currentHelper(domain, id) {
+		if (typeof this.ha?.call !== 'function' || !id) return null
+		const list = await this.ha.call({ type: `${domain}/list` })
+		return (Array.isArray(list) ? list : []).find(h => h.id === id) ?? null
+	}
+
+	#validateScene(config) {
+		const errors = []
+		if (!config || typeof config !== 'object') return ['씬 설정(config)이 없다']
+		if (!String(config.name ?? '').trim()) errors.push('씬 이름(name)이 필요하다')
+		const ents = config.entities && typeof config.entities === 'object' && !Array.isArray(config.entities) ? Object.keys(config.entities) : []
+		if (!ents.length) errors.push('씬에는 entities가 하나 이상 필요하다')
+		for (const id of ents) {
+			if (!ENTITY_REF_RE.test(id)) errors.push(`잘못된 entity_id: ${id}`)
+			else if (this.policy.isTier3Blocked(id)) errors.push(`안전 정책(Tier 3)으로 차단된 기기는 씬에 넣을 수 없다: ${id}`)
+			else if (this.states?.size && !this.states.has(id)) errors.push(`존재하지 않는 엔티티: ${id}`)
+		}
+		return errors
 	}
 
 	// 지금 HA에 저장된 설정. 없으면 null, 확인할 수단이 없으면 undefined(시험용 가짜 HA 등). 그 밖의 오류는 던진다.
@@ -502,6 +554,50 @@ export class HaAdmin {
 			}
 			preSnapshot = await this.#snapshotFor('automation', configId, `automation.${configId}`)
 			diffText = unifiedDiff(preSnapshot ? JSON.stringify(preSnapshot, null, 2) : '', JSON.stringify(config, null, 2), `automation.${configId}`)
+		} else if (kind === 'scene_upsert') {
+			const config = finalPayload.config ?? finalPayload
+			const configId = this.#resolveConfigId(kind, target_id, finalPayload) || `haagent_scene_${now}`
+			const errs = this.#validateScene(config)
+			if (errs.length) return { ok: false, error: `사전 검증 실패: ${errs.join(', ')}`, validation: { valid: false, errors: errs } }
+			finalPayload = { config_id: configId, config: { ...config, id: configId } }
+			preSnapshot = await this.#snapshotFor('scene', configId, target_id)
+			validation = { valid: true, errors: [], warnings: [], summary_text: `씬 ${preSnapshot ? '수정' : '생성'}: ${config.name} (${Object.keys(config.entities).length}개 기기)` }
+			diffText = unifiedDiff(preSnapshot ? JSON.stringify(preSnapshot, null, 2) : '', JSON.stringify(finalPayload.config, null, 2), target_id || `scene.${configId}`)
+		} else if (kind === 'scene_delete') {
+			const configId = this.#resolveConfigId(kind, target_id, finalPayload)
+			if (!configId) return { ok: false, error: 'scene_delete에는 씬 대상(target_id 또는 config_id)이 필요하다' }
+			finalPayload = { config_id: configId }
+			preSnapshot = await this.#snapshotFor('scene', configId, target_id)
+			if (!preSnapshot) return { ok: false, error: `지울 씬 설정을 찾지 못함(UI에서 만든 씬만 지울 수 있다): ${target_id || configId}` }
+			validation = { valid: true, errors: [], warnings: [], summary_text: `씬 삭제: ${preSnapshot.name ?? target_id}` }
+			diffText = unifiedDiff(JSON.stringify(preSnapshot, null, 2), '', target_id || `scene.${configId}`)
+		} else if (kind === 'helper_upsert' || kind === 'helper_delete') {
+			const domain = String(finalPayload.domain ?? String(target_id).split('.')[0] ?? '')
+			if (!HELPER_DOMAINS.includes(domain)) return { ok: false, error: `헬퍼 도메인은 ${HELPER_DOMAINS.join(', ')} 중 하나여야 한다: ${domain || '(없음)'}` }
+			const id = String(finalPayload.id ?? (String(target_id).startsWith(`${domain}.`) ? String(target_id).slice(domain.length + 1) : '')).trim() || null
+			if (id && this.policy.isTier3Blocked(`${domain}.${id}`)) return { ok: false, error: `안전 정책(Tier 3)으로 차단된 대상: ${domain}.${id}` }
+			let cur = null
+			if (id) { try { cur = await this.#currentHelper(domain, id) } catch (e) { return { ok: false, error: `지금 헬퍼 설정을 읽지 못함: ${e.message}` } } }
+			if (kind === 'helper_delete') {
+				if (!id || !cur) return { ok: false, error: `지울 헬퍼를 찾지 못함(UI에서 만든 헬퍼만 지울 수 있다): ${domain}.${id ?? ''}` }
+				finalPayload = { domain, id }
+				preSnapshot = cur
+				validation = { valid: true, errors: [], warnings: ['롤백하면 같은 이름으로 다시 만들지만 그 헬퍼를 쓰던 자동화·대시보드 연결은 확인이 필요하다'], summary_text: `헬퍼 삭제: ${cur.name ?? id} (${domain})` }
+				diffText = unifiedDiff(JSON.stringify(cur, null, 2), '', `${domain}.${id}`)
+			} else {
+				const fields = pickHelperFields(domain, finalPayload.config ?? {})
+				const errs = []
+				if (!id && !String(fields.name ?? '').trim()) errs.push('새 헬퍼에는 name이 필요하다')
+				if (id && !cur) errs.push(`고칠 헬퍼를 찾지 못함(UI에서 만든 헬퍼만 고칠 수 있다): ${domain}.${id}`)
+				for (const k of ['min', 'max', 'step', 'minimum', 'maximum']) if (fields[k] != null && !Number.isFinite(Number(fields[k]))) errs.push(`${k}는 숫자여야 한다`)
+				if (domain === 'input_select' && fields.options != null && !(Array.isArray(fields.options) && fields.options.length && fields.options.every(x => typeof x === 'string'))) errs.push('input_select의 options는 글자 목록이어야 한다')
+				if (domain === 'input_select' && !id && !Array.isArray(fields.options)) errs.push('새 input_select에는 options가 필요하다')
+				if (errs.length) return { ok: false, error: `사전 검증 실패: ${errs.join(', ')}`, validation: { valid: false, errors: errs } }
+				finalPayload = { domain, id, config: fields }
+				preSnapshot = cur
+				validation = { valid: true, errors: [], warnings: [], summary_text: `헬퍼 ${id ? '수정' : '생성'}: ${fields.name ?? cur?.name ?? id} (${domain})` }
+				diffText = unifiedDiff(cur ? JSON.stringify(cur, null, 2) : '', JSON.stringify({ ...(cur ?? {}), ...fields }, null, 2), `${domain}.${id ?? '(새 헬퍼)'}`)
+			}
 		} else if (kind === 'entity_admin') {
 			const svc = `homeassistant.${finalPayload.service}`
 			if (!ADMIN_SERVICES.has(svc)) return { ok: false, error: `허용되지 않은 엔티티 관리 서비스: ${svc}` }
@@ -528,8 +624,15 @@ export class HaAdmin {
 			if (built.error) return { ok: false, error: built.error }
 			const cfgChk = validateConfig(mergeConfig(built.next))
 			if (cfgChk.errors.length) return { ok: false, error: `설정 사전 검증 실패: ${cfgChk.errors.join(', ')}` }
+			let summaryText = built.summaryText
+			if (kind === 'self_alias_proposal') {
+				// 별칭은 LLM 없이 바로 기기를 움직이는 빠른 경로를 바꾼다. 평가 사례가 전보다 나빠지면 올리지 않는다.
+				const reg = this.#aliasRegression(finalPayload, target_id)
+				if (!reg.ok) return { ok: false, error: `빠른 경로 회귀 평가 실패: ${reg.errors.join(' / ')}`, validation: { valid: false, errors: reg.errors } }
+				if (!reg.skipped) summaryText += ` / 빠른 경로 회귀 평가 ${reg.after.passed}/${reg.after.total} 통과`
+			}
 			preSnapshot = built.beforeSlice
-			validation = { valid: true, errors: [], warnings: cfgChk.warnings, summary_text: built.summaryText }
+			validation = { valid: true, errors: [], warnings: cfgChk.warnings, summary_text: summaryText }
 			diffText = unifiedDiff(JSON.stringify(built.beforeSlice, null, 2), JSON.stringify(built.afterSlice, null, 2), `config.json (${kind})`)
 		} else {
 			diffText = `${kind} ${target_id} ${JSON.stringify(finalPayload)}`
@@ -610,7 +713,8 @@ export class HaAdmin {
 	// 'applying'으로 선점한 제안을 적용한다. p는 선점 전(pending) 내용이다.
 	async #applyClaimed(p, now) {
 		const pid = p.pid
-		const mutatedConfig = ['automation_upsert', 'automation_delete', 'script_upsert', 'script_delete', 'promote_rule'].includes(p.kind)
+		const mutatedConfig = CONFIG_FILE_KINDS.has(p.kind)
+		let appliedPayload = null
 		// 예전 판이 만든 제안도 승인할 때 Tier 3 검사를 다시 거친다.
 		if (['automation_upsert', 'script_upsert', 'promote_rule'].includes(p.kind)) {
 			const errs = this.policy.checkConfigCalls(collectConfigCalls(p.kind === 'script_upsert' ? 'script_upsert' : 'automation_upsert', p.payload?.config))
@@ -622,7 +726,7 @@ export class HaAdmin {
 		}
 		// 제안 뒤에 HA에서 같은 설정을 손댔으면(UI 수정 등) 덮어쓰지 않는다. 그 수정이 사라지고, 롤백도 옛 판으로 돌아가기 때문이다.
 		if (mutatedConfig) {
-			const domain = p.kind.startsWith('script') ? 'script' : 'automation'
+			const domain = configDomainOf(p.kind)
 			let cur
 			try { cur = await this.#currentConfig(domain, p.payload?.config_id) } catch (e) {
 				this.#saveProposal(p) // 다시 승인할 수 있게 pending으로 되돌린다
@@ -632,6 +736,15 @@ export class HaAdmin {
 				const stale = { ...p, status: 'error', decided_at: now, error: '제안을 만든 뒤 HA에서 이 설정이 바뀌어 적용하지 않았어요. 바뀐 내용을 기준으로 다시 제안해야 해요.' }
 				this.#saveProposal(stale)
 				return { ok: false, error: stale.error, proposal: stale }
+			}
+		}
+		if (p.kind === 'self_alias_proposal') {
+			// 제안 뒤에 별칭·기기 이름이 바뀌었을 수 있으니 승인할 때 한 번 더 평가한다.
+			const reg = this.#aliasRegression(p.payload, p.target_id)
+			if (!reg.ok) {
+				const failed = { ...p, status: 'error', decided_at: now, error: `빠른 경로 회귀 평가 실패: ${reg.errors.join(' / ')}` }
+				this.#saveProposal(failed)
+				return { ok: false, error: failed.error, proposal: failed }
 			}
 		}
 		if (p.pre_snapshot) this.#saveSnapFile(pid, 'before', p.pre_snapshot)
@@ -649,6 +762,22 @@ export class HaAdmin {
 			} else if (p.kind === 'script_delete') {
 				await this.#withConfigWrite(() => this.ha.deleteConfigRest('script', p.payload.config_id))
 				await this.ha.callService('script', 'reload')
+			} else if (p.kind === 'scene_upsert') {
+				await this.#withConfigWrite(() => this.ha.saveConfigRest('scene', p.payload.config_id, p.payload.config))
+				await this.ha.callService('scene', 'reload')
+			} else if (p.kind === 'scene_delete') {
+				await this.#withConfigWrite(() => this.ha.deleteConfigRest('scene', p.payload.config_id))
+				await this.ha.callService('scene', 'reload')
+			} else if (p.kind === 'helper_upsert') {
+				const { domain, id, config } = p.payload
+				const res = await this.#withConfigWrite(() => this.ha.call(id
+					? { type: `${domain}/update`, [`${domain}_id`]: id, ...config }
+					: { type: `${domain}/create`, ...config }))
+				// 새로 만든 헬퍼의 id를 남겨 롤백 때 지운다
+				if (!id) appliedPayload = { ...p.payload, created_id: res?.id ?? null }
+			} else if (p.kind === 'helper_delete') {
+				const { domain, id } = p.payload
+				await this.#withConfigWrite(() => this.ha.call({ type: `${domain}/delete`, [`${domain}_id`]: id }))
 			} else if (p.kind === 'automation_toggle') {
 				const svc = p.payload?.state === 'off' ? 'turn_off' : 'turn_on'
 				await this.ha.callService('automation', svc, { target: { entity_id: p.target_id } })
@@ -681,7 +810,7 @@ export class HaAdmin {
 					throw new Error(`check_config 실패: ${JSON.stringify(chk.errors ?? chk.result)}`)
 				}
 			}
-			const updated = { ...p, status: 'applied', decided_at: now, applied_at: now, error: null }
+			const updated = { ...p, ...(appliedPayload ? { payload: appliedPayload } : {}), status: 'applied', decided_at: now, applied_at: now, error: null }
 			this.#saveProposal(updated)
 			if (p.kind === 'promote_rule' && this.onRulePromoted && p.payload?.rule_id) {
 				await this.onRulePromoted(p.payload.rule_id)
@@ -743,7 +872,16 @@ export class HaAdmin {
 			await this.onConfigUpdated?.(merged, p)
 			return
 		}
-		const domain = (p.kind.startsWith('script')) ? 'script' : 'automation'
+		if (p.kind === 'helper_upsert' || p.kind === 'helper_delete') {
+			const { domain, id, created_id: createdId } = p.payload ?? {}
+			await this.#withConfigWrite(async () => {
+				if (p.kind === 'helper_upsert' && createdId) await this.ha.call({ type: `${domain}/delete`, [`${domain}_id`]: createdId })
+				else if (p.kind === 'helper_upsert' && id && p.pre_snapshot) await this.ha.call({ type: `${domain}/update`, [`${domain}_id`]: id, ...pickHelperFields(domain, p.pre_snapshot) })
+				else if (p.kind === 'helper_delete' && p.pre_snapshot) await this.ha.call({ type: `${domain}/create`, ...pickHelperFields(domain, p.pre_snapshot) })
+			})
+			return
+		}
+		const domain = configDomainOf(p.kind)
 		if (p.kind === 'automation_toggle') {
 			const prev = p.pre_snapshot?.state
 			if (prev === 'on' || prev === 'off') await this.ha.callService('automation', prev === 'on' ? 'turn_on' : 'turn_off', { target: { entity_id: p.target_id } })
@@ -751,7 +889,7 @@ export class HaAdmin {
 		}
 		if (p.pre_snapshot) {
 			await this.#withConfigWrite(() => this.ha.saveConfigRest(domain, p.payload.config_id, p.pre_snapshot))
-		} else if (p.kind === 'automation_upsert' || p.kind === 'script_upsert' || p.kind === 'promote_rule') {
+		} else if (['automation_upsert', 'script_upsert', 'promote_rule', 'scene_upsert'].includes(p.kind)) {
 			await this.#withConfigWrite(() => this.ha.deleteConfigRest(domain, p.payload.config_id))
 		}
 		await this.ha.callService(domain, 'reload')
@@ -855,6 +993,10 @@ export class HaAdmin {
 				if (Array.isArray(list)) report.orphaned_entities = list.slice(0, 50)
 			} catch {}
 		}
+		// 기기 건강(응답 없음·배터리·신호)과 방(영역)이 지정되지 않은 제어 기기
+		try {
+			report.device_health = scanDeviceHealth({ states: this.states, meta: this.meta ?? {}, cfg: this.cfg ?? {}, isNoise: globs(this.cfg?.noise_entities ?? []) })
+		} catch (e) { report.device_health = { error: e.message } }
 		return report
 	}
 }

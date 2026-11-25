@@ -159,6 +159,18 @@ export function proposalApprovalPayload(p) {
 	}
 }
 
+// 적용한 제안이 7일 사후 검증에서 악화로 나왔을 때: 되돌릴지 묻는다(버튼 하나로 롤백)
+export function experimentRegressedPayload(p, exp) {
+	return {
+		title: `📉 7일 검증 결과 악화: ${p.title}`.slice(0, 60),
+		message: `적용 뒤 7일 동안 ${String(exp?.notes ?? '부정 신호가 늘었어요').replace(/ \(악화 감지[^)]*\)/, '')}. 적용 전으로 되돌릴까요?`.slice(0, 450),
+		data: {
+			tag: proposalTag(p.pid), group: 'ha-agent', notification_icon: ICON, ...CHANNELS.normal,
+			actions: [{ action: `HAAGENT_ROLL_${p.pid}`, title: '롤백' }, replyButton],
+		},
+	}
+}
+
 export function proposalResultPayload(p, { rollback = false } = {}) {
 	const text = {
 		applied: [`✅ 적용 완료: ${p.title}`, p.summary],

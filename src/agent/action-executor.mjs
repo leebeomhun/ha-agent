@@ -91,8 +91,12 @@ export class ActionExecutor {
 		const data = overrideService?.data ?? rec.service_data ?? {}
 		// 호출 전 상태를 잡아 둔다. 상태 변화 이벤트가 호출 응답보다 먼저 오면 호출 뒤에 잡은 값으로는 변화를 놓친다.
 		const before = ag.states.get(rec.entity_id)
+		// 이 상태 변화는 집 비서가 한 것으로 표시한다. 상태 변화 이벤트가 호출 응답보다 먼저 올 수 있어 부르기 전에 알려 둔다.
+		const expectTo = service === 'turn_on' ? 'on' : service === 'turn_off' ? 'off' : (data.option ?? null)
+		ag.origin?.noteAgentCall(rec.entity_id, expectTo, null, ag.clock())
 		try {
-			await ag.ha.callService(domain, service, { ...(Object.keys(data).length ? { data } : {}), target: { entity_id: rec.entity_id } })
+			const res = await ag.ha.callService(domain, service, { ...(Object.keys(data).length ? { data } : {}), target: { entity_id: rec.entity_id } })
+			ag.origin?.noteAgentCall(rec.entity_id, expectTo, res, ag.clock())
 			rec.status = (await this.waitState(rec.entity_id, service, data, before)) ? 'done' : 'unverified'
 			ag.bump(undo ? 'undos' : 'actions')
 		} catch (e) { rec.status = 'error'; rec.error = e.message }

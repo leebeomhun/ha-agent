@@ -48,8 +48,26 @@ export class Notifier {
 			}
 		}
 		a.journal.notification(rec)
+		if (n.kind === 'alert' && ['sent', 'queued'].includes(rec.status)) this.trackAlert(nid, n.related_rule_ids ?? [], now)
 		log(`알림 ${rec.status}: [${n.level}] ${n.title} — ${n.message}`)
 		return `${rec.status}: ${n.title}`
+	}
+
+	// 규칙 알림 뒤 사람이 관련 기기를 만지는지 지켜본다(알림이 쓸모 있었는지 = 알림 정밀도 신호).
+	// 관련 기기: 규칙이 보는 엔티티들 + 그 엔티티와 같은 방의 제어 기기(예: 화장실 습도 알림 → 화장실 환풍기)
+	trackAlert(nid, ruleIds, now) {
+		const a = this.agent
+		if (!ruleIds.length || !a.implicitFeedback?.trackAlert) return
+		const rules = a.engine.rules.filter(r => ruleIds.includes(r.id))
+		const ids = new Set(rules.flatMap(r => [r.entity_id, ...(r.also ?? []).map(c => c.entity_id)]).filter(Boolean))
+		const areas = new Set([...ids].map(id => a.meta.areaOf?.get(id)).filter(Boolean))
+		if (areas.size && a.meta.areaOf) {
+			for (const [id, area] of a.meta.areaOf) {
+				if (areas.has(area) && /^(light|switch|fan|cover|climate|humidifier|media_player|input_boolean)\./.test(id)) ids.add(id)
+				if (ids.size >= 30) break
+			}
+		}
+		a.implicitFeedback.trackAlert({ nid, rule_ids: ruleIds, entity_ids: [...ids], ts: now })
 	}
 
 	async flushOutbox(now) {

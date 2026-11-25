@@ -237,6 +237,7 @@ test('3. HA 연결: 이벤트를 처리하는 쪽의 오류로는 연결을 끊�
 		feed({ type: 'auth_ok' })
 		await answerNext(null) // state_changed 구독
 		await answerNext(null) // 버튼 이벤트 구독
+		await answerNext(null) // 자동화 실행(automation_triggered) 구독
 		await answerNext([]) // get_states
 		await flush()
 		assert.equal(ready, true)

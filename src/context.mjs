@@ -84,6 +84,12 @@ export const significantChange = (c, isNoise = () => false) =>
 	!isNoise(c.id) && !(c.id.startsWith('media_player.') && MEDIA_ON.has(c.from) && MEDIA_ON.has(c.to))
 
 const BURST_GAP = 5 * 60000
+// 변화를 일으킨 쪽 표시(사람이 한 것인지, 자동화·집 비서가 한 것인지 판단에 쓴다)
+const ORIGIN_TAG = { user: ' [사람·앱]', agent: ' [집 비서]' }
+const CONTROL_DOMAINS = new Set(['light', 'switch', 'fan', 'cover', 'climate', 'media_player', 'input_boolean', 'humidifier', 'lock', 'vacuum'])
+export const originTag = c => (c.origin === 'automation' ? ` [자동화${c.actor ? `: ${c.actor}` : ''}]`
+	: c.origin === 'device' ? (CONTROL_DOMAINS.has(String(c.id).split('.')[0]) ? ' [사람·기기]' : '')
+		: ORIGIN_TAG[c.origin] ?? '')
 // 최근 변화를 프롬프트 줄로. 같은 엔티티가 짧은 사이에 3번 넘게 바뀐 것은 한 줄로 묶고, 소음 엔티티는 횟수만 남긴다.
 export function changeLines(list, isNoise = () => false, max = 80) {
 	const hm = t => kst(new Date(t)).hm
@@ -96,7 +102,7 @@ export function changeLines(list, isNoise = () => false, max = 80) {
 	}
 	const rows = []
 	for (const b of bursts) {
-		if (b.length < 3) { for (const c of b) rows.push([c.t, `- ${hm(c.t)} ${c.name ?? c.id} (${c.id}) ${c.from} → ${c.to}`]); continue }
+		if (b.length < 3) { for (const c of b) rows.push([c.t, `- ${hm(c.t)} ${c.name ?? c.id} (${c.id}) ${c.from} → ${c.to}${originTag(c)}`]); continue }
 		const seq = [b[0].from, ...b.map(c => c.to)]
 		const path = seq.length <= 6 ? seq.join(' → ') : `${seq.slice(0, 3).join(' → ')} → … → ${seq.slice(-2).join(' → ')}`
 		rows.push([b[0].t, `- ${hm(b[0].t)}~${hm(b.at(-1).t)} ${b[0].name ?? b[0].id} (${b[0].id}) ${b.length}번 바뀜: ${path}`])

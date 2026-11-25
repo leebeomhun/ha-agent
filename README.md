@@ -23,11 +23,18 @@ Home Assistant(HA)를 실시간으로 감시하고, **HA Assist 대화**·**기�
    - 자가개선 엔진(`src/engine/learning.mjs`)이 암묵적 피드백(제어 되돌림·Assist 재발화/정정/거짓 제어·제안 실패), HA 재시작 스파이크를 제외한 통계적 루틴 마이너, 규칙 정밀도 스코어카드, 실패→회귀 평가셋(`state/evals/cases.json`), Tier 2 자가 튜닝 제안(`self_alias_proposal`/`self_noise_proposal`/`self_stt_tune`/`self_lesson_proposal`, 불변 코어 보호 + 롤백), 사전 백테스트 과다발동 게이트, 제안 검증 실패 1회 Self-Repair, 변경 후 7일 효과 검증 실험을 수행한다.
    - 관리 제안의 이전 설정은 HA에서 새로 읽고, 승인 직전에 다시 읽어 그사이 HA에서 바뀌었으면 덮어쓰지 않는다.
    - 집 특화 정보는 `state/home-profile.md`로 분리하고, `state/memory.md`는 단기 작업 메모, 선호·지시·거절 이력은 `memory_items`로 관리한다.
-6. **다중 LLM 라우터 및 OpenAI / Gemini 듀얼 플랫폼 (`src/llm/router.mjs`, `src/brain.mjs`)**:
+6. **자가개선 루프 (`src/engine/origin.mjs`, `automation-suggest.mjs`, `scorecard.mjs`, `regression.mjs`, `device-health.mjs`)**:
+   - **학습 신호**: 상태 변화마다 HA `context`로 조작 주체(사람·앱 / 사람·기기 / 자동화 / 집 비서)를 가려 `events.origin`에 남기고, 자동화가 한 일을 사람이 곧바로 뒤집음(`automation_overridden`), 규칙 알림 뒤 관련 기기 조작(`notification_acted`), 승인 없이 만료된 제안(`proposal_ignored`), 사용자의 자동화 직접 수정(`automation_user_edited`, 집 비서가 만든 자동화면 `proposal_edited_by_user` + 선호 기억)을 기록한다.
+   - **루틴 → 자동화 제안**: 사람이 반복한 켜기/끄기 루틴을 logbook으로 사람 조작인지 확인하고, 그 기기를 이미 움직이는 자동화가 있으면 빼고, "시각"·"귀가" 트리거를 지난 기록으로 백테스트해 정확도·재현율 기준을 넘는 것만 근거와 함께 Tier 2 제안으로 올린다(하루 최대 2건). 주간 보고서의 YAML 초안은 `proposals`로도 내도록 한 번 더 묻는다.
+   - **루프 닫기**: 7일 실험이 악화면 규칙은 이전 판으로 자동 원복, 제안은 [롤백] 버튼으로 묻고, 약해진 교훈은 끈다. 별칭 제안은 빠른 경로 회귀 평가(LLM 없음)를 통과해야 올라가고 승인할 때 다시 평가한다.
+   - **자기 성능 지표**: 알림 뒤 조치 비율, 제안 수락률, Assist 성공률, 빈 판단 비율, 판단당 토큰, 자동화 뒤집힘의 주간 추세를 계산해 주간 보고서 끝과 콘솔·CLI에 보여 준다.
+   - **관리 범위**: 기기 건강(오래 응답 없음·배터리·약한 신호) 새 문제 알림, 씬(`scene_upsert/delete`)·헬퍼(`helper_upsert/delete`) 생성·수정·삭제 제안과 롤백, 방 미지정 제어 기기 감사.
+   - 위 작업은 매일 `learning.daily_hour`(기본 19시)에 한 번 돈다.
+7. **다중 LLM 라우터 및 OpenAI / Gemini 듀얼 플랫폼 (`src/llm/router.mjs`, `src/brain.mjs`)**:
    - **OpenAI**: `codex` (Codex CLI 샌드박스) ↔ `api` (OpenAI Responses API)
    - **Gemini**: `agy` (Antigravity CLI `--sandbox`) ↔ `gemini` (Gemini Interactions API `/v1beta/interactions`, `response_format` + `step_list` 도구 루프)
    - 작업 유형별(`assist`, `default` 등) 라우팅과 쌍 기반 자동 페일오버(`codex↔api`, `agy↔gemini`), CLI/API 런타임 전환(`brain` 명령)을 지원한다.
-7. **비상 알림 길 (`src/oob.mjs`)**:
+8. **비상 알림 길 (`src/oob.mjs`)**:
    - **카카오톡(`kakao`)**: `/home/ubuntu/reserve/.env` 토큰을 공유해 친구(`이범훈(알림)`) 또는 나에게 보내기(`memo`)로 발송하며, `401` 시 리프레시 토큰으로 자동 갱신 후 `.env`에 원자적으로 재기록한다.
    - 카카오톡 실패 시 `fallback_memo` 및 `oob.fallback`(`slack` 등)을 지원하며, `ntfy`, `telegram`, `slack`, `webhook`도 지원한다.
 
@@ -50,6 +57,11 @@ node src/cli.mjs routines [일수]                  # 통계적 출퇴근·기�
 node src/cli.mjs experiments [eval]               # 변경 사후 검증 실험 조회·평가
 node src/cli.mjs self-tune [propose]              # 자가 튜닝 제안 후보 조회·Tier 2 등록
 node src/cli.mjs evals                            # 실패 사례에서 자동 축적된 회귀 평가셋 조회
+node src/cli.mjs scorecard [주수] [--json]        # 자기 성능 지표(주간 추세)
+node src/cli.mjs suggest-automations [apply]      # 생활 루틴 → 자동화 후보(기본 계산만, apply면 승인 대기 제안으로)
+node src/cli.mjs health                           # 기기 건강(응답 없음·배터리·신호·방 미지정)
+node src/cli.mjs regression                       # Assist 빠른 경로 회귀 평가(LLM 없음)
+node src/cli.mjs daily-learning                   # 하루 자가개선 작업을 지금 한 번 실행(데몬 필요)
 node src/cli.mjs rules                            # 감시 규칙 목록
 node src/cli.mjs log [n]                          # 최근 판단 기록
 node src/cli.mjs stats [일수]                     # 운영·토큰·빈 호출 통계

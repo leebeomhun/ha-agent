@@ -14,10 +14,13 @@ export const DEFAULT_TIER3_PATTERNS = [
 ]
 export const ADMIN_SERVICES = new Set([
 	'automation.turn_on', 'automation.turn_off', 'automation.toggle', 'automation.reload', 'automation.trigger',
-	'script.reload',
+	'script.reload', 'scene.reload',
 	'homeassistant.reload_config_entry', 'homeassistant.check_config', 'homeassistant.list_orphaned_database_entities',
 	'homeassistant.rename_entity', 'homeassistant.add_entity_to_area', 'homeassistant.add_label_to_entity',
 	'homeassistant.disable_entity', 'homeassistant.enable_entity', 'homeassistant.hide_entity', 'homeassistant.unhide_entity',
+	// 엔티티 레지스트리 정리(방·라벨·별칭·아이콘). 엔티티 하나만 바꾸고 기기를 움직이지 않는다.
+	'homeassistant.remove_entity_from_area', 'homeassistant.remove_label_from_entity',
+	'homeassistant.add_alias_to_entity', 'homeassistant.remove_alias_from_entity', 'homeassistant.set_entity_icon',
 	'backup.create_automatic',
 ])
 // HA 자동화·스크립트 설정 안에 들어갈 수 없는 동작 도메인. 승인 뒤 HA 안에서 돌기 때문에 WS 호출 검사(Tier 3)를 거치지 않는다.

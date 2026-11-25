@@ -425,11 +425,14 @@ test('주간 분석: 정한 요일·시각에 혼자 돌고, 7일 자료를 써 
 	const light = readJson(join(P.run, 'weekly-devices.json'), null).devices.find(d => d.id === 'light.a')
 	assert.equal(light.reverted.length, 1)
 	assert.equal(light.reverted[0].undone_after_min, 3)
-	assert.equal(readFileSync(join(P.weekly, '2026-11-15.md'), 'utf8'), REPORT + '\n')
+	// 보고서 = LLM이 쓴 본문 + 코드가 붙이는 "자기 성능 지표" 절
+	const saved = readFileSync(join(P.weekly, '2026-11-15.md'), 'utf8')
+	assert.ok(saved.startsWith(REPORT), '본문은 그대로')
+	assert.match(saved, /## 자기 성능 지표 \(자동 집계\)\n\| 지표 \|/)
 	assert.equal(x.ha.sent.at(-1).title.includes('주간 자동화 분석'), true, '알림을 안 냈으면 기본 알림을 보낸다')
 	assert.match(x.ha.sent.at(-1).message, /귀가 조명 조건을 손볼 만해요/)
 	assert.equal(readJsonl(P.decisions).at(-1).applied.report, '2026-11-15.md')
-	assert.deepEqual(x.ha.posted.map(d => [d.notification_id, d.message]), [['haagent_weekly', REPORT]], '전문을 HA 알림 목록에 올린다')
+	assert.deepEqual(x.ha.posted.map(d => [d.notification_id, d.message]), [['haagent_weekly', saved.trimEnd()]], '전문을 HA 알림 목록에 올린다')
 	assert.match(x.ha.sent.at(-1).message, /HA 앱의 알림/)
 	assert.equal(readJsonl(P.decisions).at(-1).applied.published, true)
 	const run = readdirSync(P.runs).at(-1)
@@ -440,7 +443,7 @@ test('주간 분석: 정한 요일·시각에 혼자 돌고, 7일 자료를 써 
 	assert.equal(x.t.prompts.length, 2)
 	await x.agent.cycle([{ type: 'manual', reason: '시험' }])
 	assert.match(x.t.prompts[2], /run\/weekly-last-report\.md: 지난 주간 분석 보고서 \(2026-11-15\)/)
-	assert.equal(readFileSync(join(P.run, 'weekly-last-report.md'), 'utf8'), REPORT + '\n')
+	assert.equal(readFileSync(join(P.run, 'weekly-last-report.md'), 'utf8'), saved)
 })
 
 test('주간 분석: 보고서 없이 끝나면 실패로 보고 다시 시도한다. 명령으로도 깨울 수 있다', async () => {

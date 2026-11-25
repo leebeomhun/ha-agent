@@ -1,11 +1,12 @@
 // 집 비서 본체: HA 실시간 감시(규칙·이상탐지), Assist 대화 서버, PolicyEngine, ToolBroker, HaAdmin, LLM 라우터를 통합 조율한다.
 import { readdirSync, readFileSync, unlinkSync, writeFileSync, mkdirSync, existsSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
+import { createHash } from 'node:crypto'
 import { HA } from './ha.mjs'
 import { RuleEngine, validateRule } from './rules.mjs'
 import { compactStates, automationList, notableChange, significantChange, buildPrompt } from './context.mjs'
 import { runBrain, brainMode, brainSettings, validateResponse, selfCheck, normalizeMode, MODES, MODE_LABEL } from './brain.mjs'
-import { feedbackPayload, proposalApprovalPayload, proposalResultPayload, ACTION_RE, REPLY_ACTION, TAG_PREFIX } from './notify.mjs'
+import { feedbackPayload, proposalApprovalPayload, proposalResultPayload, experimentRegressedPayload, ACTION_RE, REPLY_ACTION, TAG_PREFIX } from './notify.mjs'
 import { PolicyEngine } from './core/policy.mjs'
 import { Store } from './core/store.mjs'
 import { Journal } from './core/journal.mjs'
@@ -13,6 +14,11 @@ import { MemoryManager } from './core/memory.mjs'
 import { AnomalyEngine } from './engine/anomaly.mjs'
 import { ImplicitFeedbackTracker, buildLearningDigest, registerExperiment, evaluateDueExperiments, proposalExperimentScope } from './engine/learning.mjs'
 import { HaAdmin } from './admin/ha-admin.mjs'
+import { OriginTracker } from './engine/origin.mjs'
+import { suggestAutomations } from './engine/automation-suggest.mjs'
+import { buildScorecard, renderScorecard } from './engine/scorecard.mjs'
+import { scanDeviceHealth, healthIssueKeys, newHealthIssues } from './engine/device-health.mjs'
+import { fastPathCases, runFastPathRegression, directoryIndexFor } from './engine/regression.mjs'
 import { ToolBroker } from './tools/registry.mjs'
 import { digestHaData } from './tools/read.mjs'
 import { SessionManager } from './orchestrator/session.mjs'
@@ -37,6 +43,26 @@ const MAX_DEFERS = 3
 const sysKey = x => `${x.level ?? ''}|${x.name ?? ''}|${x.message ?? ''}`
 const repairKey = r => `${r.domain ?? ''}:${r.id ?? ''}`
 export const PUBLISH_SERVICE = 'persistent_notification.create'
+const canonical = v => JSON.stringify(v, (k, x) => (x && typeof x === 'object' && !Array.isArray(x) ? Object.fromEntries(Object.keys(x).sort().map(key => [key, x[key]])) : x))
+const cfgHash = c => createHash('sha1').update(canonical(c)).digest('hex').slice(0, 16)
+const triggerTimes = c => [].concat(c?.triggers ?? c?.trigger ?? []).map(t => t?.at).filter(Boolean).flat().map(String)
+
+// 주간 보고서의 "새 자동화 제안" 절에 YAML 초안이 있는가(그렇다면 proposals로도 내야 바로 승인할 수 있다)
+export function reportHasAutomationDraft(report) {
+	const m = /##\s*새 자동화 제안([\s\S]*?)(?=\n##\s|$)/.exec(String(report ?? ''))
+	return Boolean(m && /```ya?ml|^\s*(triggers?|actions?):/m.test(m[1]))
+}
+
+// 사용자가 자동화를 직접 고쳤을 때 무엇이 바뀌었는지 사람이 읽을 요약
+export function automationChangeSummary(prev, next) {
+	if (!prev || !next) return []
+	const out = []
+	const label = { alias: '이름', description: '설명', mode: '실행 방식', triggers: '트리거', trigger: '트리거', conditions: '조건', condition: '조건', actions: '동작', action: '동작' }
+	for (const k of Object.keys(label)) if (canonical(prev[k]) !== canonical(next[k]) && !out.includes(label[k])) out.push(label[k])
+	const a = triggerTimes(prev).join(','), b = triggerTimes(next).join(',')
+	if (a !== b && (a || b)) out.push(`시각 ${a || '없음'}→${b || '없음'}`)
+	return out
+}
 
 export class Agent {
 	// ha·brain·oob·clock·canUse는 시험에서 가짜로 바꿔 끼운다.
@@ -105,6 +131,9 @@ export class Agent {
 		this.startupProblem = null
 		this.sessionLocks = new Map()
 		this.cycleChain = Promise.resolve()
+		// 상태 변화의 조작 주체(사람·기기·자동화·집 비서) 판별
+		this.origin = new OriginTracker()
+		this.dailyRunning = false
 
 		this.memoryMgr = new MemoryManager({ store: this.store, cfg: this.cfg })
 		this.anomaly = new AnomalyEngine({ store: this.store, isNoise: this.isNoise, awayOverrideEntity: this.cfg.away_override_entity })
@@ -165,6 +194,7 @@ export class Agent {
 		this.ha.on('ready', list => this.#onReady(list))
 		this.ha.on('state', d => this.#onState(d))
 		this.ha.on('action', d => this.#onAction(d).catch(e => log('버튼 처리 실패:', e.message)))
+		this.ha.on('automation_triggered', (data, event) => this.origin.noteAutomationTriggered(event, this.clock()))
 	}
 	start() {
 		this.attach()
@@ -242,6 +272,9 @@ export class Agent {
 		const now = this.clock()
 		const c = notableChange(d)
 		if (c) {
+			const o = this.origin.classify(n, now)
+			c.origin = o.origin
+			if (o.actor && o.origin === 'automation') c.actor = o.actor
 			const isNoise = this.isNoise(c.id)
 			const bucket = isNoise ? this.noiseRing : this.ring
 			bucket.push(c)
@@ -422,11 +455,20 @@ export class Agent {
 		await this.actionExecutor.expireActions(now)
 		if (!this.dry) {
 			const expiredProps = this.haAdmin.expireProposals(now)
+			// 승인도 거절도 없이 만료된 제안 = 무시된 제안(학습 신호)
+			for (const p of expiredProps) if (p.status === 'expired') try { this.implicitFeedback.onProposalOutcome(p, 'ignored', now) } catch {}
 			if (expiredProps.length && this.control.send && this.ha.connected) {
 				for (const p of expiredProps) await this.notifier.send(proposalResultPayload(p, { rollback: this.haAdmin.canRollback(p) })).catch(() => {})
 			}
 		}
 		await this.notifier.flushOutbox(now)
+		// 하루 한 번 자가개선 작업(실험 후속 조치·회귀 평가·기기 건강·루틴 자동화 제안). 판단(LLM)과 따로 돌고 기다리지 않는다.
+		const dailyHour = this.cfg.learning?.daily_hour ?? 19
+		if (!this.dry && this.ha.connected && k.h === dailyHour && this.runtime.last_daily_learning !== k.date && this.cfg.learning?.enabled !== false) {
+			this.runtime.last_daily_learning = k.date
+			this.saveRuntime()
+			this.runDailyLearning(now).catch(e => log('하루 자가개선 작업 실패:', e.message))
+		}
 		await this.#maybeRun()
 	}
 
@@ -575,7 +617,7 @@ export class Agent {
 					if (this.cfg.learning?.auto_consolidate_on_reflection !== false) {
 						try { this.memoryMgr.consolidate({ now: started }) } catch (e) { log('기억 통합 실패:', e.message) }
 					}
-					try { evaluateDueExperiments(this.store, started) } catch (e) { log('실험 사후 평가 실패:', e.message) }
+					try { evaluateDueExperiments(this.store, started); await this.applyExperimentVerdicts(started) } catch (e) { log('실험 사후 평가 실패:', e.message) }
 				}
 				const reasonText = reasons.map(r => r.text ?? r.reason ?? r.description ?? r.rule_id ?? r.type).filter(Boolean).join(' ')
 				const reasonEntities = [...new Set(reasons.map(r => r.entity_id).filter(Boolean))]
@@ -595,7 +637,7 @@ export class Agent {
 					weather: ctx.weather, calendar: ctx.calendar,
 					actions: this.actionExecutor.actionContext(), metrics: deep ? weekMetrics(started, { store: this.store }) : null, lastReport,
 					learningDigest: (deep && this.store && this.cfg.learning?.enabled !== false)
-						? buildLearningDigest({ store: this.store, rules: this.engine.rules, runtime: this.runtime.rules, cfg: this.cfg, states: this.states, now: started, isNoise: this.isNoise })
+						? this.#learningDigest(started)
 						: null,
 					assistHistory,
 					awayOverride, sysDelta,
@@ -619,7 +661,7 @@ export class Agent {
 				const timeoutSec = weekly ? this.cfg.weekly.timeout_seconds : deep ? bs.timeout_deep_seconds : bs.timeout_seconds
 				const model = mode === primary && this.failures >= this.cfg.failover.after_failures && bs.fallback_model ? bs.fallback_model : bs.model
 				if (model !== bs.model) entry.model = model
-				let infoFiles = [], res, repairFeedback = null, repairedProposals = false
+				let infoFiles = [], res, repairFeedback = null, repairedProposals = false, repairedWeeklyDrafts = false
 				entry.codex_ms = 0
 				this.runAbort = new AbortController()
 				const perCycle = this.cfg.actions.per_cycle
@@ -683,6 +725,14 @@ export class Agent {
 								entry.proposal_repaired = true
 								continue
 							}
+						}
+						// 주간 보고서에 새 자동화 초안(YAML)만 쓰고 proposals를 안 냈으면 한 번 더 묻는다. 글 속 초안은 바로 승인할 수 없다.
+						if (weekly && !lastRound && !repairedWeeklyDrafts && this.cfg.policy?.admin_enabled && reportHasAutomationDraft(res.report)
+							&& !(res.proposals ?? []).some(p => ['automation_upsert', 'script_upsert'].includes(p.kind))) {
+							repairedWeeklyDrafts = true
+							repairFeedback = [{ title: '주간 보고서의 새 자동화 제안', error: '"새 자동화 제안"에 YAML 초안을 썼지만 proposals(automation_upsert)가 없다. 초안마다 같은 내용을 proposals 항목(kind=automation_upsert, payload.config)으로도 내서 사용자가 알림에서 바로 승인할 수 있게 할 것. report는 그대로 두되 각 초안 제목 옆에 "승인 대기"라고 적는다' }]
+							entry.weekly_drafts_repaired = true
+							continue
 						}
 						break
 					}
@@ -917,7 +967,9 @@ export class Agent {
 			this.meta.at = now
 			this.meta.areaOf = areaOf
 			this.meta.catOf = catOf
+			const prevAutoCfg = this.meta.autoCfg
 			this.meta.autoCfg = autoCfg
+			if (!this.dry) try { this.#detectAutomationEdits(prevAutoCfg, autoCfg, now) } catch (e) { log('자동화 변경 감지 실패:', e.message) }
 		} catch (e) { log('영역·자동화 정보를 가져오지 못함:', e.message) }
 		await this.loadScriptFields([...this.tiers.keys()], { now, force })
 	}
@@ -1108,6 +1160,8 @@ export class Agent {
 			}
 		}
 		if (out.added.length || out.changed.length || out.deleted.length || !this.rulesDoc) {
+			// 7일 검증에서 악화로 나오면 되돌릴 수 있게 바꾸기 전 규칙을 잡아 둔다
+			const oldById = new Map(this.engine.rules.map(r => [r.id, r]))
 			snapshot('rules', this.rulesDoc, now, keep)
 			this.engine.setRules(rules, this.states, now, [...out.added, ...out.changed])
 			for (const [rid, b] of backtestResults) {
@@ -1123,6 +1177,7 @@ export class Agent {
 						kind: 'rule',
 						ref_id: rid,
 						scope: { rule_ids: [rid], entity_ids: [...new Set([rule?.entity_id, ...(rule?.also ?? []).map(c => c.entity_id)].filter(Boolean))] },
+						revert: { prev_rule: oldById.get(rid) ?? null, new_rule: rule ?? null },
 						title: `감시 규칙 ${out.added.includes(rid) ? '추가' : '수정'}: ${rid}`,
 						evalDays: this.cfg.learning?.experiment_eval_days ?? 7,
 						now,
@@ -1171,9 +1226,10 @@ export class Agent {
 		}
 		if (res.report) {
 			if (reasons.some(r => r.type === 'weekly')) {
-				const reportText = rejectedProposals.length
+				const sc = this.scorecardNow(now)
+				const reportText = (rejectedProposals.length
 					? `${res.report}\n\n> ⚠️ 참고: 아래 승인안은 사전 검증을 통과하지 못해 승인 대기 목록에 등록되지 않았어요.\n${rejectedProposals.map(r => `- ${r.title}: ${r.error}`).join('\n')}`
-					: res.report
+					: res.report) + (sc ? `\n\n## 자기 성능 지표 (자동 집계)\n${renderScorecard(sc)}` : '')
 				out.report = saveWeekly(kst(new Date(now)).date, reportText, this.cfg.limits.keep_weekly)
 				out.published = await this.#publishWeekly(out.report, reportText)
 				if (!notes.length) notes.push({ kind: 'info', level: 'normal', title: '📊 주간 자동화 분석이 나왔어요', message: `${res.summary.slice(0, 300)} ${out.published ? '전문은 HA 앱의 알림(🔔)에서 볼 수 있어요.' : '전문: node src/cli.mjs weekly'}`, related_rule_ids: [] })
@@ -1228,6 +1284,186 @@ export class Agent {
 			const why = e.message.replace(/\s+/g, ' ').slice(-160)
 			await this.notifier.deliver({ kind: 'info', level: 'normal', title: '🤖 집 비서가 판단을 못 하고 있어요', message: `${label} 판단이 ${this.failures}번 연속 실패했어요. 마지막 오류: ${why}`, related_rule_ids: [] }, reasons)
 		}
+	}
+
+	// ── 자가개선 루프 ──
+
+	// 사용자가 HA에서 자동화를 직접 만들거나 고치거나 지운 것을 찾는다(집 비서가 적용·롤백한 것은 뺀다).
+	// 집 비서가 제안해 만든 자동화를 사용자가 고쳤다면 그 제안이 조금 틀렸다는 신호이고, 고친 내용은 선호로 기억한다.
+	#detectAutomationEdits(prevCfg, autoCfg, now) {
+		const prev = this.runtime.auto_cfg
+		const since = this.runtime.auto_cfg_at ?? 0
+		const hashes = {}
+		const autoIds = [...this.states.keys()].filter(id => id.startsWith('automation.'))
+		for (const eid of new Set([...autoIds, ...Object.keys(autoCfg)])) {
+			const c = autoCfg[eid]
+			if (c) hashes[eid] = { id: c.id ?? null, alias: c.alias ?? eid, hash: cfgHash(c) }
+			// 설정을 못 받은 자동화는 지난 값을 그대로 두고, 처음 보는 것이면 "내용 모름"(hash null)으로 둔다.
+			// HA가 잠깐 설정을 못 내줘도 모든 자동화를 사용자가 새로 만들거나 지운 것으로 오인하지 않게 한다.
+			else hashes[eid] = prev?.[eid] ?? { id: null, alias: this.states.get(eid)?.attributes?.friendly_name ?? eid, hash: null }
+		}
+		this.runtime.auto_cfg = hashes
+		this.runtime.auto_cfg_at = now
+		this.saveRuntime()
+		if (!prev) return []
+		const props = this.haAdmin.listProposals({ limit: 300 })
+		const mine = new Set(props.filter(p => (p.applied_at ?? 0) >= since || (p.rollback_at ?? 0) >= since || p.status === 'applying').map(p => p.payload?.config_id).filter(Boolean))
+		const changes = []
+		for (const [eid, h] of Object.entries(hashes)) {
+			if (h.id && mine.has(h.id)) continue
+			const old = prev[eid]
+			if (!old) { if (h.hash) changes.push({ eid, change: 'created', ...h, fields: [] }) }
+			else if (old.hash && h.hash && old.hash !== h.hash) changes.push({ eid, change: 'modified', ...h, fields: automationChangeSummary(prevCfg?.[eid], autoCfg[eid]) })
+		}
+		for (const [eid, old] of Object.entries(prev)) if (!hashes[eid] && old.hash && !(old.id && mine.has(old.id))) changes.push({ eid, change: 'deleted', ...old, fields: [] })
+		const verb = { created: '만듦', modified: '고침', deleted: '지움' }
+		for (const ch of changes) {
+			this.store?.recordImplicitFeedback({ ts: now, kind: 'automation_user_edited', entity_id: ch.eid, ref_id: ch.id, score: 0, detail: { change: ch.change, alias: ch.alias, fields: ch.fields } })
+			const made = props.find(p => p.status === 'applied' && ch.id && p.payload?.config_id === ch.id)
+			if (made && ch.change !== 'created') {
+				this.implicitFeedback.onProposalOutcome(made, ch.change === 'deleted' ? 'deleted_by_user' : 'edited_by_user', now, ch.fields.join(', '))
+				this.memoryMgr.applyOps([{
+					op: 'upsert', category: 'preference', key: `auto_edit_${ch.id}`.slice(0, 80), ttl_days: 180, entity_ids: [ch.eid],
+					content: `사용자가 집 비서가 만든 자동화 "${ch.alias}"를 직접 ${verb[ch.change]}${ch.fields.length ? `(${ch.fields.join(', ')})` : ''}. 비슷한 제안을 할 때 이 수정을 따를 것.`,
+				}], { source: 'user_edit', now })
+			}
+			log(`사용자가 자동화를 직접 ${verb[ch.change]}: ${ch.alias}${ch.fields.length ? ` (${ch.fields.join(', ')})` : ''}${made ? ' — 집 비서 제안으로 만든 자동화' : ''}`)
+		}
+		return changes
+	}
+
+	#learningDigest(now) {
+		const parts = [buildLearningDigest({ store: this.store, rules: this.engine.rules, runtime: this.runtime.rules, cfg: this.cfg, states: this.states, now, isNoise: this.isNoise })]
+		const sc = this.scorecardNow(now)
+		if (sc) {
+			const t = sc.trends.filter(x => x.latest != null).map(x => `${x.label} ${x.latest}${x.previous != null ? `(전주 ${x.previous}${x.better === true ? ' ▲' : x.better === false ? ' ▼' : ''})` : ''}`)
+			if (t.length) parts.push(`- 자기 성능 지표(최근 7일): ${t.join(', ')}`)
+		}
+		const routineProps = this.haAdmin.listProposals({ limit: 100 }).filter(p => String(p.payload?.config_id ?? '').startsWith('haagent_routine_'))
+		if (routineProps.length) parts.push(`- 생활 루틴 자동화 제안(코드가 백테스트로 이미 올림, 같은 것을 다시 제안하지 말 것): ${routineProps.slice(0, 6).map(p => `[${p.status}] ${p.title}`).join(' / ')}`)
+		return parts.filter(Boolean).join('\n')
+	}
+
+	scorecardNow(now = this.clock()) {
+		if (!this.store) return null
+		return buildScorecard({ store: this.store, now, regression: this.runtime.last_regression ?? null })
+	}
+
+	// 지금 설정으로 빠른 경로 회귀 평가
+	regressionNow() {
+		const index = directoryIndexFor({ policy: this.policy, states: this.states, meta: this.meta, cfg: this.cfg })
+		return runFastPathRegression({ index, cases: fastPathCases() })
+	}
+
+	async suggestAutomationsNow({ dry = true, now = this.clock() } = {}) {
+		if (!this.meta.autoCfg && this.ha.connected) await this.refreshMeta(now, true)
+		return suggestAutomations({
+			store: this.store, ha: this.ha, states: this.states, meta: this.meta, policy: this.policy, cfg: this.cfg, isNoise: this.isNoise,
+			proposals: this.haAdmin.listProposals({ limit: 500 }),
+			propose: this.cfg.policy?.admin_enabled ? req => this.createAndNotifyProposal(req) : null,
+			now, dry,
+		})
+	}
+
+	// 새로 생긴 기기 문제(응답 없음·배터리·신호)만 알린다. 조용한 시간이면 다음 날 다시 본다.
+	async checkDeviceHealth(now = this.clock()) {
+		const report = scanDeviceHealth({ states: this.states, meta: this.meta, now, isNoise: this.isNoise, cfg: this.cfg })
+		const lines = newHealthIssues(report, this.runtime.health_seen ?? [])
+		if (lines.length && this.isQuiet(now)) return { report, notified: 0, deferred: lines.length }
+		this.runtime.health_seen = healthIssueKeys(report)
+		this.saveRuntime()
+		if (lines.length) {
+			await this.notifier.deliver({ kind: 'info', level: 'normal', title: '🔧 기기 점검이 필요해요', message: `${lines.slice(0, 6).join('\n')}${lines.length > 6 ? `\n외 ${lines.length - 6}건` : ''}`.slice(0, 450), related_rule_ids: [] })
+		}
+		return { report, notified: lines.length }
+	}
+
+	// 판정이 난 실험의 후속 조치: 악화 → 규칙 원복 / 제안 롤백 묻기 / 약해진 교훈 끄기, 개선 → 규칙에 검증 표시
+	async applyExperimentVerdicts(now = this.clock()) {
+		if (!this.store || this.dry) return []
+		const done = []
+		for (const exp of this.store.unactionedExperiments()) {
+			let note = '조치 없음'
+			try {
+				if (exp.status === 'regressed') {
+					if (exp.kind === 'rule') note = await this.#revertRegressedRule(exp, now)
+					else if (String(exp.kind).startsWith('proposal:')) note = await this.#offerRollback(exp)
+					else if (exp.kind === 'lesson') note = this.#retireWeakLesson(exp, now)
+				} else if (exp.status === 'improved') {
+					if (exp.kind === 'rule' && this.runtime.rules[exp.ref_id]) {
+						this.runtime.rules[exp.ref_id].validated_at = now
+						this.saveRuntime()
+						note = '검증됨 표시(HA 자동화 승격 후보)'
+					} else note = '유지'
+				}
+			} catch (e) { note = `조치 실패: ${e.message}` }
+			this.store.markExperimentActioned(exp.eid, now, note)
+			done.push({ eid: exp.eid, kind: exp.kind, ref_id: exp.ref_id, verdict: exp.status, note })
+			log(`실험 후속 조치 [${exp.status}] ${exp.title}: ${note}`)
+		}
+		return done
+	}
+
+	async #revertRegressedRule(exp, now) {
+		const rid = exp.ref_id
+		const rv = exp.baseline_metrics?.revert
+		if (!rv) return '되돌릴 이전 판 기록이 없음'
+		const cur = this.engine.rules.find(r => r.id === rid)
+		if (!cur) return '규칙이 이미 없음'
+		if (rv.new_rule && canonical(cur) !== canonical(rv.new_rule)) return '그 뒤 규칙이 다시 바뀌어 되돌리지 않음'
+		const rules = rv.prev_rule ? this.engine.rules.map(r => (r.id === rid ? rv.prev_rule : r)) : this.engine.rules.filter(r => r.id !== rid)
+		snapshot('rules', this.rulesDoc, now, this.cfg.limits.keep_snapshots)
+		this.engine.setRules(rules, this.states, now, rv.prev_rule ? [rid] : [])
+		this.rulesDoc = { updated: iso(now), rules }
+		writeJson(P.rules, this.rulesDoc)
+		this.saveRuntime()
+		const how = rv.prev_rule ? '이전 판으로 되돌렸어요' : '추가 전으로 되돌렸어요(규칙 삭제)'
+		const why = String(exp.notes ?? '').replace(/ \(악화 감지[^)]*\)/, '')
+		await this.notifier.deliver({ kind: 'info', level: 'normal', title: '📉 감시 규칙을 되돌렸어요', message: `${cur.description ?? rid}: 바꾼 뒤 7일 검증에서 나빠져(${why}) ${how}.`.slice(0, 450), related_rule_ids: [] }).catch(() => {})
+		return rv.prev_rule ? '이전 판으로 원복' : '새 규칙 삭제'
+	}
+
+	async #offerRollback(exp) {
+		const p = this.haAdmin.getProposal(exp.ref_id)
+		if (!p || !this.haAdmin.canRollback(p)) return '롤백할 수 없는 제안이라 기록만 남김'
+		if (this.control.send && this.ha.connected) await this.notifier.send(experimentRegressedPayload(p, exp)).catch(() => {})
+		return '롤백 버튼과 함께 되돌릴지 물음'
+	}
+
+	#retireWeakLesson(exp, now) {
+		const l = this.store.getLesson(exp.ref_id)
+		if (!l) return '교훈이 이미 없음'
+		if (l.confidence >= 0.35) return `신뢰도를 ${l.confidence}로 낮춤`
+		const r = this.store.deleteLesson(exp.ref_id, { source: 'experiment', now })
+		return r.ok ? `신뢰도 ${l.confidence}로 낮아 교훈을 끔` : (r.error ?? '교훈을 끄지 못함')
+	}
+
+	// 하루 한 번: 실험 평가·후속 조치 → 빠른 경로 회귀 평가 → 기기 건강 → 루틴 자동화 제안
+	async runDailyLearning(now = this.clock()) {
+		if (this.dry || !this.store || this.dailyRunning) return null
+		this.dailyRunning = true
+		const out = {}
+		try {
+			try { evaluateDueExperiments(this.store, now); out.experiments = await this.applyExperimentVerdicts(now) } catch (e) { out.experiments_error = e.message }
+			try {
+				const reg = this.regressionNow()
+				this.runtime.last_regression = { at: iso(now), passed: reg.passed, total: reg.total, failed: reg.failed.slice(0, 5) }
+				out.regression = this.runtime.last_regression
+			} catch (e) { out.regression_error = e.message }
+			try {
+				const h = await this.checkDeviceHealth(now)
+				out.health = { notified: h.notified, unavailable: h.report.unavailable.length, low_battery: h.report.low_battery.length, weak_signal: h.report.weak_signal.length }
+			} catch (e) { out.health_error = e.message }
+			if (this.cfg.policy?.admin_enabled && this.ha.connected) {
+				try {
+					const sg = await this.suggestAutomationsNow({ dry: false, now })
+					out.suggest = { candidates: sg.candidates.length, eligible: sg.candidates.filter(c => ['eligible', 'proposed'].includes(c.status)).length, created: sg.created.map(p => p.title) }
+				} catch (e) { out.suggest_error = e.message }
+			}
+			this.saveRuntime()
+		} finally { this.dailyRunning = false }
+		log(`하루 자가개선 작업: ${JSON.stringify(out).slice(0, 400)}`)
+		return out
 	}
 
 	saveRuntime() { if (!this.dry) writeJson(P.runtime, this.runtime) }
